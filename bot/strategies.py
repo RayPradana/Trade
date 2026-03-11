@@ -97,17 +97,19 @@ def _position_size(
     confidence: float,
     vol: VolatilityStats,
 ) -> float:
-    """Risk-based position sizing capped by configured risk_per_trade."""
-    if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
+    """Dynamic risk-based position sizing: base size = risk_per_trade * capital / price."""
+    if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE or current_price <= 0:
         return 0.0
+    # Compute how many units of the base asset represent one "risk unit" of capital
+    dynamic_base = (config.risk_per_trade * config.initial_capital) / current_price
     desired_risk_value = config.initial_capital * config.risk_per_trade
-    base_order_risk = risk_per_unit * config.base_order_size
+    base_order_risk = risk_per_unit * dynamic_base
     dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
     scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
     confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
     volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
-    size = config.base_order_size * scale * confidence_multiplier * volatility_multiplier
-    return max(size, config.base_order_size * 0.25)
+    size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
+    return max(size, dynamic_base * 0.25)
 
 
 def make_trade_decision(

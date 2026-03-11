@@ -35,8 +35,7 @@ class BotConfig:
     api_key: Optional[str]
     api_secret: Optional[str] = None
     pair: str = "btc_idr"  # Last-resort fallback used when pair discovery via get_pairs() fails entirely
-    base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
-    risk_per_trade: float = 0.01  # 1% default
+    risk_per_trade: float = 0.01  # 1% default; order size = risk_per_trade * initial_capital / coin_price
     dry_run: bool = True
     run_once: bool = False
     real_time: bool = False
@@ -80,7 +79,6 @@ class BotConfig:
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             api_secret=os.getenv("INDODAX_SECRET"),
-            base_order_size=float(os.getenv("BASE_ORDER_SIZE", "0.0001")),
             risk_per_trade=float(os.getenv("RISK_PER_TRADE", "0.01")),
             dry_run=os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"},
             run_once=os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"},
@@ -120,8 +118,6 @@ class BotConfig:
     def _validate(self) -> None:
         if not (0 < self.risk_per_trade <= 0.5):
             raise ValueError("RISK_PER_TRADE must be between 0 and 0.5")
-        if self.base_order_size <= 0:
-            raise ValueError("BASE_ORDER_SIZE must be positive")
         if self.grid_levels_per_side <= 0:
             raise ValueError("GRID_LEVELS_PER_SIDE must be positive")
         if self.grid_spacing_pct <= 0:

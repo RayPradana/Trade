@@ -28,7 +28,8 @@ def build_grid_plan(current_price: float, config: BotConfig) -> GridPlan:
     """Build symmetric grid orders above and below the anchor price."""
     levels = max(1, config.grid_levels_per_side)
     spacing = max(1e-6, config.grid_spacing_pct)
-    amount = config.grid_order_size or config.base_order_size
+    # Use explicit override, otherwise derive dynamically from risk budget and current price
+    amount = config.grid_order_size or (config.risk_per_trade * config.initial_capital) / current_price
 
     buy_orders: List[GridOrder] = []
     sell_orders: List[GridOrder] = []

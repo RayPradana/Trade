@@ -26,9 +26,7 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | Variabel | Deskripsi | Default |
 | --- | --- | --- |
 | `INDODAX_KEY` | API key Indodax (hanya diperlukan untuk mode live) | - |
-| `TRADE_PAIR` | Pasangan dagang fallback jika pemilihan otomatis tidak menemukan kandidat | `btc_idr` |
-| `BASE_ORDER_SIZE` | Ukuran order dasar (dalam aset dasar) | `0.0001` |
-| `RISK_PER_TRADE` | Risiko per transaksi (0.01 = 1%) | `0.01` |
+| `RISK_PER_TRADE` | Risiko per transaksi (0.01 = 1%); ukuran order = `RISK_PER_TRADE × INITIAL_CAPITAL / harga_koin` | `0.01` |
 | `DRY_RUN` | `true/false` untuk simulasi (set `false` untuk mode live) | `true` |
 | `RUN_ONCE` | Jalankan satu siklus lalu berhenti | `false` |
 | `REALTIME_MODE` | Aktifkan polling cepat untuk data hampir real-time (default 1s jika aktif) | `false` |
@@ -37,7 +35,7 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `GRID_ENABLED` | Aktifkan mode grid trading (menempatkan buy/sell bertingkat) | `false` |
 | `GRID_LEVELS_PER_SIDE` | Jumlah level grid di tiap sisi harga anchor | `3` |
 | `GRID_SPACING_PCT` | Jarak antar level grid (0.004 = 0.4%) | `0.004` |
-| `GRID_ORDER_SIZE` | (Opsional) Ukuran order per level; default memakai `BASE_ORDER_SIZE` | - |
+| `GRID_ORDER_SIZE` | (Opsional) Ukuran order per level; default memakai `RISK_PER_TRADE × INITIAL_CAPITAL / harga` | - |
 | `ORDER_QUEUE_ENABLED` | Aktifkan antrean permintaan order dengan rate limit | `true` |
 | `ORDER_MIN_INTERVAL` | Jeda minimal antar permintaan order (detik) | `0.25` |
 | `WEBSOCKET_ENABLED` | Coba gunakan WebSocket untuk data real-time (fallback ke REST) | `true` |
@@ -106,7 +104,7 @@ REALTIME_MODE=true DRY_RUN=true python main.py
 
 - Set `GRID_ENABLED=true` untuk menyalakan penempatan order beli/jual bertingkat simetris di sekitar harga saat ini.
 - Atur kepadatan grid dengan `GRID_LEVELS_PER_SIDE` (jumlah level per sisi) dan `GRID_SPACING_PCT` (jarak persen antar level).
-- (Opsional) Set `GRID_ORDER_SIZE` jika ingin ukuran order per level berbeda dari `BASE_ORDER_SIZE`.
+- (Opsional) Set `GRID_ORDER_SIZE` jika ingin ukuran order per level berbeda dari ukuran dinamis (`RISK_PER_TRADE × INITIAL_CAPITAL / harga`).
 - Contoh:
 
 ```bash
