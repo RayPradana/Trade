@@ -11,7 +11,7 @@ SCALP_SPREAD_THRESHOLD = 0.0015
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
-DIVISION_GUARD = 1e-8  # prevents division by zero / extremely small stop distances
+MIN_STOP_DISTANCE = 1e-8  # prevents division by zero / extremely small stop distances
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
 
 
@@ -49,6 +49,16 @@ def _confidence(trend: TrendResult, orderbook: OrderbookInsight, vol: Volatility
     orderbook_score = min(abs(orderbook.imbalance) + spread_bonus, 1.0)
     vol_score = 1 - min(vol.volatility * 10, VOLATILITY_PENALTY_CAP)
     return round(max(0.0, min(1.0, (trend_score * 0.45 + orderbook_score * 0.35 + vol_score * 0.2))), 3)
+
+
+def _position_size(current_price: float, stop_loss: Optional[float], config: BotConfig, risk_per_unit: float) -> float:
+    """Risk-based position sizing capped by configured risk_per_trade."""
+    if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
+        return 0.0
+    desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
+    base_order_risk = risk_per_unit * config.base_order_size
+    scale = min(2.0, desired_risk_value / max(MIN_STOP_DISTANCE, base_order_risk))
+    return max(config.base_order_size * scale, config.base_order_size * 0.25)
 
 
 def make_trade_decision(
@@ -94,17 +104,8 @@ def make_trade_decision(
     ).strip()
 
     # size based on risk per trade relative to stop distance
-    if action == "hold" or not stop_loss:
-        amount = 0.0
-    else:
-        risk_per_unit = abs(current_price - stop_loss)
-        if risk_per_unit < DIVISION_GUARD:
-            amount = 0.0
-        else:
-            desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
-            base_order_risk = risk_per_unit * config.base_order_size
-            scale = min(2.0, desired_risk_value / max(DIVISION_GUARD, base_order_risk))
-            amount = max(config.base_order_size * scale, config.base_order_size * 0.25)
+    risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
+    amount = _position_size(current_price, stop_loss, config, risk_per_unit)
 
     return StrategyDecision(
         mode=mode,

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from statistics import mean, pstdev
 from typing import Dict, Iterable, List, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,6 +52,7 @@ def _safe_float(value: str) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
+        logger.debug("Failed to parse float from value=%s", value)
         return 0.0
 
 

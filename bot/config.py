@@ -11,7 +11,7 @@ class BotConfig:
     api_secret: Optional[str]
     pair: str = "btc_idr"
     scan_pairs: Optional[List[str]] = None
-    base_order_size: float = 0.0001  # in base asset
+    base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
     risk_per_trade: float = 0.01  # 1% default
     dry_run: bool = True
     min_confidence: float = 0.52

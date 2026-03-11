@@ -74,7 +74,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(pair, "b_idr")
         self.assertEqual(snapshot["decision"].confidence, 0.8)
 
-    def test_maybe_execute_limited_by_cash(self) -> None:
+    def test_maybe_execute_limits_buy_amount_by_available_cash(self) -> None:
         config = BotConfig(
             api_key=None,
             api_secret=None,

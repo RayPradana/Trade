@@ -22,6 +22,7 @@ class PortfolioTracker:
         self.cash = initial_capital
         self.base_position = 0.0
         self.realized_pnl = 0.0
+        self.avg_cost = 0.0
         self.target_equity = initial_capital * (1 + target_profit_pct)
         self.min_equity = initial_capital * (1 - max_loss_pct)
 
@@ -29,13 +30,16 @@ class PortfolioTracker:
         notional = price * amount
         if action == "buy":
             self.cash -= notional
+            total_cost = self.avg_cost * self.base_position + price * amount
             self.base_position += amount
+            self.avg_cost = total_cost / self.base_position if self.base_position > 0 else 0.0
         elif action == "sell":
-            self.cash += notional
-            self.base_position -= amount
-        # realized PnL only counted when position is reduced
-        if action == "sell":
-            self.realized_pnl = self.cash + self.base_position * price - self.initial_capital
+            sell_qty = min(amount, self.base_position)
+            self.cash += price * sell_qty
+            self.realized_pnl += (price - self.avg_cost) * sell_qty
+            self.base_position -= sell_qty
+            if self.base_position <= 0:
+                self.avg_cost = 0.0
 
     def snapshot(self, mark_price: float) -> PortfolioSnapshot:
         equity = self.cash + self.base_position * mark_price

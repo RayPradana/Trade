@@ -77,12 +77,20 @@ class Trader:
 
         stop_reason = self.tracker.stop_reason(price)
         if stop_reason:
+            logger.info("Stop triggered (%s) equity=%s", stop_reason, self.tracker.as_dict(price))
             return {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
 
         if decision.action == "hold":
+            logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, self.tracker.as_dict(price))
             return {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
 
         if decision.confidence < self.config.min_confidence:
+            logger.info(
+                "Skip low confidence action= %s conf=%.3f min=%.3f",
+                decision.action,
+                decision.confidence,
+                self.config.min_confidence,
+            )
             return {
                 "status": "skipped",
                 "reason": f"confidence {decision.confidence} below threshold {self.config.min_confidence}",
@@ -90,7 +98,7 @@ class Trader:
             }
 
         # simple slippage guard using top of book
-        depth = self.client.get_depth(self.config.pair, count=5)
+        depth = self.client.get_depth(snapshot["pair"], count=5)
         bids = depth.get("buy") or []
         asks = depth.get("sell") or []
         top_bid = float(bids[0][0]) if bids else price
@@ -100,12 +108,14 @@ class Trader:
         allowed_min = price * (1 - self.config.max_slippage_pct)
 
         if decision.action == "buy" and reference_price > allowed_max:
+            logger.info("Skip buy due to slippage price=%s allowed_max=%s", reference_price, allowed_max)
             return {
                 "status": "skipped",
                 "reason": "slippage too high for buy",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
         if decision.action == "sell" and reference_price < allowed_min:
+            logger.info("Skip sell due to slippage price=%s allowed_min=%s", reference_price, allowed_min)
             return {
                 "status": "skipped",
                 "reason": "slippage too high for sell",
@@ -122,6 +132,7 @@ class Trader:
             effective_amount = min(decision.amount, max_sellable)
 
         if effective_amount <= 0:
+            logger.info("Skip due to insufficient balance/position | action=%s", decision.action)
             return {
                 "status": "skipped",
                 "reason": "insufficient balance or position",
@@ -153,6 +164,7 @@ class Trader:
             self.config.pair, decision.action, reference_price, effective_amount
         )
         self.tracker.record_trade(decision.action, reference_price, effective_amount)
+        logger.info("Placed order action=%s amount=%s price=%s response=%s", decision.action, effective_amount, reference_price, order_resp)
         return {
             "status": "placed",
             "order": order_resp,

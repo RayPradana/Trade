@@ -70,6 +70,18 @@ def main() -> None:
                 summary.confidence,
                 summary.reason,
             )
+            ob = snapshot.get("orderbook")
+            levels = snapshot.get("levels")
+            vol = snapshot.get("volatility")
+            logging.info(
+                "analytics pair=%s spread=%.4f imbalance=%.2f vol=%.4f support=%s resistance=%s",
+                pair,
+                ob.spread_pct if ob else float("nan"),
+                ob.imbalance if ob else float("nan"),
+                vol.volatility if vol else float("nan"),
+                getattr(levels, "support", None),
+                getattr(levels, "resistance", None),
+            )
             outcome = trader.maybe_execute(snapshot)
             logging.info("result=%s", outcome)
             portfolio_price = snapshot["price"]
@@ -77,7 +89,7 @@ def main() -> None:
             if outcome.get("status") == "stopped":
                 break
         except (requests.RequestException, RuntimeError, ValueError):
-            logging.exception("Recoverable error in bot loop")
+            logging.exception("Recoverable error in bot loop (pair=%s)", config.pair)
             if args.once:
                 raise
         except KeyboardInterrupt:
