@@ -3,7 +3,7 @@
 Bot trading otomatis untuk Indodax menggunakan Python. Bot melakukan:
 
 - Analisis tren koin dengan moving average cepat/lambat
-- Analisa order book (spread, ketidakseimbangan volume), volume, support/resistance, dan candlestick dari data trades real-time
+- Analisis order book (spread, ketidakseimbangan volume), volume, support/resistance, dan candlestick dari data trades real-time
 - Pemilihan gaya trading otomatis (scalping, day trading, swing, position) sesuai kondisi pasar
 - Eksekusi limit order beli/jual otomatis dengan batasan slippage, stop-loss, take-profit (stop-limit secara logis melalui stop-loss guard)
 - Risk management: target profit, batas rugi, pembatasan ukuran order berdasarkan modal/cash, dan proteksi over-sell posisi

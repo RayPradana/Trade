@@ -31,8 +31,7 @@ def _load_dotenv(path: Optional[Path] = None) -> None:
 @dataclass
 class BotConfig:
     api_key: Optional[str]
-# Default/fallback pair when automatic scanning yields no candidates
-    pair: str = "btc_idr"
+    pair: str = "btc_idr"  # Default/fallback pair when automatic scanning yields no candidates
     scan_pairs: Optional[List[str]] = None
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
     risk_per_trade: float = 0.01  # 1% default

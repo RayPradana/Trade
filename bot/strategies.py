@@ -11,7 +11,7 @@ SCALP_SPREAD_THRESHOLD = 0.0015
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
-# Minimum stop distance expressed in absolute price units to avoid zero-division and unrealistic sizing
+# Minimum stop distance expressed in absolute price units to avoid zero division and unrealistic sizing
 MIN_STOP_DISTANCE = 1e-6
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
 
