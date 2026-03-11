@@ -28,9 +28,28 @@ class GuardedTrader(Trader):
         super().__init__(config, client=self._Client())
 
 
+class AutoPairsTrader(Trader):
+    """Trader that auto-loads pairs from stubbed client and analyzes provided snapshots."""
+
+    class _Client:
+        def __init__(self, pairs: list[str]) -> None:
+            self._pairs = pairs
+
+        def get_pairs(self) -> list[Dict[str, Any]]:
+            return [{"name": p} for p in self._pairs]
+
+    def __init__(self, config: BotConfig, snapshots: Dict[str, Dict[str, Any]]) -> None:
+        super().__init__(config, client=self._Client(list(snapshots.keys())))
+        self._snapshots = snapshots
+
+    def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
+        key = pair or self.config.pair
+        return self._snapshots[key]
+
+
 class TraderSelectionTests(unittest.TestCase):
     def test_scan_and_choose_picks_best_confidence(self) -> None:
-        config = BotConfig(api_key=None, api_secret=None, scan_pairs=["a_idr", "b_idr"], pair="a_idr")
+        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="a_idr")
         snapshots = {
             "a_idr": {
                 "pair": "a_idr",
@@ -74,10 +93,55 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(pair, "b_idr")
         self.assertEqual(snapshot["decision"].confidence, 0.8)
 
+    def test_scan_and_choose_without_manual_input_uses_auto_pairs(self) -> None:
+        config = BotConfig(api_key=None, scan_pairs=None, pair="manual_idr")
+        snapshots = {
+            "auto_a": {
+                "pair": "auto_a",
+                "price": 100.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="swing_trading",
+                    action="buy",
+                    confidence=0.6,
+                    reason="ok",
+                    target_price=100,
+                    amount=0.1,
+                    stop_loss=95,
+                    take_profit=110,
+                ),
+            },
+            "auto_b": {
+                "pair": "auto_b",
+                "price": 100.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="day_trading",
+                    action="buy",
+                    confidence=0.9,
+                    reason="better",
+                    target_price=100,
+                    amount=0.1,
+                    stop_loss=95,
+                    take_profit=110,
+                ),
+            },
+        }
+        trader = AutoPairsTrader(config, snapshots)
+        pair, snapshot = trader.scan_and_choose()
+        self.assertEqual(pair, "auto_b")
+        self.assertEqual(snapshot["decision"].confidence, 0.9)
+        self.assertEqual(trader.config.pair, "auto_b")
+
     def test_maybe_execute_limits_buy_amount_by_available_cash(self) -> None:
         config = BotConfig(
             api_key=None,
-            api_secret=None,
             dry_run=True,
             initial_capital=50.0,
             max_loss_pct=0.9,

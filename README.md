@@ -18,13 +18,12 @@ Bot trading otomatis untuk Indodax menggunakan Python. Bot melakukan:
 
 ## Konfigurasi
 
-Konfigurasi dapat diatur lewat variabel lingkungan:
+Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 
 | Variabel | Deskripsi | Default |
 | --- | --- | --- |
 | `INDODAX_KEY` | API key Indodax (hanya diperlukan untuk mode live) | - |
-| `INDODAX_SECRET` | API secret Indodax | - |
-| `TRADE_PAIR` | Pasangan dagang, contoh `btc_idr` | `btc_idr` |
+| `TRADE_PAIR` | Pasangan dagang fallback bila pemilihan otomatis tidak tersedia | `btc_idr` |
 | `BASE_ORDER_SIZE` | Ukuran order dasar (dalam aset dasar) | `0.0001` |
 | `RISK_PER_TRADE` | Risiko per transaksi (0.01 = 1%) | `0.01` |
 | `DRY_RUN` | `true/false` untuk simulasi | `true` |
@@ -36,31 +35,36 @@ Konfigurasi dapat diatur lewat variabel lingkungan:
 | `INITIAL_CAPITAL` | Modal awal (quote currency, mis. IDR) | `1000000` |
 | `TARGET_PROFIT_PCT` | Target profit relatif (0.2 = 20%) | `0.2` |
 | `MAX_LOSS_PCT` | Batas kerugian relatif (0.1 = 10%) | `0.1` |
-| `TRADE_PAIRS` | Daftar pasangan dipisah koma untuk discan | `btc_idr` |
+| `TRADE_PAIRS` | Daftar pasangan dipisah koma untuk discan otomatis (jika kosong, bot tarik seluruh pairs dari API) | `btc_idr` |
 
 ## Menjalankan
+
+### Konfigurasi via `.env`
+
+Buat file `.env` di root repo:
+
+```
+INDODAX_KEY=your_api_key
+TRADE_PAIRS=btc_idr,eth_idr
+DRY_RUN=true
+```
 
 ### Dry-run (simulasi, aman)
 
 ```bash
-python main.py --pair btc_idr --once
+python main.py --once
 ```
 
 ### Mode live (eksekusi order)
 
 ```bash
-export INDODAX_KEY=your_key
-export INDODAX_SECRET=your_secret
-python main.py --pair btc_idr --live
+export INDODAX_KEY=your_api_key
+python main.py --live
 ```
 
 Opsi penting:
 
 - `--once` menjalankan satu siklus analisa + keputusan.
-- `--interval` menimpa interval candlestick.
-- `--min-confidence` mengubah ambang eksekusi.
-- `--initial-capital`, `--target-profit`, `--max-loss` mengontrol modal, target keuntungan, dan batas rugi.
-- `--pairs` untuk scan banyak pasangan sebelum entry (bot memilih confidence tertinggi).
 
 ## Cara Kerja Singkat
 

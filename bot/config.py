@@ -2,13 +2,32 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
+
+
+def _load_dotenv(path: Optional[Path] = None) -> None:
+    """Load environment variables from a .env file without overriding existing values."""
+    dotenv_path = path or Path(__file__).resolve().parent.parent / ".env"
+    if not dotenv_path.exists():
+        return
+
+    for raw_line in dotenv_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        if key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
 
 
 @dataclass
 class BotConfig:
     api_key: Optional[str]
-    api_secret: Optional[str]
     pair: str = "btc_idr"
     scan_pairs: Optional[List[str]] = None
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
@@ -25,11 +44,11 @@ class BotConfig:
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        _load_dotenv()
         pairs_env = os.getenv("TRADE_PAIRS")
         scan_pairs = [p.strip().lower() for p in pairs_env.split(",")] if pairs_env else None
         return cls(
             api_key=os.getenv("INDODAX_KEY"),
-            api_secret=os.getenv("INDODAX_SECRET"),
             pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
             scan_pairs=scan_pairs,
             base_order_size=float(os.getenv("BASE_ORDER_SIZE", "0.0001")),
@@ -46,5 +65,5 @@ class BotConfig:
         )
 
     def require_auth(self) -> None:
-        if not self.api_key or not self.api_secret:
-            raise ValueError("INDODAX_KEY and INDODAX_SECRET are required for live trading")
+        if not self.api_key:
+            raise ValueError("INDODAX_KEY is required for live trading")

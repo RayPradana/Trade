@@ -7,7 +7,7 @@ from bot.analysis import OrderbookInsight, TrendResult, VolatilityStats, Support
 
 class StrategyTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = BotConfig(api_key=None, api_secret=None, dry_run=True)
+        self.config = BotConfig(api_key=None, dry_run=True)
 
     def test_select_strategy_scalping(self) -> None:
         trend = TrendResult("up", 101, 100, 0.01)

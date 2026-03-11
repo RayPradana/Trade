@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class Trader:
     def __init__(self, config: BotConfig, client: Optional[IndodaxClient] = None) -> None:
         self.config = config
-        self.client = client or IndodaxClient(config.api_key, config.api_secret)
+        self.client = client or IndodaxClient(config.api_key)
         self._all_pairs: Optional[List[str]] = None
         self.tracker = PortfolioTracker(
             initial_capital=config.initial_capital,
@@ -157,7 +157,7 @@ class Trader:
 
         # live trading path
         # Guard against programmatic use without running through CLI validation.
-        if self.config.api_key is None or self.config.api_secret is None:
+        if self.config.api_key is None:
             raise ValueError("API credentials required for live trading")
 
         order_resp = self.client.create_order(
