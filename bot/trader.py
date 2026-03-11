@@ -86,7 +86,7 @@ class Trader:
 
         if decision.confidence < self.config.min_confidence:
             logger.info(
-                "Skip low confidence action= %s conf=%.3f min=%.3f",
+                "Skip low confidence action=%s conf=%.3f min=%.3f",
                 decision.action,
                 decision.confidence,
                 self.config.min_confidence,
@@ -220,9 +220,7 @@ class Trader:
                 best_pair = pair
 
         if best_snapshot:
-            self.config.pair = best_pair
             return best_pair, best_snapshot
 
         # fallback to default pair if nothing tradable
-        self.config.pair = best_pair
         return best_pair, self.analyze_market(best_pair)

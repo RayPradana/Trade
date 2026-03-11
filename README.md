@@ -23,7 +23,7 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | Variabel | Deskripsi | Default |
 | --- | --- | --- |
 | `INDODAX_KEY` | API key Indodax (hanya diperlukan untuk mode live) | - |
-| `TRADE_PAIR` | Pasangan dagang fallback bila pemilihan otomatis tidak tersedia | `btc_idr` |
+| `TRADE_PAIR` | Pasangan dagang fallback jika pemilihan otomatis tidak menemukan kandidat | `btc_idr` |
 | `BASE_ORDER_SIZE` | Ukuran order dasar (dalam aset dasar) | `0.0001` |
 | `RISK_PER_TRADE` | Risiko per transaksi (0.01 = 1%) | `0.01` |
 | `DRY_RUN` | `true/false` untuk simulasi | `true` |

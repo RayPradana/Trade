@@ -28,6 +28,7 @@ def _load_dotenv(path: Optional[Path] = None) -> None:
 @dataclass
 class BotConfig:
     api_key: Optional[str]
+    # Default/fallback pair when pemindaian otomatis tidak menghasilkan kandidat
     pair: str = "btc_idr"
     scan_pairs: Optional[List[str]] = None
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)

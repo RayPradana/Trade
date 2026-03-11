@@ -137,7 +137,7 @@ class TraderSelectionTests(unittest.TestCase):
         pair, snapshot = trader.scan_and_choose()
         self.assertEqual(pair, "auto_b")
         self.assertEqual(snapshot["decision"].confidence, 0.9)
-        self.assertEqual(trader.config.pair, "auto_b")
+        self.assertEqual(trader.config.pair, "manual_idr")  # config stays as fallback
 
     def test_maybe_execute_limits_buy_amount_by_available_cash(self) -> None:
         config = BotConfig(
