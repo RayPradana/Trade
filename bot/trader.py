@@ -161,7 +161,7 @@ class Trader:
             raise ValueError("API credentials required for live trading")
 
         order_resp = self.client.create_order(
-            self.config.pair, decision.action, reference_price, effective_amount
+            snapshot["pair"], decision.action, reference_price, effective_amount
         )
         self.tracker.record_trade(decision.action, reference_price, effective_amount)
         logger.info(

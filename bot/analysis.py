@@ -75,8 +75,8 @@ def build_candles(
     candles: List[Candle] = []
     for bucket_ts in sorted(buckets.keys())[-limit:]:
         bucket_trades = buckets[bucket_ts]
-        trade_prices = [_safe_float(t.get("price")) for t in bucket_trades]
-        amounts = [_safe_float(t.get("amount", 0)) for t in bucket_trades]
+        trade_prices = [_safe_float(t.get("price", "")) for t in bucket_trades]
+        amounts = [_safe_float(t.get("amount", "0")) for t in bucket_trades]
         if not trade_prices:
             continue
         candles.append(

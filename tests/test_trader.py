@@ -139,6 +139,69 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(snapshot["decision"].confidence, 0.9)
         self.assertEqual(trader.config.pair, "manual_idr")  # config stays as fallback
 
+    def test_scan_and_choose_falls_back_when_all_hold(self) -> None:
+        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="fallback_idr")
+        snapshots = {
+            "a_idr": {
+                "pair": "a_idr",
+                "price": 100.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="day_trading",
+                    action="hold",
+                    confidence=0.4,
+                    reason="hold",
+                    target_price=100,
+                    amount=0.0,
+                    stop_loss=None,
+                    take_profit=None,
+                ),
+            },
+            "b_idr": {
+                "pair": "b_idr",
+                "price": 100.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="day_trading",
+                    action="hold",
+                    confidence=0.3,
+                    reason="hold",
+                    target_price=100,
+                    amount=0.0,
+                    stop_loss=None,
+                    take_profit=None,
+                ),
+            },
+            "fallback_idr": {
+                "pair": "fallback_idr",
+                "price": 120.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="position_trading",
+                    action="buy",
+                    confidence=0.6,
+                    reason="fallback",
+                    target_price=120,
+                    amount=0.2,
+                    stop_loss=110,
+                    take_profit=130,
+                ),
+            },
+        }
+        trader = StubTrader(config, snapshots)
+        pair, snapshot = trader.scan_and_choose()
+        self.assertEqual(pair, "fallback_idr")
+        self.assertEqual(snapshot["decision"].action, "buy")
+
     def test_maybe_execute_limits_buy_amount_by_available_cash(self) -> None:
         config = BotConfig(
             api_key=None,

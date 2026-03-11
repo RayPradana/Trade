@@ -56,7 +56,7 @@ def _position_size(current_price: float, stop_loss: Optional[float], config: Bot
     """Risk-based position sizing capped by configured risk_per_trade."""
     if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
         return 0.0
-    desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
+    desired_risk_value = config.initial_capital * config.risk_per_trade
     base_order_risk = risk_per_unit * config.base_order_size
     scale = min(2.0, desired_risk_value / max(MIN_STOP_DISTANCE, base_order_risk))
     return max(config.base_order_size * scale, config.base_order_size * 0.25)
