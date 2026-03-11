@@ -196,7 +196,7 @@ class Trader:
                         elif "ticker_id" in p:
                             names.append(p["ticker_id"])
                     self._all_pairs = [n.lower() for n in names if n]
-                except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for pair list fetch failures
+                except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for pair listing/parsing failures
                     logger.warning("Failed to load pairs; fallback to default %s", exc)
                     self._all_pairs = [self.config.pair]
             pairs = self._all_pairs or [self.config.pair]
@@ -209,7 +209,7 @@ class Trader:
         for pair in pairs:
             try:
                 snapshot = self.analyze_market(pair)
-            except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for per-pair analysis failures
+            except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for per-pair API/parse failures
                 logger.warning("Failed to analyze %s: %s", pair, exc)
                 failed_pairs.append(pair)
                 continue

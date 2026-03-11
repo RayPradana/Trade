@@ -11,7 +11,8 @@ def _load_dotenv(path: Optional[Path] = None) -> None:
     dotenv_path = path or Path(__file__).resolve().parent.parent / ".env"
     if not dotenv_path.exists():
         return
-    # Escaped quotes inside values are not supported. Use plain quoting, e.g. KEY='value with spaces'
+    # Escaped quotes inside values are not supported and will be treated as literal characters.
+    # Use plain quoting, e.g. KEY='value with spaces'
 
     for raw_line in dotenv_path.read_text().splitlines():
         line = raw_line.strip()

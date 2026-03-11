@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from urllib.parse import urlencode
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -76,7 +77,7 @@ class IndodaxClient:
         if params:
             payload.update({k: v for k, v in params.items() if v is not None})
 
-        encoded = requests.compat.urlencode(payload)
+        encoded = urlencode(payload)
         headers = {"Key": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
         response = self.session.post(
             f"{self.base_url}/tapi", data=encoded, headers=headers, timeout=self.timeout
