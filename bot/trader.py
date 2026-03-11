@@ -121,18 +121,22 @@ class Trader:
         scale = effective_amount / decision_amount
         return [max(0.0, amt * scale) for amt in staged]
 
-    def analyze_market(self, pair: Optional[str] = None) -> Dict[str, Any]:
+    def analyze_market(
+        self,
+        pair: Optional[str] = None,
+        prefetched_ticker: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         pair = pair or self.config.pair
         ticker: Dict[str, Any]
         depth: Dict[str, Any]
         trades: List[Dict[str, Any]]
         if self.realtime and self.realtime.has_snapshot and pair == self.config.pair:
             snap = self.realtime.snapshot()
-            ticker = snap.get("ticker") or self.client.get_ticker(pair)
+            ticker = snap.get("ticker") or prefetched_ticker or self.client.get_ticker(pair)
             depth = snap.get("depth") or self.client.get_depth(pair, count=200)
             trades = snap.get("trades") or self.client.get_trades(pair, count=400)
         else:
-            ticker = self.client.get_ticker(pair)
+            ticker = prefetched_ticker or self.client.get_ticker(pair)
             depth = self.client.get_depth(pair, count=200)
             trades = self.client.get_trades(pair, count=400)
 
@@ -415,14 +419,36 @@ class Trader:
     _SCAN_BACKOFF_BASE = 2.0  # seconds; doubled on each retry (2, 4, 8 …)
     _SCAN_BACKOFF_MAX = 30.0  # hard cap so a long run of 429s never blocks indefinitely
 
-    def _analyze_with_retry(self, pair: str) -> Dict[str, Any]:
-        """Analyze a single pair with exponential back-off on HTTP 429 responses."""
+    def _analyze_with_retry(
+        self,
+        pair: str,
+        prefetched_ticker: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Analyze a single pair with exponential back-off on HTTP 429 responses.
+
+        The client raises ``RuntimeError("HTTP error: 429 …")`` (wrapping the
+        underlying ``requests.HTTPError``).  Both exception types are handled so
+        the retry logic works regardless of whether tests mock at the client
+        layer or the ``analyze_market`` layer.
+        """
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(self._MAX_SCAN_RETRIES):
             try:
-                return self.analyze_market(pair)
-            except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 429:
+                return self.analyze_market(pair, prefetched_ticker=prefetched_ticker)
+            except (requests.HTTPError, RuntimeError) as exc:
+                # Detect 429 from both the raw requests.HTTPError (test path) and
+                # from the RuntimeError wrapper that IndodaxClient raises (production).
+                if isinstance(exc, requests.HTTPError):
+                    is_429 = exc.response is not None and exc.response.status_code == 429
+                else:
+                    # IndodaxClient wraps requests.HTTPError as the __cause__
+                    cause = exc.__cause__
+                    is_429 = (
+                        isinstance(cause, requests.HTTPError)
+                        and cause.response is not None
+                        and cause.response.status_code == 429
+                    )
+                if is_429:
                     backoff = min(self._SCAN_BACKOFF_BASE * (2 ** attempt), self._SCAN_BACKOFF_MAX)
                     logger.warning(
                         "Rate-limited on %s (attempt %d/%d); backing off %.1fs",
@@ -430,6 +456,9 @@ class Trader:
                     )
                     time.sleep(backoff)
                     last_exc = exc
+                    # Don't rely on a stale prefetched ticker on retry; let the
+                    # call fetch it fresh via REST.
+                    prefetched_ticker = None
                 else:
                     raise
         raise last_exc
@@ -456,11 +485,25 @@ class Trader:
         best_score = -1.0
         failed_pairs: List[str] = []
 
+        # Pre-fetch all tickers in one call to avoid per-pair REST ticker requests.
+        # Indodax summaries keys omit underscores ("btcidr") while pair names use
+        # them ("btc_idr"), so we normalise via pair.replace("_", "").
+        ticker_cache: Dict[str, Any] = {}
+        try:
+            summaries = self.client.get_summaries()
+            raw_tickers = summaries.get("tickers", {}) if isinstance(summaries, dict) else {}
+            ticker_cache = dict(raw_tickers)
+            logger.debug("Fetched summaries for %d pairs", len(ticker_cache))
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            logger.warning("Failed to fetch summaries; will use per-pair ticker requests: %s", exc)
+
         for pair in pairs:
             if self.config.scan_request_delay > 0:
                 time.sleep(self.config.scan_request_delay)
+            # Summaries keys have no underscore; convert "btc_idr" → "btcidr"
+            prefetched_ticker = ticker_cache.get(pair.replace("_", "")) if ticker_cache else None
             try:
-                snapshot = self._analyze_with_retry(pair)
+                snapshot = self._analyze_with_retry(pair, prefetched_ticker=prefetched_ticker)
             # pragma: no cover - guard for per-pair API/parse failures
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 logger.warning("Failed to analyze %s: %s", pair, exc)

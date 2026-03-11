@@ -25,11 +25,14 @@ class StubTrader(Trader):
         def get_pairs(self) -> list[dict]:
             return [{"name": p} for p in self._pairs]
 
+        def get_summaries(self) -> dict:
+            return {}
+
     def __init__(self, config: BotConfig, snapshots: Dict[str, Dict[str, Any]]) -> None:
         super().__init__(config, client=self._Client(list(snapshots.keys())))
         self._snapshots = snapshots
 
-    def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
+    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
         key = pair or self.config.pair
         return self._snapshots[key]
 
@@ -40,6 +43,9 @@ class GuardedTrader(Trader):
     class _Client:
         def get_depth(self, pair: str, count: int = 5) -> Dict[str, Any]:
             return {"buy": [["100", "1"]], "sell": [["100.05", "1"]]}
+
+        def get_summaries(self) -> dict:
+            return {}
 
     def __init__(self, config: BotConfig) -> None:
         super().__init__(config, client=self._Client())
@@ -55,11 +61,14 @@ class AutoPairsTrader(Trader):
         def get_pairs(self) -> list[Dict[str, Any]]:
             return [{"name": p} for p in self._pairs]
 
+        def get_summaries(self) -> dict:
+            return {}
+
     def __init__(self, config: BotConfig, snapshots: Dict[str, Dict[str, Any]]) -> None:
         super().__init__(config, client=self._Client(list(snapshots.keys())))
         self._snapshots = snapshots
 
-    def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
+    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
         key = pair or self.config.pair
         return self._snapshots[key]
 
@@ -71,10 +80,13 @@ class AllFailTrader(Trader):
         def get_pairs(self) -> list[dict]:
             return [{"name": "a_idr"}, {"name": "b_idr"}]
 
+        def get_summaries(self) -> dict:
+            return {}
+
     def __init__(self, config: BotConfig) -> None:
         super().__init__(config, client=self._Client())
 
-    def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
+    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
         raise requests.RequestException("network unavailable")
 
 
@@ -367,7 +379,7 @@ class TraderSelectionTests(unittest.TestCase):
         }
         calls: list[int] = []
 
-        def fake_analyze(pair: str | None = None) -> Dict[str, Any]:
+        def fake_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
             calls.append(1)
             if len(calls) == 1:
                 # Build a minimal HTTPError with status 429
@@ -391,7 +403,7 @@ class TraderSelectionTests(unittest.TestCase):
         trader = GuardedTrader(config)
         sleep_calls: list[float] = []
 
-        def always_429(pair: str | None = None) -> Dict[str, Any]:
+        def always_429(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
             resp = requests.Response()
             resp.status_code = 429
             raise requests.HTTPError(response=resp)
@@ -436,6 +448,119 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 2)
         for call_args in mock_sleep.call_args_list:
             self.assertEqual(call_args, mock.call(0.5))
+
+    def test_scan_and_choose_uses_summaries_to_prefetch_tickers(self) -> None:
+        """scan_and_choose should call get_summaries() once and pass ticker data to analyze_market."""
+        import unittest.mock as mock
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0)
+        received_prefetched: list[Any] = []
+
+        class SummaryClient:
+            def get_pairs(self) -> list[dict]:
+                return [{"name": "btc_idr"}, {"name": "eth_idr"}]
+
+            def get_summaries(self) -> dict:
+                return {
+                    "tickers": {
+                        "btcidr": {"last": "1000000000", "high": "1100000000"},
+                        "ethidr": {"last": "50000000", "high": "55000000"},
+                    }
+                }
+
+        class SummaryTrader(Trader):
+            def analyze_market(
+                self,
+                pair: str | None = None,
+                prefetched_ticker: Dict[str, Any] | None = None,
+            ) -> Dict[str, Any]:
+                received_prefetched.append((pair, prefetched_ticker))
+                return {
+                    "pair": pair, "price": 100.0, "trend": None, "orderbook": None,
+                    "volatility": None, "levels": None, "indicators": None,
+                    "decision": StrategyDecision(
+                        mode="scalping", action="buy", confidence=0.7, reason="ok",
+                        target_price=100, amount=1, stop_loss=99, take_profit=101,
+                    ),
+                }
+
+        trader = SummaryTrader(config, client=SummaryClient())
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()
+
+        # Both pairs must have been analyzed with a non-None prefetched ticker
+        self.assertEqual(len(received_prefetched), 2)
+        pairs_seen = {r[0] for r in received_prefetched}
+        self.assertIn("btc_idr", pairs_seen)
+        self.assertIn("eth_idr", pairs_seen)
+        for pair_name, ticker in received_prefetched:
+            self.assertIsNotNone(ticker, f"Expected prefetched_ticker for {pair_name}")
+            self.assertIn("last", ticker)
+
+    def test_analyze_with_retry_handles_runtimeerror_429(self) -> None:
+        """_analyze_with_retry must retry when the client raises RuntimeError wrapping a 429.
+
+        In production, IndodaxClient._handle_response() wraps requests.HTTPError
+        inside RuntimeError using ``raise RuntimeError(msg) from exc``.  The
+        retry logic detects 429 by inspecting ``__cause__``.
+        """
+        import unittest.mock as mock
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0)
+        trader = GuardedTrader(config)
+        calls: list[int] = []
+        success_snapshot: Dict[str, Any] = {
+            "pair": "btc_idr", "price": 1.0, "decision": StrategyDecision(
+                mode="scalping", action="buy", confidence=0.6, reason="ok",
+                target_price=1, amount=1, stop_loss=0.99, take_profit=1.01,
+            ),
+        }
+
+        def fake_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            calls.append(1)
+            if len(calls) == 1:
+                # This is what IndodaxClient actually raises (RuntimeError wrapping HTTPError)
+                resp = requests.Response()
+                resp.status_code = 429
+                original = requests.HTTPError(response=resp)
+                raise RuntimeError(f"HTTP error: 429 Client Error: Too Many Requests for url: https://indodax.com/api/ticker/btc_idr") from original
+            return success_snapshot
+
+        trader.analyze_market = fake_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            result = trader._analyze_with_retry("btc_idr")
+        self.assertEqual(result["pair"], "btc_idr")
+        self.assertEqual(len(calls), 2)
+
+    def test_scan_and_choose_falls_back_when_summaries_fails(self) -> None:
+        """When get_summaries() fails, scan_and_choose must still work using per-pair ticker calls."""
+        config = BotConfig(api_key=None, scan_request_delay=0.0)
+        snapshots = {
+            "btc_idr": {
+                "pair": "btc_idr", "price": 1.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.7, reason="ok",
+                    target_price=1, amount=1, stop_loss=0.99, take_profit=1.01,
+                ),
+            },
+        }
+
+        class BrokenSummariesClient:
+            def get_pairs(self) -> list[dict]:
+                return [{"name": "btc_idr"}]
+
+            def get_summaries(self) -> dict:
+                raise RuntimeError("summaries unavailable")
+
+        class BrokenSummariesTrader(StubTrader):
+            pass
+
+        trader = BrokenSummariesTrader(config, snapshots)
+        trader.client = BrokenSummariesClient()  # type: ignore[assignment]
+        pair, snapshot = trader.scan_and_choose()
+        self.assertEqual(pair, "btc_idr")
+        self.assertIsNotNone(snapshot)
 
 
 if __name__ == "__main__":
