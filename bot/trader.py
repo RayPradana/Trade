@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 # that EMA-based indicators (MACD, Bollinger) have enough warm-up data.
 _OHLC_BUFFER_CANDLES = 100
 
+# Number of order-book levels fetched for execution guards (slippage, spread,
+# sell-wall, liquidity depth).  Kept as a constant so all guards are consistent.
+_EXECUTION_DEPTH_LEVELS = 20
+
 
 class Trader:
     def __init__(self, config: BotConfig, client: Optional[IndodaxClient] = None) -> None:
@@ -56,6 +60,10 @@ class Trader:
         self._scan_offset: int = 0  # rotating window index for pairs_per_cycle
         self._multi_feed: Optional[MultiPairFeed] = None
         self._scan_cycle_count: int = 0  # total completed full-scan cycles (for dynamic refresh)
+        # ── Pump-protection price history ────────────────────────────────────
+        # Circular buffer of (unix_timestamp, price) tuples.  Only populated
+        # when pump_protection_pct > 0 to avoid overhead when the feature is off.
+        self._price_history: List[Tuple[float, float]] = []
         self.tracker = PortfolioTracker(
             initial_capital=config.initial_capital,
             target_profit_pct=config.target_profit_pct,
@@ -281,6 +289,37 @@ class Trader:
                     pass
         return 0.0
 
+    def _record_price(self, price: float) -> None:
+        """Append *(now, price)* to the pump-detection history buffer.
+
+        Old entries outside the lookback window are pruned to keep the buffer
+        small.  This method is a no-op when pump protection is disabled.
+        """
+        if self.config.pump_protection_pct <= 0:
+            return
+        now = time.time()
+        self._price_history.append((now, price))
+        # Prune entries older than the lookback window (keep a small tail buffer
+        # so the oldest sample inside the window is always available)
+        cutoff = now - self.config.pump_lookback_seconds
+        while len(self._price_history) > 1 and self._price_history[0][0] < cutoff:
+            self._price_history.pop(0)
+
+    def _is_pumped(self, current_price: float) -> bool:
+        """Return *True* when price has risen above the pump threshold.
+
+        Compares *current_price* to the oldest recorded price inside the
+        ``pump_lookback_seconds`` window.  Returns ``False`` when pump
+        protection is disabled or when there is insufficient price history.
+        """
+        if self.config.pump_protection_pct <= 0 or not self._price_history:
+            return False
+        oldest_price = self._price_history[0][1]
+        if oldest_price <= 0:
+            return False
+        rise = (current_price - oldest_price) / oldest_price
+        return rise >= self.config.pump_protection_pct
+
     def _pair_composite_score(self, pair: str) -> float:
         """Return a composite ranking score for *pair* used to select the top-N watchlist.
 
@@ -369,14 +408,14 @@ class Trader:
             return None
 
     def _liquidity_depth_idr(self, depth: Dict[str, Any], price: float) -> float:
-        """Return the total IDR value of the top-20 bid and ask levels.
+        """Return the total IDR value of the top-N bid and ask levels.
 
         Used to filter out thin markets where the effective spread would make
         a trade unprofitable.  Returns 0.0 on any parse error.
         """
         try:
-            bids = (depth.get("buy") or [])[:20]
-            asks = (depth.get("sell") or [])[:20]
+            bids = (depth.get("buy") or [])[:_EXECUTION_DEPTH_LEVELS]
+            asks = (depth.get("sell") or [])[:_EXECUTION_DEPTH_LEVELS]
             total = 0.0
             for level in bids + asks:
                 total += float(level[0]) * float(level[1])
@@ -533,6 +572,8 @@ class Trader:
         vol = analyze_volatility(candles)
         levels = support_resistance(candles)
         price = self._extract_price(ticker)
+        # Record price in the pump-protection rolling buffer.
+        self._record_price(price)
         indicators: MomentumIndicators = derive_indicators(candles)
 
         # ── Multi-timeframe analysis ─────────────────────────────────────────
@@ -741,7 +782,7 @@ class Trader:
             return outcome
 
         # simple slippage guard using top of book
-        depth = self.client.get_depth(snapshot["pair"], count=20)
+        depth = self.client.get_depth(snapshot["pair"], count=_EXECUTION_DEPTH_LEVELS)
         bids = depth.get("buy") or []
         asks = depth.get("sell") or []
         top_bid = float(bids[0][0]) if bids else price
@@ -749,6 +790,71 @@ class Trader:
         reference_price = top_ask if decision.action == "buy" else top_bid
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
+
+        # ── Spread filter ─────────────────────────────────────────────────────
+        # Skip any trade (buy or sell) when the bid-ask spread is too wide.
+        # Wide spreads increase execution cost and indicate thin liquidity.
+        if self.config.max_spread_pct > 0 and top_bid > 0 and top_ask > 0:
+            live_spread_pct = (top_ask - top_bid) / top_bid
+            if live_spread_pct >= self.config.max_spread_pct:
+                logger.info(
+                    "Spread too wide on %s: %.4f%% ≥ %.4f%% — skipping %s",
+                    snapshot["pair"],
+                    live_spread_pct * 100,
+                    self.config.max_spread_pct * 100,
+                    decision.action,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"spread_too_wide {live_spread_pct:.4%} ≥ {self.config.max_spread_pct:.4%}"
+                    ),
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
+        # ── Sell-wall / orderbook wall guard ─────────────────────────────────
+        # Skip buy when aggregate ask-side volume dominates bid-side volume by
+        # the configured multiple.  This protects against entering a market
+        # where persistent sell-wall pressure will suppress price recovery.
+        if self.config.orderbook_wall_threshold > 0 and decision.action == "buy":
+            bid_vol = sum(float(b[1]) for b in bids[:_EXECUTION_DEPTH_LEVELS] if len(b) >= 2)
+            ask_vol = sum(float(a[1]) for a in asks[:_EXECUTION_DEPTH_LEVELS] if len(a) >= 2)
+            if bid_vol > 0 and ask_vol / bid_vol >= self.config.orderbook_wall_threshold:
+                logger.info(
+                    "Sell-wall detected on %s: ask/bid=%.1f× ≥ %.1f× — skipping buy",
+                    snapshot["pair"],
+                    ask_vol / bid_vol,
+                    self.config.orderbook_wall_threshold,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"sell_wall ask/bid={ask_vol / bid_vol:.2f}× ≥ {self.config.orderbook_wall_threshold:.1f}×"
+                    ),
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
+        # ── Pump protection ───────────────────────────────────────────────────
+        # Skip entry when price has spiked by more than pump_protection_pct
+        # within the last pump_lookback_seconds.  Prevents FOMO buying after
+        # a sharp pump that is likely to retrace.
+        if decision.action == "buy" and self._is_pumped(price):
+            oldest_price = self._price_history[0][1] if self._price_history else price
+            rise = (price - oldest_price) / oldest_price if oldest_price > 0 else 0.0
+            logger.info(
+                "Pump detected on %s: price rose %.2f%% in ≤%.0fs — skipping buy",
+                snapshot["pair"],
+                rise * 100,
+                self.config.pump_lookback_seconds,
+            )
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"pump_detected rise={rise:.2%} ≥ {self.config.pump_protection_pct:.2%} "
+                    f"in {self.config.pump_lookback_seconds:.0f}s"
+                ),
+                "portfolio": self.tracker.as_dict(price),
+            }
 
         # ── Minimum liquidity depth check ─────────────────────────────────────
         if self.config.min_liquidity_depth_idr > 0 and decision.action == "buy":

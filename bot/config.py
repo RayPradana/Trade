@@ -162,6 +162,25 @@ class BotConfig:
     # Hold past TP while RSI < this threshold (not yet overbought).
     # E.g. 70 = close only when RSI >= 70.  0 = disabled.
     conditional_tp_max_rsi: float = 0.0
+    # ── Sell-wall / orderbook wall guard ─────────────────────────────────────
+    # Skip buy when the total ask-side depth (top-20 levels) is at least this
+    # many times larger than the total bid-side depth.
+    # E.g. 5 = skip if ask volume ≥ 5× bid volume (strong sell-wall pressure).
+    # 0 = disabled (default).
+    orderbook_wall_threshold: float = 0.0
+    # ── Pump protection ───────────────────────────────────────────────────────
+    # Skip entry when the price has risen by more than this fraction within the
+    # last pump_lookback_seconds.  Prevents FOMO buys after a sharp spike.
+    # E.g. 0.05 = skip buy if price is up >5% vs the oldest recorded price in
+    # the lookback window.  0 = disabled (default).
+    pump_protection_pct: float = 0.0
+    # Rolling window (seconds) used to detect a pump.  Default 60 seconds.
+    pump_lookback_seconds: float = 60.0
+    # ── Spread filter ─────────────────────────────────────────────────────────
+    # Skip any trade (buy or sell) when the bid-ask spread exceeds this
+    # fraction of the best bid price.
+    # E.g. 0.002 = skip when spread > 0.2%.  0 = disabled (default).
+    max_spread_pct: float = 0.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -240,6 +259,10 @@ class BotConfig:
             conditional_tp_min_trend_strength=float(os.getenv("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0")),
             conditional_tp_min_ob_imbalance=float(os.getenv("CONDITIONAL_TP_MIN_OB_IMBALANCE", "0")),
             conditional_tp_max_rsi=float(os.getenv("CONDITIONAL_TP_MAX_RSI", "0")),
+            orderbook_wall_threshold=float(os.getenv("ORDERBOOK_WALL_THRESHOLD", "0")),
+            pump_protection_pct=float(os.getenv("PUMP_PROTECTION_PCT", "0")),
+            pump_lookback_seconds=float(os.getenv("PUMP_LOOKBACK_SECONDS", "60")),
+            max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0")),
         )
         cfg._validate()
         return cfg
@@ -324,5 +347,13 @@ class BotConfig:
             raise ValueError("TRAILING_TP_PCT must be non-negative")
         if self.conditional_tp_max_rsi < 0:
             raise ValueError("CONDITIONAL_TP_MAX_RSI must be non-negative")
+        if self.orderbook_wall_threshold < 0:
+            raise ValueError("ORDERBOOK_WALL_THRESHOLD must be non-negative")
+        if self.pump_protection_pct < 0:
+            raise ValueError("PUMP_PROTECTION_PCT must be non-negative")
+        if self.pump_lookback_seconds <= 0:
+            raise ValueError("PUMP_LOOKBACK_SECONDS must be positive")
+        if self.max_spread_pct < 0:
+            raise ValueError("MAX_SPREAD_PCT must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()

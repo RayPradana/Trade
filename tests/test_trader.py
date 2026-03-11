@@ -1339,6 +1339,206 @@ class LiquidityDepthFilterTest(unittest.TestCase):
         self.assertIn("thin_market", outcome["reason"])
 
 
+def _make_buy_snap(price: float = 100.0, action: str = "buy") -> Dict[str, Any]:
+    """Helper to create a minimal buy snapshot for maybe_execute tests."""
+    return {
+        "pair": "btc_idr",
+        "price": price,
+        "trend": None,
+        "orderbook": None,
+        "volatility": None,
+        "levels": None,
+        "indicators": None,
+        "insufficient_data": False,
+        "grid_plan": None,
+        "decision": StrategyDecision(
+            mode="scalping",
+            action=action,
+            confidence=0.9,
+            reason="test",
+            target_price=price,
+            amount=0.1,
+            stop_loss=price * 0.95,
+            take_profit=price * 1.05,
+        ),
+    }
+
+
+class SpreadFilterTest(unittest.TestCase):
+    """Tests for MAX_SPREAD_PCT spread filter in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader_with_depth(self, bid: float, ask: float, max_spread_pct: float) -> Trader:
+        config = BotConfig(api_key=None, max_spread_pct=max_spread_pct, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [[str(bid), "10"]], "sell": [[str(ask), "10"]],
+            },
+        })()
+        return trader
+
+    def test_wide_spread_skips_buy(self):
+        """When spread > max_spread_pct the buy must be skipped."""
+        # bid=100, ask=103 → spread=3% > limit of 0.2%
+        trader = self._trader_with_depth(bid=100.0, ask=103.0, max_spread_pct=0.002)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("spread_too_wide", outcome["reason"])
+
+    def test_wide_spread_skips_sell(self):
+        """Spread filter also applies to sell actions."""
+        trader = self._trader_with_depth(bid=100.0, ask=103.0, max_spread_pct=0.002)
+        # pre-load a position so sell isn't blocked by insufficient balance
+        trader.tracker.record_trade("buy", 90.0, 0.1)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0, action="sell"))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("spread_too_wide", outcome["reason"])
+
+    def test_tight_spread_allows_trade(self):
+        """When spread is within limit the trade must proceed past the spread check."""
+        # bid=100, ask=100.1 → spread=0.1% < limit of 0.2%
+        trader = self._trader_with_depth(bid=100.0, ask=100.1, max_spread_pct=0.002)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        # Status may be skipped for other reasons (balance) but NOT spread
+        self.assertNotIn("spread_too_wide", outcome.get("reason", ""))
+
+    def test_spread_filter_disabled(self):
+        """When max_spread_pct=0 the spread filter is disabled."""
+        trader = self._trader_with_depth(bid=100.0, ask=200.0, max_spread_pct=0.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        self.assertNotIn("spread_too_wide", outcome.get("reason", ""))
+
+
+class SellWallGuardTest(unittest.TestCase):
+    """Tests for ORDERBOOK_WALL_THRESHOLD sell-wall guard in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader_with_depth(self, bid_vol: float, ask_vol: float, threshold: float) -> Trader:
+        config = BotConfig(api_key=None, orderbook_wall_threshold=threshold, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", str(bid_vol)]],
+                "sell": [["100.1", str(ask_vol)]],
+            },
+        })()
+        return trader
+
+    def test_dominant_sell_wall_blocks_buy(self):
+        """When ask/bid volume ratio ≥ threshold the buy must be blocked."""
+        # ask=500 units, bid=100 units → ratio=5.0 ≥ threshold=5.0
+        trader = self._trader_with_depth(bid_vol=100.0, ask_vol=500.0, threshold=5.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("sell_wall", outcome["reason"])
+
+    def test_balanced_book_allows_buy(self):
+        """When ask/bid ratio < threshold the buy must NOT be blocked by wall guard."""
+        # ask=200, bid=100 → ratio=2.0 < threshold=5.0
+        trader = self._trader_with_depth(bid_vol=100.0, ask_vol=200.0, threshold=5.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        self.assertNotIn("sell_wall", outcome.get("reason", ""))
+
+    def test_wall_guard_does_not_block_sell(self):
+        """The sell-wall guard only applies to buy orders."""
+        trader = self._trader_with_depth(bid_vol=100.0, ask_vol=500.0, threshold=5.0)
+        trader.tracker.record_trade("buy", 90.0, 0.1)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0, action="sell"))
+        self.assertNotIn("sell_wall", outcome.get("reason", ""))
+
+    def test_wall_guard_disabled(self):
+        """When threshold=0 the sell-wall guard is disabled."""
+        trader = self._trader_with_depth(bid_vol=1.0, ask_vol=1000.0, threshold=0.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        self.assertNotIn("sell_wall", outcome.get("reason", ""))
+
+
+class PumpProtectionTest(unittest.TestCase):
+    """Tests for pump protection in _record_price / _is_pumped / maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader(self, pump_pct: float = 0.05, lookback: float = 60.0) -> Trader:
+        config = BotConfig(
+            api_key=None,
+            pump_protection_pct=pump_pct,
+            pump_lookback_seconds=lookback,
+            dry_run=True,
+        )
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.1", "10"]],
+            },
+        })()
+        return trader
+
+    def test_is_pumped_returns_false_with_no_history(self):
+        trader = self._trader()
+        self.assertFalse(trader._is_pumped(200.0))
+
+    def test_is_pumped_returns_false_when_disabled(self):
+        trader = self._trader(pump_pct=0.0)
+        trader._price_history = [(0.0, 100.0)]
+        self.assertFalse(trader._is_pumped(200.0))
+
+    def test_is_pumped_true_on_large_rise(self):
+        trader = self._trader(pump_pct=0.05)
+        trader._price_history = [(0.0, 100.0)]  # inject old price manually
+        self.assertTrue(trader._is_pumped(106.0))   # +6% > 5% threshold
+
+    def test_is_pumped_false_on_small_rise(self):
+        trader = self._trader(pump_pct=0.05)
+        trader._price_history = [(0.0, 100.0)]
+        self.assertFalse(trader._is_pumped(104.0))  # +4% < 5% threshold
+
+    def test_record_price_populates_history(self):
+        trader = self._trader(pump_pct=0.05)
+        self.assertEqual(trader._price_history, [])
+        trader._record_price(100.0)
+        self.assertEqual(len(trader._price_history), 1)
+        self.assertAlmostEqual(trader._price_history[0][1], 100.0)
+
+    def test_record_price_noop_when_disabled(self):
+        trader = self._trader(pump_pct=0.0)
+        trader._record_price(100.0)
+        self.assertEqual(trader._price_history, [])
+
+    def test_pump_blocks_buy_in_maybe_execute(self):
+        """A pumped price should cause maybe_execute to skip the buy."""
+        trader = self._trader(pump_pct=0.05)
+        # Inject a historic price well below the current price to simulate pump
+        import time as _time
+        trader._price_history = [(_time.time() - 30, 80.0)]  # 30s ago @ 80
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))  # +25% pump
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("pump_detected", outcome["reason"])
+
+    def test_pump_does_not_block_sell(self):
+        """Pump protection only applies to buy orders."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05)
+        trader._price_history = [(_time.time() - 30, 80.0)]
+        trader.tracker.record_trade("buy", 80.0, 0.1)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0, action="sell"))
+        self.assertNotIn("pump_detected", outcome.get("reason", ""))
+
+
 class EvaluateDynamicTpTest(unittest.TestCase):
     def setUp(self):
         logging.disable(logging.CRITICAL)

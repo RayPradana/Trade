@@ -294,3 +294,56 @@ class DynamicTpConfigTest(TestCase):
         with patch.dict(__import__("os").environ, {"PROFIT_BUFFER_DRAWDOWN_PCT": "1.0"}, clear=True):
             with self.assertRaises(ValueError):
                 BotConfig.from_env()
+
+    def test_orderbook_wall_defaults_to_zero(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.orderbook_wall_threshold, 0.0)
+
+    def test_orderbook_wall_from_env(self):
+        with patch.dict(os.environ, {"ORDERBOOK_WALL_THRESHOLD": "5"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.orderbook_wall_threshold, 5.0)
+
+    def test_orderbook_wall_negative_invalid(self):
+        with patch.dict(os.environ, {"ORDERBOOK_WALL_THRESHOLD": "-1"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_pump_protection_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.pump_protection_pct, 0.0)
+            self.assertAlmostEqual(cfg.pump_lookback_seconds, 60.0)
+
+    def test_pump_protection_from_env(self):
+        env = {"PUMP_PROTECTION_PCT": "0.05", "PUMP_LOOKBACK_SECONDS": "120"}
+        with patch.dict(os.environ, env, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.pump_protection_pct, 0.05)
+            self.assertAlmostEqual(cfg.pump_lookback_seconds, 120.0)
+
+    def test_pump_protection_negative_pct_invalid(self):
+        with patch.dict(os.environ, {"PUMP_PROTECTION_PCT": "-0.01"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_pump_lookback_zero_invalid(self):
+        with patch.dict(os.environ, {"PUMP_LOOKBACK_SECONDS": "0"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_max_spread_pct_defaults_to_zero(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.max_spread_pct, 0.0)
+
+    def test_max_spread_pct_from_env(self):
+        with patch.dict(os.environ, {"MAX_SPREAD_PCT": "0.002"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.max_spread_pct, 0.002)
+
+    def test_max_spread_pct_negative_invalid(self):
+        with patch.dict(os.environ, {"MAX_SPREAD_PCT": "-0.001"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
