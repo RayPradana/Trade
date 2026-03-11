@@ -6,6 +6,7 @@ Bot trading otomatis untuk Indodax menggunakan Python. Bot melakukan:
 - Analisa order book (spread, ketidakseimbangan volume), volume, support/resistance, dan candlestick dari data trades real-time
 - Pemilihan gaya trading otomatis (scalping, day trading, swing, position) sesuai kondisi pasar
 - Eksekusi limit order beli/jual otomatis dengan batasan slippage, stop-loss, take-profit (stop-limit secara logis melalui stop-loss guard)
+- Risk management: target profit, batas rugi, pembatasan ukuran order berdasarkan modal/cash, dan proteksi over-sell posisi
 - Mode **dry-run** bawaan agar aman untuk simulasi tanpa mengeksekusi order sungguhan
 
 > Gunakan dokumentasi resmi Indodax: https://github.com/btcid/indodax-official-api-docs
@@ -80,7 +81,7 @@ Opsi penting:
 5. **Eksekusi & guard**: 
    - **Dry-run**: hanya log simulasi.
    - **Live**: mengirim **limit order** `trade` ke `tapi` Indodax (butuh API key/secret). Stop-limit dijaga secara logis lewat stop-loss/take-profit dan pengecekan slippage.
-   - Portfolio guard berhenti otomatis bila target profit tercapai atau batas rugi terlampaui.
+   - Risk guard: ukuran order dibatasi modal/posisi yang tersedia, tidak akan oversell; portfolio guard berhenti otomatis bila target profit tercapai atau batas rugi terlampaui.
 
 ## Keamanan & Catatan
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 
 @dataclass
@@ -48,7 +48,7 @@ class PortfolioTracker:
             min_equity=self.min_equity,
         )
 
-    def stop_reason(self, mark_price: float) -> str | None:
+    def stop_reason(self, mark_price: float) -> Optional[str]:
         snap = self.snapshot(mark_price)
         if snap.equity >= self.target_equity:
             return "target_profit_reached"

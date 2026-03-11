@@ -46,8 +46,8 @@ class Trader:
             raise ValueError("Ticker missing price fields")
         return float(last_value)
 
-    def analyze_market(self) -> Dict[str, Any]:
-        pair = self.config.pair
+    def analyze_market(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        pair = pair or self.config.pair
         ticker = self.client.get_ticker(pair)
         depth = self.client.get_depth(pair, count=200)
         trades = self.client.get_trades(pair, count=400)
@@ -112,14 +112,30 @@ class Trader:
                 "portfolio": self.tracker.as_dict(reference_price),
             }
 
+        # capital and position guards (risk management)
+        effective_amount = decision.amount
+        if decision.action == "buy":
+            max_affordable = max(0.0, self.tracker.cash / reference_price)
+            effective_amount = min(decision.amount, max_affordable)
+        elif decision.action == "sell":
+            max_sellable = max(0.0, self.tracker.base_position)
+            effective_amount = min(decision.amount, max_sellable)
+
+        if effective_amount <= 0:
+            return {
+                "status": "skipped",
+                "reason": "insufficient balance or position",
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
+
         if self.config.dry_run:
-            logger.info("DRY-RUN %s %s @ %s", decision.action, decision.amount, reference_price)
-            self.tracker.record_trade(decision.action, reference_price, decision.amount)
+            logger.info("DRY-RUN %s %s @ %s", decision.action, effective_amount, reference_price)
+            self.tracker.record_trade(decision.action, reference_price, effective_amount)
             return {
                 "status": "simulated",
                 "action": decision.action,
                 "price": reference_price,
-                "amount": decision.amount,
+                "amount": effective_amount,
                 "mode": decision.mode,
                 "stop_loss": decision.stop_loss,
                 "take_profit": decision.take_profit,
@@ -134,15 +150,15 @@ class Trader:
             raise ValueError("API credentials required for live trading")
 
         order_resp = self.client.create_order(
-            self.config.pair, decision.action, reference_price, decision.amount
+            self.config.pair, decision.action, reference_price, effective_amount
         )
-        self.tracker.record_trade(decision.action, reference_price, decision.amount)
+        self.tracker.record_trade(decision.action, reference_price, effective_amount)
         return {
             "status": "placed",
             "order": order_resp,
             "action": decision.action,
             "price": reference_price,
-            "amount": decision.amount,
+            "amount": effective_amount,
             "mode": decision.mode,
             "portfolio": self.tracker.as_dict(reference_price),
         }
@@ -172,9 +188,8 @@ class Trader:
         best_score = -1.0
 
         for pair in pairs:
-            self.config.pair = pair
             try:
-                snapshot = self.analyze_market()
+                snapshot = self.analyze_market(pair)
             except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for flaky pairs
                 logger.warning("Failed to analyze %s: %s", pair, exc)
                 continue
@@ -192,4 +207,4 @@ class Trader:
 
         # fallback to default pair if nothing tradable
         self.config.pair = best_pair
-        return best_pair, self.analyze_market()
+        return best_pair, self.analyze_market(best_pair)

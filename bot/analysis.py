@@ -45,7 +45,7 @@ class SupportResistance:
     lookback: int
 
 
-def _to_float(value: str) -> float:
+def _safe_float(value: str) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -71,8 +71,8 @@ def build_candles(
     candles: List[Candle] = []
     for bucket_ts in sorted(buckets.keys())[-limit:]:
         bucket_trades = buckets[bucket_ts]
-        trade_prices = [_to_float(t.get("price")) for t in bucket_trades]
-        amounts = [_to_float(t.get("amount", 0)) for t in bucket_trades]
+        trade_prices = [_safe_float(t.get("price")) for t in bucket_trades]
+        amounts = [_safe_float(t.get("amount", 0)) for t in bucket_trades]
         if not trade_prices:
             continue
         candles.append(
@@ -129,11 +129,11 @@ def analyze_trend(
 def analyze_orderbook(depth: Dict[str, object]) -> OrderbookInsight:
     bids = depth.get("buy") or []
     asks = depth.get("sell") or []
-    top_bid = _to_float(bids[0][0]) if bids else 0.0
-    top_ask = _to_float(asks[0][0]) if asks else 0.0
+    top_bid = _safe_float(bids[0][0]) if bids else 0.0
+    top_ask = _safe_float(asks[0][0]) if asks else 0.0
     spread_pct = (top_ask - top_bid) / top_bid if top_bid else 0.0
-    bid_volume = sum(_to_float(b[1]) for b in bids[:20])
-    ask_volume = sum(_to_float(a[1]) for a in asks[:20])
+    bid_volume = sum(_safe_float(b[1]) for b in bids[:20])
+    ask_volume = sum(_safe_float(a[1]) for a in asks[:20])
     total = bid_volume + ask_volume
     imbalance = (bid_volume - ask_volume) / total if total else 0.0
     return OrderbookInsight(
