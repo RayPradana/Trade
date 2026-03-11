@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import signal
 import sys
@@ -11,44 +12,86 @@ import requests
 from bot.config import BotConfig
 from bot.trader import Trader
 
-# ANSI color codes – automatically disabled when output is not a terminal
+# ── ANSI codes — disabled when stdout is not a terminal ─────────────────
 _USE_COLOR = sys.stdout.isatty()
 
-_RESET = "\033[0m" if _USE_COLOR else ""
-_BOLD = "\033[1m" if _USE_COLOR else ""
-_DIM = "\033[2m" if _USE_COLOR else ""
-_CYAN = "\033[36m" if _USE_COLOR else ""
-_GREEN = "\033[32m" if _USE_COLOR else ""
-_YELLOW = "\033[33m" if _USE_COLOR else ""
-_RED = "\033[31m" if _USE_COLOR else ""
+_RESET   = "\033[0m"  if _USE_COLOR else ""
+_BOLD    = "\033[1m"  if _USE_COLOR else ""
+_DIM     = "\033[2m"  if _USE_COLOR else ""
+_CYAN    = "\033[36m" if _USE_COLOR else ""
+_GREEN   = "\033[32m" if _USE_COLOR else ""
+_YELLOW  = "\033[33m" if _USE_COLOR else ""
+_RED     = "\033[31m" if _USE_COLOR else ""
 _MAGENTA = "\033[35m" if _USE_COLOR else ""
-_BLUE = "\033[34m" if _USE_COLOR else ""
+_BLUE    = "\033[34m" if _USE_COLOR else ""
+_WHITE   = "\033[97m" if _USE_COLOR else ""
 
 _LEVEL_COLORS = {
-    "DEBUG": _CYAN,
-    "INFO": _GREEN,
-    "WARNING": _YELLOW,
-    "ERROR": _RED,
+    "DEBUG":    _CYAN,
+    "INFO":     _GREEN,
+    "WARNING":  _YELLOW,
+    "ERROR":    _RED,
     "CRITICAL": _MAGENTA,
 }
 
 _ACTION_ICONS = {
-    "buy": "📈",
+    "buy":  "📈",
     "sell": "📉",
     "hold": "⏸️",
     "grid": "🔲",
 }
 
 _STATUS_ICONS = {
-    "simulated": "🧪",
-    "placed": "✅",
-    "skipped": "⏭️",
-    "hold": "⏸️",
-    "stopped": "🛑",
-    "force_sold": "📤",
+    "simulated":      "🧪",
+    "placed":         "✅",
+    "skipped":        "⏭️",
+    "hold":           "⏸️",
+    "stopped":        "🛑",
+    "force_sold":     "📤",
     "grid_simulated": "🔲",
-    "grid_placed": "🔲",
+    "grid_placed":    "🔲",
 }
+
+# ── Display primitives ───────────────────────────────────────────────────
+
+def _conf_bar(conf: float, width: int = 10) -> str:
+    """Unicode block progress-bar for a confidence value (0–1)."""
+    filled = int(conf * width)
+    bar = "█" * filled + "░" * (width - filled)
+    color = _GREEN if conf >= 0.7 else (_YELLOW if conf >= 0.52 else _RED)
+    return f"{color}{bar}{_RESET} {_BOLD}{conf:.3f}{_RESET}"
+
+
+def _pnl_str(value: float) -> str:
+    """Colored PnL string: green ▲ for profit, red ▼ for loss."""
+    if value > 0:
+        return f"{_GREEN}{_BOLD}▲ +{value:,.2f}{_RESET}"
+    if value < 0:
+        return f"{_RED}{_BOLD}▼ {value:,.2f}{_RESET}"
+    return f"{_DIM}  {value:,.2f}{_RESET}"
+
+
+def _pct_str(value: float) -> str:
+    """Colored percentage string."""
+    if value > 0:
+        return f"{_GREEN}+{value:.2f}%{_RESET}"
+    if value < 0:
+        return f"{_RED}{value:.2f}%{_RESET}"
+    return f" {value:.2f}%"
+
+
+def _idr(value: float) -> str:
+    """Format a number with thousands-separator (IDR style)."""
+    return f"Rp {value:>15,.2f}"
+
+
+def _idr_compact(value: float) -> str:
+    """Compact IDR display: billions → 'B', millions → 'M', otherwise full."""
+    if value >= 1_000_000_000:
+        return f"Rp {value / 1_000_000_000:.3f}B"
+    if value >= 1_000_000:
+        return f"Rp {value / 1_000_000:.2f}M"
+    return f"Rp {value:,.2f}"
 
 
 class _ColoredFormatter(logging.Formatter):
@@ -72,26 +115,282 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
+# ── Section separators ───────────────────────────────────────────────────
+
 def _separator(label: str = "") -> str:
-    width = 72
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    width = 68
     if label:
-        pad = max(0, (width - len(label) - 2) // 2)
-        return f"{_BOLD}{_BLUE}{'─' * pad} {label} {'─' * pad}{_RESET}"
-    return f"{_DIM}{'─' * width}{_RESET}"
+        body = f" {label} "
+        ts_tag = f" {ts} "
+        dashes = max(4, width - len(body) - len(ts_tag))
+        left  = dashes // 2
+        right = dashes - left
+        return (
+            f"{_BOLD}{_BLUE}{'═' * left}{body}{'═' * right}{_RESET}"
+            f"{_DIM}{ts_tag}{_RESET}"
+        )
+    return f"{_DIM}{'─' * width}  {ts}{_RESET}"
 
 
-def _log_portfolio(portfolio: dict, prefix: str = "   portf  ") -> None:
-    trailing = f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—"
+# ── Startup banner ────────────────────────────────────────────────────────
+
+def _log_startup_banner(config: BotConfig) -> None:
+    """Print a startup banner summarising key configuration."""
+    dry_tag  = (f"{_GREEN}✅ YES (simulated){_RESET}"
+                if config.dry_run else f"{_RED}🔴 NO  (LIVE){_RESET}")
+    resume   = str(config.state_path) if config.state_path else f"{_DIM}disabled{_RESET}"
+    sep = f"{_DIM}{'─' * 50}{_RESET}"
+    logging.info(sep)
+    logging.info("🤖  %s%sINDODAX TRADING BOT%s  %sby RayPradana%s",
+                 _BOLD, _WHITE, _RESET, _DIM, _RESET)
+    logging.info(sep)
+    logging.info("   %-12s %s%-12s%s  │  dry-run  : %s",
+                 "mode     :", _BOLD, config.trade_mode.upper(), _RESET, dry_tag)
+    logging.info("   %-12s %s  │  pair     : %s%s%s",
+                 "capital  :", f"{_BOLD}Rp {config.initial_capital:>18,.0f}{_RESET}",
+                 _BOLD, config.pair, _RESET)
+    logging.info("   %-12s %s+%.1f%%%s      │  max-loss : %s-%.1f%%%s",
+                 "target   :",
+                 _GREEN, config.target_profit_pct * 100, _RESET,
+                 _RED,   config.max_loss_pct * 100,      _RESET)
+    logging.info("   %-12s %s", "resume   :", resume)
+    logging.info(sep)
+
+
+# ── Signal display (BUY/SELL decision) ───────────────────────────────────
+
+def _log_signal(snapshot: dict) -> None:
+    """Log a buy/sell signal with market data and indicators in tree format."""
+    decision = snapshot["decision"]
+    ob       = snapshot.get("orderbook")
+    levels   = snapshot.get("levels")
+    vol      = snapshot.get("volatility")
+    ind      = snapshot.get("indicators")
+    pair     = snapshot["pair"]
+    price    = snapshot["price"]
+
+    action_color = (_GREEN if decision.action == "buy"
+                    else _RED if decision.action == "sell" else _YELLOW)
+    icon = _ACTION_ICONS.get(decision.action, "❓")
+
+    # ── Header line ──────────────────────────────────────────────────────
     logging.info(
-        "%s: equity=%s  cash=%s  pos=%.8f  pnl=%s  trades=%d  win=%.0f%%  trail=%s",
-        prefix,
-        f"{portfolio['equity']:,.2f}",
-        f"{portfolio['cash']:,.2f}",
-        portfolio["base_position"],
-        f"{portfolio['realized_pnl']:+,.2f}",
-        portfolio["trade_count"],
-        portfolio["win_rate"] * 100,
-        trailing,
+        "%s %s%s %s%s  %s%s%s  ·  %s  ·  conf %s  ·  %s%s%s",
+        icon,
+        action_color, _BOLD, decision.action.upper(), _RESET,
+        _BOLD, pair, _RESET,
+        _idr(price),
+        _conf_bar(decision.confidence),
+        _DIM, decision.mode, _RESET,
+    )
+
+    # ── Reason ───────────────────────────────────────────────────────────
+    logging.info("   %s├─%s reason  : %s", _DIM, _RESET, decision.reason)
+
+    # ── Market data ──────────────────────────────────────────────────────
+    spread_pct = (ob.spread_pct * 100) if ob else float("nan")
+    imbalance  = ob.imbalance if ob else float("nan")
+    volatility = vol.volatility if vol else float("nan")
+    imb_color  = _GREEN if imbalance > 0.1 else (_RED if imbalance < -0.1 else _YELLOW)
+    logging.info(
+        "   %s├─%s market  : spread=%s%.4f%%%s  imbalance=%s%+.3f%s  vol=%s%.4f%s",
+        _DIM, _RESET,
+        _DIM, spread_pct, _RESET,
+        imb_color, imbalance, _RESET,
+        _DIM, volatility, _RESET,
+    )
+
+    # ── Support / Resistance ─────────────────────────────────────────────
+    sup = (f"{_GREEN}{_idr_compact(levels.support)}{_RESET}"
+           if (levels and levels.support) else f"{_DIM}N/A{_RESET}")
+    res = (f"{_RED}{_idr_compact(levels.resistance)}{_RESET}"
+           if (levels and levels.resistance) else f"{_DIM}N/A{_RESET}")
+    logging.info(
+        "   %s├─%s levels  : support=%s    resistance=%s",
+        _DIM, _RESET, sup, res,
+    )
+
+    # ── Technical indicators ─────────────────────────────────────────────
+    if ind:
+        rsi_color  = (_GREEN if 40 < ind.rsi < 60
+                      else _RED if ind.rsi >= 70 or ind.rsi <= 30 else _YELLOW)
+        macd_color = _GREEN if ind.macd > 0 else _RED
+        bb_lo = _idr_compact(ind.bb_lower)
+        bb_mi = _idr_compact(ind.bb_mid)
+        bb_hi = _idr_compact(ind.bb_upper)
+        logging.info(
+            "   %s└─%s indic   : RSI=%s%.1f%s  MACD=%s%+.6f%s  BB[%s%s%s / %s / %s%s%s]",
+            _DIM, _RESET,
+            rsi_color, ind.rsi, _RESET,
+            macd_color, ind.macd, _RESET,
+            _GREEN, bb_lo, _RESET,
+            bb_mi,
+            _RED, bb_hi, _RESET,
+        )
+    else:
+        logging.info("   %s└─%s indic   : —", _DIM, _RESET)
+
+
+# ── Order result display ─────────────────────────────────────────────────
+
+def _log_outcome(outcome: dict) -> None:
+    """Log the result of maybe_execute in tree format."""
+    status = outcome.get("status", "—")
+    action = outcome.get("action", "—")
+    price  = outcome.get("price")
+    amount = outcome.get("amount")
+    icon   = _STATUS_ICONS.get(status, "❓")
+
+    status_color = (
+        _GREEN  if status in ("simulated", "placed")
+        else _RED    if status in ("stopped", "force_sold")
+        else _YELLOW if status in ("skipped",)
+        else _DIM
+    )
+
+    price_str  = f"{_BOLD}{_idr(float(price))}{_RESET}" if price  else f"{_DIM}—{_RESET}"
+    amount_str = f"{_BOLD}{float(amount):.8f}{_RESET}"   if amount else f"{_DIM}—{_RESET}"
+    action_str = action.upper() if action else "—"
+
+    logging.info(
+        "%s %s%s%s  ·  %s  ·  %s  ·  @ %s",
+        icon,
+        status_color, _BOLD + status.upper() + _RESET, _RESET,
+        action_str,
+        amount_str,
+        price_str,
+    )
+
+    steps  = outcome.get("executed_steps")
+    stop   = outcome.get("stop_loss")
+    tp     = outcome.get("take_profit")
+    reason = outcome.get("reason")
+
+    lines: list = []
+    if steps and len(steps) > 1:
+        lines.append(f"steps     : {len(steps)} staged entries")
+    if stop:
+        lines.append(f"stop-loss : {_RED}{_idr(float(stop))}{_RESET}")
+    if tp:
+        lines.append(f"take-prof : {_GREEN}{_idr(float(tp))}{_RESET}")
+    if reason and status not in ("simulated", "placed"):
+        lines.append(f"reason    : {_DIM}{reason}{_RESET}")
+
+    for i, line in enumerate(lines):
+        connector = "└─" if i == len(lines) - 1 else "├─"
+        logging.info("   %s%s%s %s", _DIM, connector, _RESET, line)
+
+
+# ── Portfolio display ────────────────────────────────────────────────────
+
+def _log_portfolio(portfolio: dict, initial_capital: float = 0.0) -> None:
+    """Log a multi-line tree-formatted portfolio summary."""
+    equity   = portfolio["equity"]
+    cash     = portfolio["cash"]
+    pos      = portfolio["base_position"]
+    pnl      = portfolio["realized_pnl"]
+    avg_cost = portfolio.get("avg_cost", 0.0)
+    trades   = portfolio.get("trade_count", 0)
+    win_rate = portfolio.get("win_rate", 0.0)
+    trail    = portfolio.get("trailing_stop")
+    t_equity = portfolio.get("target_equity", 0.0)
+    m_equity = portfolio.get("min_equity", 0.0)
+
+    # unrealized = (equity - cash) - pos * avg_cost   [equity = cash + pos * mark_price]
+    unrealized = (equity - cash) - pos * avg_cost if pos > 0 else 0.0
+
+    equity_pct_str = ""
+    if initial_capital > 0:
+        equity_pct = (equity - initial_capital) / initial_capital * 100
+        equity_pct_str = f"  ({_pct_str(equity_pct)} vs initial)"
+
+    logging.info("%s📊 Portfolio%s", _BOLD, _RESET)
+    logging.info(
+        "   %s├─%s equity   : %s%s",
+        _DIM, _RESET,
+        f"{_BOLD}{_idr(equity)}{_RESET}",
+        equity_pct_str,
+    )
+    logging.info(
+        "   %s├─%s cash     : %s    position : %s%.8f%s coin",
+        _DIM, _RESET,
+        f"{_idr(cash)}",
+        _BOLD, pos, _RESET,
+    )
+    if pos > 0:
+        logging.info(
+            "   %s├─%s avg cost : %s    unrealized: %s",
+            _DIM, _RESET,
+            f"{_idr(avg_cost)}",
+            _pnl_str(unrealized),
+        )
+    logging.info(
+        "   %s├─%s real PnL : %s    trades : %s%d%s  win-rate : %s%.0f%%%s",
+        _DIM, _RESET,
+        _pnl_str(pnl),
+        _BOLD, trades, _RESET,
+        _GREEN if win_rate >= 0.5 else _RED, win_rate * 100, _RESET,
+    )
+    trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"    if trail    else f"{_DIM}—{_RESET}"
+    target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}"  if t_equity else f"{_DIM}—{_RESET}"
+    floor_str  = f"{_RED}{_idr(m_equity)}{_RESET}"    if m_equity else f"{_DIM}—{_RESET}"
+    logging.info(
+        "   %s└─%s trail    : %s    target : %s    floor : %s",
+        _DIM, _RESET, trail_str, target_str, floor_str,
+    )
+
+
+# ── Holding-position status ───────────────────────────────────────────────
+
+def _log_holding(pair: str, price: float, portfolio: dict,
+                 initial_capital: float = 0.0) -> None:
+    """Log a compact holding-position summary with unrealized PnL."""
+    pos      = portfolio["base_position"]
+    avg_cost = portfolio.get("avg_cost", 0.0)
+    equity   = portfolio["equity"]
+    cash     = portfolio["cash"]
+    trail    = portfolio.get("trailing_stop")
+    t_equity = portfolio.get("target_equity", 0.0)
+
+    unrealized = (equity - cash) - pos * avg_cost if pos > 0 else 0.0
+    unreal_pct = (unrealized / (pos * avg_cost) * 100) if (pos > 0 and avg_cost > 0) else 0.0
+
+    equity_pct_str = ""
+    if initial_capital > 0:
+        equity_pct = (equity - initial_capital) / initial_capital * 100
+        equity_pct_str = f"  ({_pct_str(equity_pct)})"
+
+    logging.info(
+        "⏸️  %sHOLDING%s  %s%s%s  ·  price %s",
+        _BOLD, _RESET,
+        _BOLD, pair, _RESET,
+        f"{_YELLOW}{_idr(price)}{_RESET}",
+    )
+    logging.info(
+        "   %s├─%s position : %s%.8f%s coin  @  avg %s",
+        _DIM, _RESET,
+        _BOLD, pos, _RESET,
+        f"{_idr(avg_cost)}",
+    )
+    logging.info(
+        "   %s├─%s unrealized: %s  (%s%.2f%%%s)",
+        _DIM, _RESET,
+        _pnl_str(unrealized),
+        _GREEN if unreal_pct >= 0 else _RED, unreal_pct, _RESET,
+    )
+    logging.info(
+        "   %s├─%s equity    : %s%s    cash : %s",
+        _DIM, _RESET,
+        f"{_BOLD}{_idr(equity)}{_RESET}",
+        equity_pct_str,
+        f"{_idr(cash)}",
+    )
+    trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"   if trail    else f"{_DIM}—{_RESET}"
+    target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}" if t_equity else f"{_DIM}—{_RESET}"
+    logging.info(
+        "   %s└─%s trail     : %s    target : %s",
+        _DIM, _RESET, trail_str, target_str,
     )
 
 
@@ -103,11 +402,7 @@ def main() -> None:
         config.require_auth()
 
     trader = Trader(config)
-    logging.info(
-        "🤖 Starting bot | mode=%s  dry_run=%s",
-        config.trade_mode.upper(),
-        config.dry_run,
-    )
+    _log_startup_banner(config)
 
     # ── Graceful shutdown on SIGTERM (e.g. Docker / systemd stop) ──────────
     _shutdown = threading.Event()
@@ -130,7 +425,12 @@ def main() -> None:
     # ── Auto-resume: use the pair from saved state if we're resuming ────────
     if trader.restored_pair:
         pair = trader.restored_pair
-        logging.info("🔄 Resuming saved position on %s  pos=%.8f", pair, trader.tracker.base_position)
+        logging.info(
+            "🔄 %sRESUMING%s  pair=%s%s%s  pos=%.8f",
+            _BOLD, _RESET,
+            _BOLD, pair, _RESET,
+            trader.tracker.base_position,
+        )
 
     while not _shutdown.is_set():
         cycle += 1
@@ -156,19 +456,25 @@ def main() -> None:
 
                 if should_exit:
                     exit_reason = stop_reason or f"sell signal ({held_decision.reason[:60]})"
-                    logging.info("📤 Exiting position on %s — %s", pair, exit_reason)
+                    logging.info(
+                        "📤 %sEXIT%s  %s%s%s  ·  %s",
+                        _BOLD, _RESET,
+                        _BOLD, pair, _RESET,
+                        exit_reason,
+                    )
                     force_outcome = trader.force_sell(held_snapshot)
                     portfolio = trader.tracker.as_dict(held_price)
                     logging.info(
-                        "📊 Position closed: amount=%.8f  price=%s",
-                        force_outcome.get("amount", 0),
-                        f"{held_price:,.2f}",
+                        "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %15,.2f",
+                        _DIM, _RESET,
+                        _BOLD, force_outcome.get("amount", 0), _RESET,
+                        held_price,
                     )
-                    _log_portfolio(portfolio)
+                    _log_portfolio(portfolio, config.initial_capital)
                     consecutive_errors = 0
                     # single-trade mode: one complete cycle (buy → sell) is enough
                     if config.trade_mode == "single" and _entered_position:
-                        logging.info("✅ Single-trade cycle complete — stopping.")
+                        logging.info("✅ %sSingle-trade cycle complete — stopping.%s", _BOLD, _RESET)
                         break
                     if config.run_once:
                         break
@@ -178,14 +484,7 @@ def main() -> None:
 
                 # Still holding – use faster polling interval
                 portfolio = trader.tracker.as_dict(held_price)
-                logging.info(
-                    "⏸️  Holding %s | price=%s | pos=%.8f | equity=%s | trail=%s",
-                    pair,
-                    f"{held_price:,.2f}",
-                    trader.tracker.base_position,
-                    f"{portfolio['equity']:,.2f}",
-                    f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—",
-                )
+                _log_holding(pair, held_price, portfolio, config.initial_capital)
                 consecutive_errors = 0
                 if config.run_once:
                     break
@@ -194,55 +493,11 @@ def main() -> None:
 
             # ── Scan all pairs and choose the best opportunity ───────────────
             pair, snapshot = trader.scan_and_choose()
-            summary = snapshot["decision"]
-            icon = _ACTION_ICONS.get(summary.action, "❓")
-            logging.info(
-                "%s %s  pair=%-12s  mode=%-16s  price=%s  conf=%.3f",
-                icon,
-                summary.action.upper(),
-                pair,
-                summary.mode,
-                f"{snapshot['price']:,.2f}",
-                summary.confidence,
-            )
-            logging.info(
-                "   reason : %s",
-                summary.reason,
-            )
-            ob = snapshot.get("orderbook")
-            levels = snapshot.get("levels")
-            vol = snapshot.get("volatility")
-            ind = snapshot.get("indicators")
-            logging.info(
-                "   market : spread=%.4f%%  imbalance=%+.3f  vol=%.4f  "
-                "support=%s  resistance=%s",
-                (ob.spread_pct * 100) if ob else float("nan"),
-                ob.imbalance if ob else float("nan"),
-                vol.volatility if vol else float("nan"),
-                f"{levels.support:,.2f}" if levels and levels.support else "N/A",
-                f"{levels.resistance:,.2f}" if levels and levels.resistance else "N/A",
-            )
-            if ind:
-                logging.info(
-                    "   indic  : RSI=%.1f  MACD=%.6f  BB[%.2f / %.2f / %.2f]",
-                    ind.rsi,
-                    ind.macd,
-                    ind.bb_lower,
-                    ind.bb_mid,
-                    ind.bb_upper,
-                )
+            _log_signal(snapshot)
             outcome = trader.maybe_execute(snapshot)
-            status_icon = _STATUS_ICONS.get(outcome.get("status", ""), "❓")
-            logging.info(
-                "%s result : status=%-14s  action=%s  amount=%s  price=%s",
-                status_icon,
-                outcome.get("status"),
-                outcome.get("action", "—"),
-                outcome.get("amount", "—"),
-                outcome.get("price", "—"),
-            )
+            _log_outcome(outcome)
             portfolio = trader.tracker.as_dict(snapshot["price"])
-            _log_portfolio(portfolio)
+            _log_portfolio(portfolio, config.initial_capital)
 
             consecutive_errors = 0
             scan_cycles += 1
@@ -254,27 +509,29 @@ def main() -> None:
             # ── Stop condition: liquidate remaining position and rotate ───────
             if outcome.get("status") == "stopped":
                 logging.info(
-                    "🛑 Stop condition reached: %s — liquidating and rotating …",
-                    outcome.get("reason"),
+                    "🛑 %sSTOP%s  %s  — liquidating and rotating …",
+                    _BOLD, _RESET, outcome.get("reason", ""),
                 )
                 if trader.tracker.base_position > 0:
                     force_outcome = trader.force_sell(snapshot)
                     logging.info(
-                        "📤 Force-sold: amount=%s  price=%s",
-                        force_outcome.get("amount"),
-                        force_outcome.get("price"),
+                        "   📤 Force-sold : %s%.8f%s coin  ·  Rp %15,.2f",
+                        _BOLD, force_outcome.get("amount", 0), _RESET,
+                        force_outcome.get("price", 0),
                     )
                 # Re-compute portfolio after any liquidation
                 portfolio = trader.tracker.as_dict(snapshot["price"])
                 logging.info(
-                    "📊 Rotation summary: pnl=%s  equity=%s  trades=%d  win=%.0f%%",
-                    f"{portfolio['realized_pnl']:+,.2f}",
-                    f"{portfolio['equity']:,.2f}",
+                    "   📊 %sRotation%s : pnl=%s  equity=Rp %15,.2f  "
+                    "trades=%d  win=%.0f%%",
+                    _BOLD, _RESET,
+                    _pnl_str(portfolio["realized_pnl"]),
+                    portfolio["equity"],
                     portfolio["trade_count"],
                     portfolio["win_rate"] * 100,
                 )
                 if config.trade_mode == "single" and _entered_position:
-                    logging.info("✅ Single-trade cycle complete — stopping.")
+                    logging.info("✅ %sSingle-trade cycle complete — stopping.%s", _BOLD, _RESET)
                     break
                 if config.run_once:
                     break
@@ -284,15 +541,14 @@ def main() -> None:
 
         except (requests.RequestException, RuntimeError, ValueError):
             consecutive_errors += 1
-            # Cap the exponent at 10 so 2**exponent stays ≤ 1024 before min()
-            # (avoids overflow warnings from Python's arbitrary-precision ints).
+            # Cap the exponent so the computed delay doesn't grow beyond _max_backoff.
+            # Without this cap the multiplication could produce a very large intermediate
+            # value even though min() would ultimately clamp it.
             exponent = min(consecutive_errors - 1, 10)
             backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
-                "⚠️  Error #%d in bot loop (pair=%s) — backing off %.0fs",
-                consecutive_errors,
-                pair,
-                backoff,
+                "⚠️  %sError #%d%s  pair=%s  backing off %.0fs …",
+                _BOLD, consecutive_errors, _RESET, pair, backoff,
             )
             if config.run_once:
                 logging.info("run_once enabled; exiting after recoverable error")
@@ -300,7 +556,7 @@ def main() -> None:
             time.sleep(backoff)
             continue
         except KeyboardInterrupt:
-            logging.info("⏹️  Bot stopped by user")
+            logging.info("⏹️  %sBOT STOPPED%s by user", _BOLD, _RESET)
             break
 
         if config.run_once:
@@ -309,10 +565,11 @@ def main() -> None:
         # Periodic performance summary every N full-scan cycles
         if scan_cycles > 0 and scan_cycles % config.cycle_summary_interval == 0:
             logging.info(
-                "📊 Periodic summary (scan #%d): pnl=%s  equity=%s  trades=%d  win=%.0f%%",
-                scan_cycles,
-                f"{portfolio['realized_pnl']:+,.2f}",
-                f"{portfolio['equity']:,.2f}",
+                "📊 %sPeriodic summary%s  scan #%d : pnl=%s  equity=Rp %15,.2f  "
+                "trades=%d  win=%.0f%%",
+                _BOLD, _RESET, scan_cycles,
+                _pnl_str(portfolio["realized_pnl"]),
+                portfolio["equity"],
                 portfolio["trade_count"],
                 portfolio["win_rate"] * 100,
             )

@@ -93,12 +93,14 @@ class Trader:
         portfolio = state.get("portfolio")
         if portfolio is None:
             return
-        self.tracker.load_state(portfolio)
-        pair = state.get("pair")
-        if self.tracker.base_position <= 0:
+        # Check position BEFORE mutating tracker to avoid partial load of stale state
+        saved_pos = float((portfolio.get("base_position") or 0))
+        if saved_pos <= 0:
             # Stale state with no open position — remove to keep things clean
             self.persistence.clear()
             return
+        self.tracker.load_state(portfolio)
+        pair = state.get("pair")
         if pair:
             self.restored_pair = str(pair)
         logger.info(

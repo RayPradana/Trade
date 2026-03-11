@@ -60,5 +60,6 @@ class StatePersistence:
         try:
             backup_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(self.path, backup_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("State backup failed (%s → %s): %s", self.path, backup_path, exc)
