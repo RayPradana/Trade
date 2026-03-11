@@ -50,7 +50,7 @@ class BotConfig:
     websocket_url: Optional[str] = None
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
     websocket_batch_size: int = 100  # max pairs per WebSocket connection for multi-pair feed
-    pairs_per_cycle: int = 0  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
+    pairs_per_cycle: int = 50  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
     min_confidence: float = 0.52
     interval_seconds: int = 300
     fast_window: int = 12
@@ -97,7 +97,7 @@ class BotConfig:
             websocket_url=os.getenv("WEBSOCKET_URL"),
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
             websocket_batch_size=int(os.getenv("WEBSOCKET_BATCH_SIZE", "100")),
-            pairs_per_cycle=int(os.getenv("PAIRS_PER_CYCLE", "0")),
+            pairs_per_cycle=int(os.getenv("PAIRS_PER_CYCLE", "50")),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
             interval_seconds=interval_seconds,
             fast_window=int(os.getenv("FAST_WINDOW", "12")),

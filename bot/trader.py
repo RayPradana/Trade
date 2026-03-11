@@ -529,13 +529,22 @@ class Trader:
         best_snapshot: Optional[Dict[str, Any]] = None
         best_score = -1.0
         failed_pairs: List[str] = []
+        skipped_pairs: List[str] = []
+
+        feed_seeded = self._multi_feed.is_seeded
 
         for pair in pairs:
             if self.config.scan_request_delay > 0:
                 time.sleep(self.config.scan_request_delay)
-            # Use the multi-pair feed's cached ticker to skip the per-pair
-            # REST ticker call entirely.
+            # Use the multi-pair feed's cached ticker to skip the per-pair REST
+            # ticker call entirely.  When the feed is seeded but this specific
+            # pair has no cached data (absent from /api/summaries — typically
+            # inactive or very-new pairs), skip it rather than falling through
+            # to a REST call that would trigger a 429.
             prefetched_ticker = self._multi_feed.get_ticker(pair)
+            if prefetched_ticker is None and feed_seeded:
+                skipped_pairs.append(pair)
+                continue
             try:
                 snapshot = self._analyze_with_retry(pair, prefetched_ticker=prefetched_ticker)
             # pragma: no cover - guard for per-pair API/parse failures
@@ -551,6 +560,13 @@ class Trader:
                 best_score = score
                 best_snapshot = snapshot
                 best_pair = pair
+
+        if skipped_pairs:
+            logger.debug(
+                "Skipped %d pairs not in feed cache: %s",
+                len(skipped_pairs),
+                ",".join(skipped_pairs[:10]) + ("…" if len(skipped_pairs) > 10 else ""),
+            )
 
         if failed_pairs:
             logger.warning("Skipped %s pairs due to errors: %s", len(failed_pairs), ",".join(failed_pairs))

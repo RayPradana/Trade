@@ -265,6 +265,12 @@ class MultiPairFeed:
         with self._lock:
             return self._cache.get(pair)
 
+    @property
+    def is_seeded(self) -> bool:
+        """``True`` once the cache has been populated by at least one successful summaries fetch."""
+        with self._lock:
+            return bool(self._cache)
+
     def _apply_ws_message_for_pair(self, pair: str, ticker: Dict[str, Any]) -> None:
         """Update the cache for *pair* with *ticker* data.
 

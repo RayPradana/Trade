@@ -676,6 +676,94 @@ class TraderSelectionTests(unittest.TestCase):
             trader.scan_and_choose()
         self.assertIsNotNone(trader._multi_feed)
 
+    def test_scan_skips_pairs_absent_from_seeded_feed(self) -> None:
+        """When the feed is seeded and a pair is not in the cache, it must be
+        skipped (no REST ticker call) rather than falling through to the REST API."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+        all_pairs = ["btc_idr", "dogs_idr"]
+
+        # btc_idr is in the feed; dogs_idr is not (absent from summaries)
+        ticker_cache = {"btc_idr": {"last": "1000000000"}}
+        snapshots = {
+            "btc_idr": {
+                "pair": "btc_idr", "price": 1.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.7, reason="ok",
+                    target_price=1, amount=1, stop_loss=0.99, take_profit=1.01,
+                ),
+            },
+        }
+        trader = StubTrader(config, snapshots)
+        trader._all_pairs = all_pairs
+
+        # Build a seeded feed that only knows about btc_idr
+        feed = MultiPairFeed(all_pairs, mock.MagicMock(), websocket_enabled=False, summaries_interval=9999)
+        with feed._lock:
+            feed._cache.update(ticker_cache)  # seed directly – no REST call
+        trader._multi_feed = feed
+
+        analyzed: list[str] = []
+        original_analyze = trader.analyze_market
+
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if pair:
+                analyzed.append(pair)
+            return original_analyze(pair, prefetched_ticker)
+
+        trader.analyze_market = recording_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()
+
+        # dogs_idr must NOT have been analyzed (no REST fallback)
+        self.assertNotIn("dogs_idr", analyzed)
+        # btc_idr must have been analyzed normally
+        self.assertIn("btc_idr", analyzed)
+
+    def test_scan_does_not_skip_when_feed_unseeded(self) -> None:
+        """When the feed has no cached data (summaries failed), pairs must NOT be
+        skipped — the REST fallback must still work."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+        all_pairs = ["btc_idr"]
+        snapshots = {
+            "btc_idr": {
+                "pair": "btc_idr", "price": 1.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.7, reason="ok",
+                    target_price=1, amount=1, stop_loss=0.99, take_profit=1.01,
+                ),
+            },
+        }
+        trader = StubTrader(config, snapshots)
+        trader._all_pairs = all_pairs
+
+        # Build an empty (un-seeded) feed
+        feed = MultiPairFeed(all_pairs, mock.MagicMock(), websocket_enabled=False, summaries_interval=9999)
+        self.assertFalse(feed.is_seeded)  # confirm unseeded
+        trader._multi_feed = feed
+
+        analyzed: list[str] = []
+        original_analyze = trader.analyze_market
+
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if pair:
+                analyzed.append(pair)
+            return original_analyze(pair, prefetched_ticker)
+
+        trader.analyze_market = recording_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()
+
+        # btc_idr must still be analyzed even with no cache (REST fallback)
+        self.assertIn("btc_idr", analyzed)
+
 
 if __name__ == "__main__":
     unittest.main()

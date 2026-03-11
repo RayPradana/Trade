@@ -264,6 +264,46 @@ class MultiPairFeedTests(unittest.TestCase):
         expected_batches = math.ceil(5 / 2)
         self.assertEqual(expected_batches, 3)
 
+    def test_is_seeded_false_before_start(self) -> None:
+        """is_seeded must be False before start() is called."""
+        feed = MultiPairFeed(
+            ["btc_idr"],
+            _SummariesClientStub({}),
+            websocket_enabled=False,
+            summaries_interval=9999,
+        )
+        self.assertFalse(feed.is_seeded)
+
+    def test_is_seeded_true_after_successful_start(self) -> None:
+        """is_seeded must be True after start() successfully seeds from summaries."""
+        client = _SummariesClientStub({"btcidr": {"last": "1000000000"}})
+        feed = MultiPairFeed(
+            ["btc_idr"],
+            client,
+            websocket_enabled=False,
+            summaries_interval=9999,
+        )
+        feed.start()
+        try:
+            self.assertTrue(feed.is_seeded)
+        finally:
+            feed.stop()
+
+    def test_is_seeded_false_when_summaries_fails(self) -> None:
+        """is_seeded must remain False when the summaries fetch fails."""
+        client = _SummariesClientStub({}, fail=True)
+        feed = MultiPairFeed(
+            ["btc_idr"],
+            client,
+            websocket_enabled=False,
+            summaries_interval=9999,
+        )
+        feed.start()
+        try:
+            self.assertFalse(feed.is_seeded)
+        finally:
+            feed.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
