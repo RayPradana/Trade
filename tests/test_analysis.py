@@ -8,6 +8,7 @@ from bot.analysis import (
     analyze_volatility,
     build_candles,
     moving_average,
+    support_resistance,
 )
 
 
@@ -49,6 +50,16 @@ class AnalysisTests(unittest.TestCase):
         vol = analyze_volatility(candles)
         self.assertGreater(vol.volatility, 0)
         self.assertAlmostEqual(vol.avg_volume, 1)
+
+    def test_support_resistance(self) -> None:
+        candles = [
+            Candle(0, 100, 100, 100, 100, 1),
+            Candle(1, 110, 111, 109, 110, 1),
+            Candle(2, 90, 91, 89, 90, 1),
+        ]
+        levels = support_resistance(candles, lookback=3)
+        self.assertEqual(levels.support, 90)
+        self.assertEqual(levels.resistance, 110)
 
 
 if __name__ == "__main__":

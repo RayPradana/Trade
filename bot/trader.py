@@ -3,7 +3,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from .analysis import analyze_orderbook, analyze_trend, analyze_volatility, build_candles
+from .analysis import (
+    analyze_orderbook,
+    analyze_trend,
+    analyze_volatility,
+    build_candles,
+    support_resistance,
+)
 from .config import BotConfig
 from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, make_trade_decision
@@ -36,14 +42,16 @@ class Trader:
         trend = analyze_trend(candles, self.config.fast_window, self.config.slow_window)
         orderbook = analyze_orderbook(depth)
         vol = analyze_volatility(candles)
+        levels = support_resistance(candles)
         price = self._extract_price(ticker)
 
-        decision = make_trade_decision(trend, orderbook, vol, price, self.config)
+        decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels)
         return {
             "price": price,
             "trend": trend,
             "orderbook": orderbook,
             "volatility": vol,
+            "levels": levels,
             "decision": decision,
             "candles": candles,
         }
@@ -91,6 +99,7 @@ class Trader:
             }
 
         # live trading path
+        # Guard against programmatic use without running through CLI validation.
         if self.config.api_key is None or self.config.api_secret is None:
             raise ValueError("API credentials required for live trading")
 

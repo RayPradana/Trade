@@ -59,8 +59,8 @@ def main() -> None:
             )
             outcome = trader.maybe_execute(snapshot)
             logging.info("result=%s", outcome)
-        except (requests.RequestException, RuntimeError, ValueError) as exc:
-            logging.exception("Recoverable error in bot loop: %s", exc)
+        except (requests.RequestException, RuntimeError, ValueError):
+            logging.exception("Recoverable error in bot loop")
             if args.once:
                 raise
         except KeyboardInterrupt:

@@ -4,14 +4,15 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from .analysis import OrderbookInsight, TrendResult, VolatilityStats
+from .analysis import OrderbookInsight, SupportResistance, TrendResult, VolatilityStats
 from .config import BotConfig
 
 SCALP_SPREAD_THRESHOLD = 0.0015
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
-MIN_DIVISOR = 1e-8  # prevent division by zero when risk window is extremely small
+MIN_RISK_DIVISOR = 1e-8  # prevents division by zero when stop distance is extremely small
+LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
 
 
 @dataclass
@@ -24,6 +25,8 @@ class StrategyDecision:
     amount: float
     stop_loss: Optional[float]
     take_profit: Optional[float]
+    support: Optional[float] = None
+    resistance: Optional[float] = None
 
 
 def select_strategy(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> str:
@@ -54,6 +57,7 @@ def make_trade_decision(
     vol: VolatilityStats,
     current_price: float,
     config: BotConfig,
+    levels: Optional[SupportResistance] = None,
 ) -> StrategyDecision:
     mode = select_strategy(trend, orderbook, vol)
     conf = _confidence(trend, orderbook, vol)
@@ -71,7 +75,23 @@ def make_trade_decision(
         stop_loss = None
         take_profit = None
 
-    reason = f"{mode} | trend={trend.direction} strength={trend.strength:.4f} vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f}"
+    sr_note = ""
+    if levels:
+        if action == "buy" and levels.resistance:
+            distance = (levels.resistance - current_price) / levels.resistance
+            if distance <= LEVEL_PROXIMITY:
+                conf *= 0.7
+                sr_note = "near_resistance"
+        if action == "sell" and levels.support:
+            distance = (current_price - levels.support) / levels.support
+            if distance <= LEVEL_PROXIMITY:
+                conf *= 0.7
+                sr_note = "near_support"
+
+    reason = (
+        f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
+        f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} {sr_note}"
+    ).strip()
 
     # size based on risk per trade relative to stop distance
     if action == "hold" or not stop_loss:
@@ -83,7 +103,7 @@ def make_trade_decision(
         else:
             desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
             base_order_risk = risk_per_unit * config.base_order_size
-            scale = min(2.0, desired_risk_value / max(MIN_DIVISOR, base_order_risk))
+            scale = min(2.0, desired_risk_value / max(MIN_RISK_DIVISOR, base_order_risk))
             amount = max(config.base_order_size * scale, config.base_order_size * 0.25)
 
     return StrategyDecision(
@@ -95,4 +115,6 @@ def make_trade_decision(
         amount=amount,
         stop_loss=stop_loss,
         take_profit=take_profit,
+        support=levels.support if levels else None,
+        resistance=levels.resistance if levels else None,
     )

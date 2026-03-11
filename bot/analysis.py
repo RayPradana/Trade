@@ -38,6 +38,13 @@ class VolatilityStats:
     avg_volume: float
 
 
+@dataclass
+class SupportResistance:
+    support: float
+    resistance: float
+    lookback: int
+
+
 def _to_float(value: str) -> float:
     try:
         return float(value)
@@ -64,17 +71,17 @@ def build_candles(
     candles: List[Candle] = []
     for bucket_ts in sorted(buckets.keys())[-limit:]:
         bucket_trades = buckets[bucket_ts]
-        prices = [_to_float(t.get("price")) for t in bucket_trades]
+        trade_prices = [_to_float(t.get("price")) for t in bucket_trades]
         amounts = [_to_float(t.get("amount", 0)) for t in bucket_trades]
-        if not prices:
+        if not trade_prices:
             continue
         candles.append(
             Candle(
                 timestamp=bucket_ts,
-                open=prices[0],
-                high=max(prices),
-                low=min(prices),
-                close=prices[-1],
+                open=trade_prices[0],
+                high=max(trade_prices),
+                low=min(trade_prices),
+                close=trade_prices[-1],
                 volume=sum(amounts),
             )
         )
@@ -150,3 +157,10 @@ def analyze_volatility(candles: Sequence[Candle]) -> VolatilityStats:
     vol = pstdev(returns) if len(returns) > 1 else 0.0
     avg_volume = mean(c.volume for c in candles)
     return VolatilityStats(volatility=vol, avg_volume=avg_volume)
+
+
+def support_resistance(candles: Sequence[Candle], lookback: int = 30) -> SupportResistance:
+    if not candles:
+        return SupportResistance(0.0, 0.0, lookback)
+    closes = [c.close for c in candles[-lookback:]]
+    return SupportResistance(support=min(closes), resistance=max(closes), lookback=lookback)
