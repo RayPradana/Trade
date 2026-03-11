@@ -49,6 +49,7 @@ class BotConfig:
     order_min_interval: float = 0.25  # seconds between order requests
     websocket_enabled: bool = True
     websocket_url: Optional[str] = None
+    websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
     min_confidence: float = 0.52
     interval_seconds: int = 300
     fast_window: int = 12
@@ -63,6 +64,7 @@ class BotConfig:
     staged_entry_steps: int = 3
     position_check_interval_seconds: int = 60  # faster poll when monitoring an open position
     cycle_summary_interval: int = 10  # print a performance summary every N full scan cycles
+    trade_mode: str = "continuous"  # "single": one buy→sell cycle then stop; "continuous": 24/7
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -98,6 +100,7 @@ class BotConfig:
             order_min_interval=float(os.getenv("ORDER_MIN_INTERVAL", "0.25")),
             websocket_enabled=websocket_enabled,
             websocket_url=os.getenv("WEBSOCKET_URL"),
+            websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
             interval_seconds=interval_seconds,
             fast_window=int(os.getenv("FAST_WINDOW", "12")),
@@ -112,6 +115,7 @@ class BotConfig:
             staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
             position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
             cycle_summary_interval=int(os.getenv("CYCLE_SUMMARY_INTERVAL", "10")),
+            trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
         )
         cfg._validate()
         return cfg
@@ -145,6 +149,8 @@ class BotConfig:
             raise ValueError("POSITION_CHECK_INTERVAL must be positive")
         if self.cycle_summary_interval <= 0:
             raise ValueError("CYCLE_SUMMARY_INTERVAL must be positive")
+        if self.trade_mode not in {"single", "continuous"}:
+            raise ValueError("TRADE_MODE must be 'single' or 'continuous'")
         if self.trailing_stop_pct < 0:
             raise ValueError("TRAILING_STOP_PCT must be non-negative")
         if not self.dry_run and not self.api_key:

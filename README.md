@@ -54,6 +54,8 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `STAGED_ENTRY_STEPS` | Jumlah maksimum langkah entry bertahap (mis. 3 langkah 50/30/20%) | `3` |
 | `POSITION_CHECK_INTERVAL` | Interval (detik) polling saat sedang memegang posisi | `60` |
 | `CYCLE_SUMMARY_INTERVAL` | Cetak ringkasan performa setiap N siklus scan penuh | `10` |
+| `TRADE_MODE` | `continuous` = 24/7; `single` = satu siklus beli→jual lalu berhenti | `continuous` |
+| `WEBSOCKET_SUBSCRIBE_MESSAGE` | Pesan JSON yang dikirim ke server WebSocket setelah koneksi (jika diperlukan) | - |
 
 ## Menjalankan
 
@@ -65,6 +67,22 @@ Salin `.env.example` menjadi `.env` di root repo, lalu isi:
 INDODAX_KEY=your_api_key
 TRADE_PAIRS=btc_idr,eth_idr
 DRY_RUN=true
+```
+
+### Mode 24/7 Otomatis (default)
+
+Bot berjalan terus-menerus, memindai pair terbaik, masuk posisi, memantau, keluar, lalu mencari peluang berikutnya.
+
+```bash
+TRADE_MODE=continuous DRY_RUN=true python main.py
+```
+
+### Mode Single-Trade (satu siklus beli → jual lalu berhenti)
+
+Berguna untuk otomasi / cron job — bot melakukan tepat satu transaksi lengkap (beli + jual) lalu keluar.
+
+```bash
+TRADE_MODE=single DRY_RUN=true python main.py
 ```
 
 ### Dry-run (simulasi, aman)
@@ -145,6 +163,8 @@ Bot dirancang untuk berjalan tanpa campur tangan:
 - **Interval adaptif**: Saat memegang posisi, bot menggunakan `POSITION_CHECK_INTERVAL` (default 60 detik) yang lebih cepat daripada `INTERVAL_SECONDS` standar agar exit tidak terlambat.
 - **Ringkasan berkala**: Setiap `CYCLE_SUMMARY_INTERVAL` siklus scan penuh, log ringkasan performa (PnL, ekuitas, jumlah trade, win-rate) dicetak.
 - **Graceful shutdown**: Sinyal `SIGTERM` (mis. `docker stop`) diserap dengan aman — bot menyelesaikan siklus yang sedang berjalan baru berhenti.
+- **Mode `single`**: Set `TRADE_MODE=single` untuk menjalankan tepat satu siklus beli→jual lalu berhenti otomatis (berguna untuk otomasi/skrip).
+- **WebSocket yang benar**: Koneksi WebSocket kini dilengkapi **auto-reconnect** dengan exponential backoff (2 s → 4 s → … → 60 s), **partial-update merging** (pembaruan ticker tidak menghapus data order-book yang sudah ada), dan pengiriman pesan **subscription** otomatis via `WEBSOCKET_SUBSCRIBE_MESSAGE` setelah koneksi tersambung.
 
 ## Keamanan & Catatan
 

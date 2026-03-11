@@ -41,3 +41,18 @@ class ConfigRealTimeTest(TestCase):
     def test_require_auth_passes_with_key_and_secret(self):
         cfg = BotConfig(api_key="key", api_secret="secret")
         cfg.require_auth()  # should not raise
+
+    def test_trade_mode_defaults_to_continuous(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.trade_mode, "continuous")
+
+    def test_trade_mode_single_loaded_from_env(self):
+        with patch.dict(os.environ, {"TRADE_MODE": "single"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.trade_mode, "single")
+
+    def test_trade_mode_invalid_raises(self):
+        with patch.dict(os.environ, {"TRADE_MODE": "invalid"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()

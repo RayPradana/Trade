@@ -67,6 +67,7 @@ class Trader:
                 websocket_url=config.websocket_url,
                 poll_interval=max(0.5, float(self.config.interval_seconds)),
                 websocket_enabled=config.websocket_enabled,
+                subscribe_message=config.websocket_subscribe_message,
             )
             self.realtime.start()
 

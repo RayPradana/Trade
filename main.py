@@ -112,6 +112,13 @@ def main() -> None:
             restored_portfolio.get("base_position"),
         )
 
+    logging.info(
+        "🤖 Starting bot | mode=%s  pair=%s  dry_run=%s",
+        config.trade_mode.upper(),
+        config.pair,
+        config.dry_run,
+    )
+
     # ── Graceful shutdown on SIGTERM (e.g. Docker / systemd stop) ──────────
     _shutdown = threading.Event()
 
@@ -126,6 +133,9 @@ def main() -> None:
     consecutive_errors = 0
     _max_backoff = 300  # 5 minutes cap
     scan_cycles = 0  # counts cycles that completed a full scan (for periodic summary)
+    # Track whether a position has been entered in this session.
+    # Used by TRADE_MODE=single to know when a full buy→sell cycle is complete.
+    _entered_position: bool = trader.tracker.base_position > 0
 
     while not _shutdown.is_set():
         cycle += 1
@@ -161,6 +171,10 @@ def main() -> None:
                     )
                     _log_portfolio(portfolio)
                     consecutive_errors = 0
+                    # single-trade mode: one complete cycle (buy → sell) is enough
+                    if config.trade_mode == "single" and _entered_position:
+                        logging.info("✅ Single-trade cycle complete — stopping.")
+                        break
                     if config.run_once:
                         break
                     logging.info(_separator())
@@ -238,6 +252,10 @@ def main() -> None:
             consecutive_errors = 0
             scan_cycles += 1
 
+            # Mark that we've entered a position (for single-trade mode)
+            if outcome.get("action") == "buy" and trader.tracker.base_position > 0:
+                _entered_position = True
+
             # ── Stop condition: liquidate remaining position and rotate ───────
             if outcome.get("status") == "stopped":
                 logging.info(
@@ -260,6 +278,9 @@ def main() -> None:
                     portfolio["trade_count"],
                     portfolio["win_rate"] * 100,
                 )
+                if config.trade_mode == "single" and _entered_position:
+                    logging.info("✅ Single-trade cycle complete — stopping.")
+                    break
                 if config.run_once:
                     break
                 logging.info(_separator())
@@ -268,7 +289,8 @@ def main() -> None:
 
         except (requests.RequestException, RuntimeError, ValueError):
             consecutive_errors += 1
-            # Cap the exponent to avoid enormous intermediate values before min()
+            # Cap the exponent at 10 so 2**exponent stays ≤ 1024 before min()
+            # (avoids overflow warnings from Python's arbitrary-precision ints).
             exponent = min(consecutive_errors - 1, 10)
             backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(

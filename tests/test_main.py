@@ -124,6 +124,132 @@ class MainErrorHandlingTests(unittest.TestCase):
         # The loop entered a second scan cycle (proving it didn't stop after stop)
         self.assertGreaterEqual(call_count["n"], 1)
 
+    def test_single_trade_mode_stops_after_one_cycle(self) -> None:
+        """TRADE_MODE=single: the bot should stop as soon as the position it
+        opened (via position-monitoring exit) is fully closed."""
+
+        def _fast_sleep(secs):
+            pass
+
+        class StubTrader:
+            def __init__(self, config) -> None:
+                self.config = config
+                self.restored_state = None
+                # Pre-load an open position so the position-monitoring branch fires.
+                self.tracker = PortfolioTracker(
+                    initial_capital=1000.0,
+                    target_profit_pct=0.2,
+                    max_loss_pct=0.1,
+                )
+                self.tracker.record_trade("buy", 100.0, 1.0)
+
+            def analyze_market(self, pair=None):
+                return {
+                    "pair": pair or "btc_idr",
+                    "price": 110.0,
+                    "orderbook": None,
+                    "volatility": None,
+                    "levels": None,
+                    "indicators": None,
+                    "decision": _SellDecision(),
+                }
+
+            def scan_and_choose(self):
+                # Should never be reached when starting with a position
+                raise RuntimeError("unexpected scan")
+
+            def maybe_execute(self, snapshot):
+                return {"status": "skipped"}
+
+            def force_sell(self, snapshot):
+                self.tracker.record_trade("sell", 110.0, self.tracker.base_position)
+                return {
+                    "status": "force_sold",
+                    "action": "sell",
+                    "amount": 1.0,
+                    "price": 110.0,
+                }
+
+        class _SellDecision:
+            action = "sell"
+            mode = "day_trading"
+            confidence = 0.8
+            reason = "exit"
+
+        with patch("main.configure_logging"):
+            with patch("main.Trader", StubTrader):
+                with patch("main.time.sleep", _fast_sleep):
+                    with patch.dict(
+                        os.environ,
+                        {"TRADE_MODE": "single", "RUN_ONCE": "false"},
+                        clear=False,
+                    ):
+                        main.main()  # must exit cleanly after the single sell
+
+    def test_continuous_mode_does_not_stop_after_sell(self) -> None:
+        """TRADE_MODE=continuous: the bot should NOT stop after selling;
+        it should continue scanning.  We verify this by having scan_and_choose
+        raise KeyboardInterrupt on its first call – if the bot rotated to
+        scan after selling, the counter will be ≥ 1."""
+        scan_count = {"n": 0}
+
+        def _fast_sleep(secs):
+            pass
+
+        class StubTrader:
+            def __init__(self, config) -> None:
+                self.config = config
+                self.restored_state = None
+                self.tracker = PortfolioTracker(
+                    initial_capital=1000.0,
+                    target_profit_pct=0.2,
+                    max_loss_pct=0.1,
+                )
+                # Pre-load an open position
+                self.tracker.record_trade("buy", 100.0, 1.0)
+
+            def analyze_market(self, pair=None):
+                return {
+                    "pair": pair or "btc_idr",
+                    "price": 110.0,
+                    "orderbook": None,
+                    "volatility": None,
+                    "levels": None,
+                    "indicators": None,
+                    "decision": _SellDecision(),
+                }
+
+            def scan_and_choose(self):
+                # Reached only after the position is closed in continuous mode
+                scan_count["n"] += 1
+                raise KeyboardInterrupt()  # end test cleanly
+
+            def maybe_execute(self, snapshot):
+                return {"status": "skipped"}
+
+            def force_sell(self, snapshot):
+                self.tracker.record_trade("sell", 110.0, self.tracker.base_position)
+                return {"status": "force_sold", "action": "sell", "amount": 1.0, "price": 110.0}
+
+        class _SellDecision:
+            action = "sell"
+            mode = "day_trading"
+            confidence = 0.8
+            reason = "exit"
+
+        with patch("main.configure_logging"):
+            with patch("main.Trader", StubTrader):
+                with patch("main.time.sleep", _fast_sleep):
+                    with patch.dict(
+                        os.environ,
+                        {"TRADE_MODE": "continuous", "RUN_ONCE": "false"},
+                        clear=False,
+                    ):
+                        main.main()
+
+        # After selling the held position, the bot tried to scan for the next trade
+        self.assertGreaterEqual(scan_count["n"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
