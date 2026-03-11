@@ -54,6 +54,9 @@ class MainErrorHandlingTests(unittest.TestCase):
             def force_sell(self, snapshot):
                 return {"status": "force_sold", "amount": 0, "price": snapshot["price"]}
 
+            def _effective_interval(self, snapshot=None):
+                return self.config.interval_seconds
+
         class _Decision:
             action = "buy"
             mode = "day_trading"
@@ -139,7 +142,6 @@ class MainErrorHandlingTests(unittest.TestCase):
                 self.config = config
                 self.restored_pair = None
                 self.persistence = type("_P", (), {"backup": lambda *a: None})()
-                # Pre-load an open position so the position-monitoring branch fires.
                 self.tracker = PortfolioTracker(
                     initial_capital=1000.0,
                     target_profit_pct=0.2,
@@ -155,6 +157,8 @@ class MainErrorHandlingTests(unittest.TestCase):
                     "volatility": None,
                     "levels": None,
                     "indicators": None,
+                    "whale": None,
+                    "spoofing": None,
                     "decision": _SellDecision(),
                 }
 
@@ -174,21 +178,8 @@ class MainErrorHandlingTests(unittest.TestCase):
                     "price": 110.0,
                 }
 
-        class _SellDecision:
-            action = "sell"
-            mode = "day_trading"
-            confidence = 0.8
-            reason = "exit"
-
-        with patch("main.configure_logging"):
-            with patch("main.Trader", StubTrader):
-                with patch("main.time.sleep", _fast_sleep):
-                    with patch.dict(
-                        os.environ,
-                        {"TRADE_MODE": "single", "RUN_ONCE": "false"},
-                        clear=False,
-                    ):
-                        main.main()  # must exit cleanly after the single sell
+            def _effective_interval(self, snapshot=None):
+                return self.config.interval_seconds
 
     def test_continuous_mode_does_not_stop_after_sell(self) -> None:
         """TRADE_MODE=continuous: the bot should NOT stop after selling;
@@ -221,6 +212,8 @@ class MainErrorHandlingTests(unittest.TestCase):
                     "volatility": None,
                     "levels": None,
                     "indicators": None,
+                    "whale": None,
+                    "spoofing": None,
                     "decision": _SellDecision(),
                 }
 
@@ -235,6 +228,9 @@ class MainErrorHandlingTests(unittest.TestCase):
             def force_sell(self, snapshot):
                 self.tracker.record_trade("sell", 110.0, self.tracker.base_position)
                 return {"status": "force_sold", "action": "sell", "amount": 1.0, "price": 110.0}
+
+            def _effective_interval(self, snapshot=None):
+                return self.config.interval_seconds
 
         class _SellDecision:
             action = "sell"

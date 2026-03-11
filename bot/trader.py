@@ -13,11 +13,13 @@ from .analysis import (
     build_candles,
     candles_from_ohlc,
     derive_indicators,
+    detect_spoofing,
     detect_whale_activity,
     interval_to_ohlc_tf,
     multi_timeframe_confirm,
     MomentumIndicators,
     MultiTimeframeResult,
+    SpoofingResult,
     WhaleActivity,
     support_resistance,
 )
@@ -288,6 +290,82 @@ class Trader:
         """
         return sorted(pairs, key=self._pair_volume, reverse=True)
 
+    def _get_reference_pair_trend(self, current_pair: str) -> Optional[str]:
+        """Return the trend direction of the highest-volume reference pair.
+
+        Used for correlated-pair confirmation: when BTC/IDR (or whatever pair
+        has the most liquidity in the feed cache) is trending up, alt-coin buy
+        signals receive a small confidence boost in :meth:`analyze_market`.
+
+        Returns ``"up"``, ``"down"``, or ``None`` when no reference can be
+        determined (feed not started, same as current pair, no data, etc.).
+        """
+        if self._multi_feed is None:
+            return None
+        try:
+            all_known = list(self._multi_feed._cache.keys())
+            if not all_known:
+                return None
+            ranked = sorted(all_known, key=self._pair_volume, reverse=True)
+            # Pick the top-volume pair that is NOT the current pair
+            ref_pair = next((p for p in ranked if p != current_pair), None)
+            if ref_pair is None:
+                return None
+            ticker = self._multi_feed.get_ticker(ref_pair)
+            if ticker is None:
+                return None
+            # Determine direction from cached last/high/low values
+            last = float(ticker.get("last") or ticker.get("last_price") or 0)
+            high = float(ticker.get("high") or 0)
+            low = float(ticker.get("low") or 0)
+            if last <= 0 or high <= 0 or low <= 0:
+                return None
+            mid = (high + low) / 2
+            if last > mid * 1.001:
+                return "up"
+            if last < mid * 0.999:
+                return "down"
+            return None
+        except Exception:
+            return None
+
+    def _liquidity_depth_idr(self, depth: Dict[str, Any], price: float) -> float:
+        """Return the total IDR value of the top-20 bid and ask levels.
+
+        Used to filter out thin markets where the effective spread would make
+        a trade unprofitable.  Returns 0.0 on any parse error.
+        """
+        try:
+            bids = (depth.get("buy") or [])[:20]
+            asks = (depth.get("sell") or [])[:20]
+            total = 0.0
+            for level in bids + asks:
+                total += float(level[0]) * float(level[1])
+            return total
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    def _effective_interval(self, snapshot: Optional[Dict[str, Any]] = None) -> int:
+        """Return the effective sleep interval (seconds) between scan cycles.
+
+        When :attr:`~BotConfig.adaptive_interval_enabled` is ``True``, a
+        higher volatility in the most recent snapshot reduces the sleep to
+        :attr:`~BotConfig.adaptive_interval_min_seconds`.  Otherwise the
+        configured :attr:`~BotConfig.interval_seconds` is returned unchanged.
+        """
+        if not self.config.adaptive_interval_enabled:
+            return self.config.interval_seconds
+        vol_value = 0.0
+        if snapshot:
+            vol = snapshot.get("volatility")
+            if vol:
+                vol_value = getattr(vol, "volatility", 0.0)
+        # Adaptive logic: if volatility > 1.5× the typical threshold (0.01),
+        # use the minimum interval; otherwise keep the normal interval.
+        if vol_value > 0.015:
+            return self.config.adaptive_interval_min_seconds
+        return self.config.interval_seconds
+
     def _refresh_dynamic_pairs(self) -> None:
         """Replace the pair watchlist with the top-N most liquid pairs.
 
@@ -417,6 +495,23 @@ class Trader:
         if whale.detected:
             logger.debug("Whale detected on %s: side=%s ratio=%.1f×", pair, whale.side, whale.ratio)
 
+        # ── Spoofing / manipulation detection ────────────────────────────────
+        spoofing: SpoofingResult = detect_spoofing(depth)
+        if spoofing.detected:
+            logger.debug(
+                "Spoofing detected on %s: side=%s distance=%.2f%%",
+                pair, spoofing.side, spoofing.distance_pct * 100,
+            )
+
+        # ── Correlated pair boost (BTC/ETH reference trend) ──────────────────
+        # When the highest-volume reference pair (typically BTC/IDR) is trending
+        # in the same direction as the primary signal, add a small confidence
+        # boost in `make_trade_decision` by passing the correlation note via the
+        # whale argument augmentation below.  We do this via the `mtf` mechanism
+        # in `make_trade_decision` by synthesising a very simple cross-pair trend
+        # note stored in the snapshot and applied in _score_snapshot.
+        reference_trend = self._get_reference_pair_trend(pair)
+
         grid_plan: Optional[GridPlan] = None
         decision: StrategyDecision
         if self.config.grid_enabled:
@@ -434,8 +529,16 @@ class Trader:
             )
         else:
             decision = make_trade_decision(
-                trend, orderbook, vol, price, self.config, levels, indicators, mtf=mtf, whale=whale
+                trend, orderbook, vol, price, self.config, levels, indicators,
+                mtf=mtf, whale=whale, spoofing=spoofing,
             )
+            # Apply correlated-pair confidence boost when reference trend aligns
+            if reference_trend == "up" and decision.action == "buy":
+                boosted_conf = min(1.0, decision.confidence + 0.04)
+                decision = StrategyDecision(
+                    **{**decision.__dict__, "confidence": round(boosted_conf, 3),
+                       "reason": decision.reason + " corr_confirm"}
+                )
         return {
             "pair": pair,
             "price": price,
@@ -450,6 +553,8 @@ class Trader:
             "insufficient_data": insufficient_data,
             "mtf": mtf,
             "whale": whale,
+            "spoofing": spoofing,
+            "reference_trend": reference_trend,
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -501,6 +606,43 @@ class Trader:
                     "portfolio": self.tracker.as_dict(price),
                 }
 
+        # ── Portfolio-wide risk cap ───────────────────────────────────────────
+        if self.config.max_portfolio_risk_pct > 0 and decision.action == "buy":
+            current_equity = self.tracker.snapshot(price).equity
+            total_position_value = self.tracker.base_position * price
+            portfolio_risk_pct = total_position_value / current_equity if current_equity > 0 else 0.0
+            if portfolio_risk_pct >= self.config.max_portfolio_risk_pct:
+                logger.info(
+                    "Portfolio risk cap reached: %.2f%% ≥ %.2f%% — skipping buy",
+                    portfolio_risk_pct * 100,
+                    self.config.max_portfolio_risk_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"portfolio_risk_cap {portfolio_risk_pct:.2%} ≥ {self.config.max_portfolio_risk_pct:.2%}",
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
+        # ── Re-entry cooldown / dip check ─────────────────────────────────────
+        if decision.action == "buy" and (
+            self.config.re_entry_cooldown_seconds > 0 or self.config.re_entry_dip_pct > 0
+        ):
+            if not self.tracker.re_entry_allowed(
+                price,
+                cooldown_seconds=self.config.re_entry_cooldown_seconds,
+                dip_pct=self.config.re_entry_dip_pct,
+            ):
+                logger.info(
+                    "Re-entry blocked: cooldown or dip condition not met (last_sell=%.2f, now=%.2f)",
+                    self.tracker.last_sell_price,
+                    price,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "re_entry_condition_not_met",
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
         if self.config.grid_enabled and snapshot.get("grid_plan"):
             return self._execute_grid(snapshot)
 
@@ -524,7 +666,7 @@ class Trader:
             return outcome
 
         # simple slippage guard using top of book
-        depth = self.client.get_depth(snapshot["pair"], count=5)
+        depth = self.client.get_depth(snapshot["pair"], count=20)
         bids = depth.get("buy") or []
         asks = depth.get("sell") or []
         top_bid = float(bids[0][0]) if bids else price
@@ -532,6 +674,20 @@ class Trader:
         reference_price = top_ask if decision.action == "buy" else top_bid
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
+
+        # ── Minimum liquidity depth check ─────────────────────────────────────
+        if self.config.min_liquidity_depth_idr > 0 and decision.action == "buy":
+            total_depth = self._liquidity_depth_idr(depth, price)
+            if total_depth < self.config.min_liquidity_depth_idr:
+                logger.info(
+                    "Thin market on %s: depth Rp%.0f < min Rp%.0f — skipping buy",
+                    snapshot["pair"], total_depth, self.config.min_liquidity_depth_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"thin_market depth Rp{total_depth:.0f} < Rp{self.config.min_liquidity_depth_idr:.0f}",
+                    "portfolio": self.tracker.as_dict(price),
+                }
 
         if decision.action == "buy" and reference_price > allowed_max:
             logger.info("Skip buy due to slippage price=%s allowed_max=%s", reference_price, allowed_max)
@@ -669,6 +825,76 @@ class Trader:
             "orders": executed,
             "portfolio": self.tracker.as_dict(price),
         }
+        return outcome
+
+    def partial_take_profit(self, snapshot: Dict[str, Any], fraction: float) -> Dict[str, Any]:
+        """Sell *fraction* of the current base position as a partial take-profit.
+
+        This is triggered from the position-monitoring loop in ``main.py`` when
+        price crosses the decision's TP level and
+        :attr:`~BotConfig.partial_tp_fraction` is configured.
+
+        :param snapshot: Current market snapshot for the held pair.
+        :param fraction: Fraction of position to sell (0 < fraction < 1).
+        :returns: Outcome dict similar to :meth:`force_sell`.
+        """
+        price = snapshot["price"]
+        pair = snapshot["pair"]
+        total_position = self.tracker.base_position
+
+        if total_position <= 0:
+            return {"status": "no_position", "pair": pair, "price": price}
+        if not (0 < fraction < 1):
+            return {"status": "invalid_fraction", "pair": pair, "price": price}
+
+        amount = total_position * fraction
+
+        # Use top-of-book bid as reference; fall back to snapshot price
+        reference_price = price
+        try:
+            depth = self.client.get_depth(pair, count=5)
+            bids = depth.get("buy") or []
+            if bids:
+                reference_price = float(bids[0][0])
+        except Exception:
+            pass
+
+        if self.config.dry_run:
+            logger.info(
+                "DRY-RUN partial-TP sell %.8f (%.0f%%) %s @ %s",
+                amount, fraction * 100, pair, reference_price,
+            )
+            self.tracker.record_trade("sell", reference_price, amount)
+            self.tracker.partial_tp_taken = True
+            outcome: Dict[str, Any] = {
+                "status": "partial_tp",
+                "action": "sell",
+                "pair": pair,
+                "price": reference_price,
+                "amount": amount,
+                "fraction": fraction,
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
+            self._persist_after_trade(pair)
+            return outcome
+
+        if self.config.api_key is None:
+            raise ValueError("API credentials required for live trading")
+
+        order_resp = self.client.create_order(pair, "sell", reference_price, amount)
+        self.tracker.record_trade("sell", reference_price, amount)
+        self.tracker.partial_tp_taken = True
+        outcome = {
+            "status": "partial_tp",
+            "action": "sell",
+            "pair": pair,
+            "price": reference_price,
+            "amount": amount,
+            "fraction": fraction,
+            "order": order_resp,
+            "portfolio": self.tracker.as_dict(reference_price),
+        }
+        self._persist_after_trade(pair)
         return outcome
 
     def force_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:

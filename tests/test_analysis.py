@@ -211,3 +211,52 @@ class WhaleDetectionTest(unittest.TestCase):
         from bot.analysis import detect_whale_activity
         result = detect_whale_activity({"buy": [], "sell": []})
         self.assertFalse(result.detected)
+
+
+class SpoofingDetectionTest(unittest.TestCase):
+    def _make_flat_book(self, price_start: float = 100.0, levels: int = 20) -> list:
+        """Uniform-volume order book — no spoofing signal."""
+        return [[str(price_start - i), "1.0"] for i in range(levels)]
+
+    def test_no_spoof_on_flat_book(self):
+        from bot.analysis import detect_spoofing
+        levels = self._make_flat_book()
+        depth = {"buy": levels, "sell": levels}
+        result = detect_spoofing(depth)
+        self.assertFalse(result.detected)
+        self.assertIsNone(result.side)
+
+    def test_detects_distant_large_bid_wall(self):
+        from bot.analysis import detect_spoofing
+        # Top bid at 100, but a huge spoof at 90 (10% away, 10× volume)
+        levels = self._make_flat_book()
+        levels.append(["90", "100.0"])   # far + large
+        depth = {"buy": levels, "sell": self._make_flat_book(110.0)}
+        result = detect_spoofing(depth, min_distance_pct=0.03)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.side, "bid")
+        self.assertGreater(result.distance_pct, 0.05)
+
+    def test_detects_distant_large_ask_wall(self):
+        from bot.analysis import detect_spoofing
+        bid_levels = self._make_flat_book(100.0)
+        ask_levels = self._make_flat_book(105.0)
+        ask_levels.append(["150", "100.0"])   # far ask + huge
+        depth = {"buy": bid_levels, "sell": ask_levels}
+        result = detect_spoofing(depth, min_distance_pct=0.03)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.side, "ask")
+
+    def test_nearby_large_wall_not_spoof(self):
+        from bot.analysis import detect_spoofing
+        # Large wall only 0.5% away → below 3% distance threshold → not a spoof
+        levels = self._make_flat_book(100.0)
+        levels.insert(2, ["99.5", "100.0"])   # large but near top of book
+        depth = {"buy": levels, "sell": self._make_flat_book(105.0)}
+        result = detect_spoofing(depth, min_distance_pct=0.03)
+        self.assertFalse(result.detected)
+
+    def test_empty_book_no_spoof(self):
+        from bot.analysis import detect_spoofing
+        result = detect_spoofing({"buy": [], "sell": []})
+        self.assertFalse(result.detected)

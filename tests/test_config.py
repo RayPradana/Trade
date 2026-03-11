@@ -186,3 +186,69 @@ class AdditionalFeaturesConfigTest(TestCase):
             cfg = BotConfig.from_env()
             self.assertEqual(cfg.dynamic_pairs_refresh_cycles, 10)
             self.assertEqual(cfg.dynamic_pairs_top_n, 20)
+
+
+class NewFeaturesConfigTest(TestCase):
+    def test_partial_tp_default(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.partial_tp_fraction, 0.0)
+
+    def test_partial_tp_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"PARTIAL_TP_FRACTION": "0.5"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.partial_tp_fraction, 0.5)
+
+    def test_partial_tp_invalid(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"PARTIAL_TP_FRACTION": "1.5"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_re_entry_cooldown_default(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.re_entry_cooldown_seconds, 0.0)
+            self.assertEqual(cfg.re_entry_dip_pct, 0.0)
+
+    def test_re_entry_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"RE_ENTRY_COOLDOWN_SECONDS": "120", "RE_ENTRY_DIP_PCT": "0.03"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.re_entry_cooldown_seconds, 120.0)
+            self.assertAlmostEqual(cfg.re_entry_dip_pct, 0.03)
+
+    def test_adaptive_interval_defaults(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertFalse(cfg.adaptive_interval_enabled)
+            self.assertEqual(cfg.adaptive_interval_min_seconds, 30)
+
+    def test_adaptive_interval_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"ADAPTIVE_INTERVAL_ENABLED": "true", "ADAPTIVE_INTERVAL_MIN_SECONDS": "15"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertTrue(cfg.adaptive_interval_enabled)
+            self.assertEqual(cfg.adaptive_interval_min_seconds, 15)
+
+    def test_portfolio_risk_default(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.max_portfolio_risk_pct, 0.0)
+
+    def test_liquidity_depth_default(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_liquidity_depth_idr, 0.0)
+
+    def test_liquidity_depth_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MIN_LIQUIDITY_DEPTH_IDR": "50000000"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.min_liquidity_depth_idr, 50_000_000.0)

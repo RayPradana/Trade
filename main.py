@@ -598,6 +598,7 @@ def main() -> None:
     consecutive_errors = 0
     _max_backoff = 300  # 5 minutes cap
     scan_cycles = 0  # counts cycles that completed a full scan (for periodic summary)
+    snapshot: dict = {}  # most recent scan snapshot (used for adaptive interval)
     # Track whether a position has been entered in this session.
     # Used by TRADE_MODE=single to know when a full buy→sell cycle is complete.
     _entered_position: bool = trader.tracker.base_position > 0
@@ -630,6 +631,43 @@ def main() -> None:
 
                 stop_reason = trader.tracker.stop_reason(held_price)
                 held_decision = held_snapshot["decision"]
+
+                # ── Partial take-profit check ────────────────────────────────
+                # When PARTIAL_TP_FRACTION is set and price has reached the TP
+                # level for the first time, sell a fraction and let the rest run.
+                if (
+                    config.partial_tp_fraction > 0
+                    and not trader.tracker.partial_tp_taken
+                    and held_decision.take_profit is not None
+                    and held_price >= held_decision.take_profit
+                ):
+                    # Auto-shift TP down when a sell wall blocks the target
+                    whale = held_snapshot.get("whale")
+                    adjusted_tp = held_decision.take_profit
+                    if whale and whale.detected and whale.side == "ask":
+                        # Sell wall at TP → take partial profit at current price
+                        adjusted_tp = held_price * 0.999  # slight discount to ensure fill
+                        logging.info(
+                            "🐋 Sell wall at TP — adjusting partial-TP target to %.2f",
+                            adjusted_tp,
+                        )
+                    if held_price >= adjusted_tp:
+                        ptp_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp_fraction)
+                        portfolio = trader.tracker.as_dict(held_price)
+                        logging.info(
+                            "🎯 PARTIAL-TP  %s%s%s  %.0f%% @ Rp %15,.2f",
+                            _BOLD, pair, _RESET,
+                            config.partial_tp_fraction * 100,
+                            held_price,
+                        )
+                        _log_portfolio(portfolio, config.initial_capital)
+                        _notify(
+                            config,
+                            f"🎯 PARTIAL-TP {pair} @ Rp {held_price:,.0f}\n"
+                            f"Fraction: {config.partial_tp_fraction:.0%}\n"
+                            f"Amount: {ptp_outcome.get('amount', 0):.8f}\n"
+                            f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
+                        )
 
                 # Exit if a hard stop fired or the strategy says sell.
                 should_exit = stop_reason is not None or held_decision.action == "sell"
@@ -666,7 +704,7 @@ def main() -> None:
                     if config.run_once:
                         break
                     logging.info(_separator())
-                    time.sleep(config.interval_seconds)
+                    time.sleep(trader._effective_interval(held_snapshot))
                     continue  # scan for next opportunity
 
                 # Still holding – use faster polling interval
@@ -788,7 +826,10 @@ def main() -> None:
             trader.persistence.backup(_backup_path)
 
         logging.info(_separator())
-        time.sleep(config.interval_seconds)
+        _sleep_secs = trader._effective_interval(snapshot)
+        if _sleep_secs != config.interval_seconds:
+            logging.debug("⚡ Adaptive interval: sleeping %ds (normal=%ds)", _sleep_secs, config.interval_seconds)
+        time.sleep(_sleep_secs)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from .analysis import (
     MomentumIndicators,
     MultiTimeframeResult,
     OrderbookInsight,
+    SpoofingResult,
     SupportResistance,
     TrendResult,
     VolatilityStats,
@@ -36,6 +37,8 @@ class StrategyDecision:
     take_profit: Optional[float]
     support: Optional[float] = None
     resistance: Optional[float] = None
+    # Fraction of position to sell at first TP (0 = sell all, disabled by default)
+    partial_tp_fraction: float = 0.0
 
 
 def select_strategy(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> str:
@@ -124,6 +127,7 @@ def make_trade_decision(
     indicators: Optional[MomentumIndicators] = None,
     mtf: Optional[MultiTimeframeResult] = None,
     whale: Optional[WhaleActivity] = None,
+    spoofing: Optional[SpoofingResult] = None,
 ) -> StrategyDecision:
     """Produce a :class:`StrategyDecision` incorporating all available signals.
 
@@ -153,6 +157,9 @@ def make_trade_decision(
         (``side="bid"``) adds a confidence bonus on buy signals; a bearish wall
         (``side="ask"``) adds a bonus on sell signals.  Opposing walls reduce
         confidence.
+    spoofing:
+        Order-book spoofing / manipulation detection result.  When spoofing is
+        detected, confidence is penalised to avoid entering during manipulation.
     """
     mode = select_strategy(trend, orderbook, vol)
     conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
@@ -229,14 +236,22 @@ def make_trade_decision(
             conf *= 0.85
             whale_note = "whale_bid_support"
 
+    # ── Spoofing / manipulation penalty ──────────────────────────────────────
+    spoof_note = ""
+    if spoofing is not None and spoofing.detected:
+        # Spoofed walls are a red flag regardless of direction → reduce conf
+        conf *= 0.75
+        spoof_note = f"spoofing_{spoofing.side}_{spoofing.distance_pct:.2%}"
+
     conf = round(max(0.0, min(1.0, conf)), 3)
 
+    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note) if n)
     reason = (
         f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
         f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} "
-        f"rsi={indicators.rsi if indicators else float('nan'):.2f} "
-        f"{sr_note} {mtf_note} {whale_note}"
-    ).strip()
+        f"rsi={indicators.rsi if indicators else float('nan'):.2f}"
+        + (f" {_notes}" if _notes else "")
+    )
 
     # size based on risk per trade relative to stop distance
     risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
@@ -253,4 +268,5 @@ def make_trade_decision(
         take_profit=take_profit,
         support=levels.support if levels else None,
         resistance=levels.resistance if levels else None,
+        partial_tp_fraction=config.partial_tp_fraction,
     )

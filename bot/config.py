@@ -108,6 +108,30 @@ class BotConfig:
     # Minimum 24-h volume rank a pair must occupy (1 = highest-volume)
     # to be added to the dynamic watchlist.  0 = no rank filter.
     dynamic_pairs_top_n: int = 50
+    # Partial take-profit: when > 0, sell this fraction of the position when
+    # price first reaches the TP level, and let the remainder run.
+    # E.g. 0.5 = sell half at TP, keep the rest.  0 = sell all (default).
+    partial_tp_fraction: float = 0.0
+    # Re-entry logic: after a sell, wait at least this many seconds before
+    # considering a new buy on the same pair.  0 = no cooldown (default).
+    re_entry_cooldown_seconds: float = 0.0
+    # Re-entry price dip: price must fall at least this fraction below the
+    # last sell price before a re-entry buy is allowed.  0 = no dip required.
+    re_entry_dip_pct: float = 0.0
+    # Adaptive scanning interval: when enabled, the bot uses a shorter sleep
+    # between scan cycles during high-volatility periods.
+    adaptive_interval_enabled: bool = False
+    # Minimum sleep between cycles (seconds) when adaptive interval is active
+    # and volatility is elevated.
+    adaptive_interval_min_seconds: int = 30
+    # Portfolio-wide risk limit: maximum total position value as a fraction of
+    # current equity across all coins combined.  0 = no cap (default).
+    # Note: the current architecture tracks a single pair, so this is
+    # equivalent to the per-coin exposure cap at the portfolio level.
+    max_portfolio_risk_pct: float = 0.0
+    # Minimum total order-book depth (sum of top-20 bid and ask levels in IDR)
+    # a pair must have before it is analysed.  0 = no filter (default).
+    min_liquidity_depth_idr: float = 0.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -174,6 +198,13 @@ class BotConfig:
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL") or None,
             dynamic_pairs_refresh_cycles=int(os.getenv("DYNAMIC_PAIRS_REFRESH_CYCLES", "0")),
             dynamic_pairs_top_n=int(os.getenv("DYNAMIC_PAIRS_TOP_N", "50")),
+            partial_tp_fraction=float(os.getenv("PARTIAL_TP_FRACTION", "0")),
+            re_entry_cooldown_seconds=float(os.getenv("RE_ENTRY_COOLDOWN_SECONDS", "0")),
+            re_entry_dip_pct=float(os.getenv("RE_ENTRY_DIP_PCT", "0")),
+            adaptive_interval_enabled=os.getenv("ADAPTIVE_INTERVAL_ENABLED", "false").lower() in {"1", "true", "yes"},
+            adaptive_interval_min_seconds=int(os.getenv("ADAPTIVE_INTERVAL_MIN_SECONDS", "30")),
+            max_portfolio_risk_pct=float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "0")),
+            min_liquidity_depth_idr=float(os.getenv("MIN_LIQUIDITY_DEPTH_IDR", "0")),
         )
         cfg._validate()
         return cfg
@@ -240,5 +271,17 @@ class BotConfig:
                     f"MTF_TIMEFRAMES contains invalid timeframe '{tf}'; "
                     f"valid options: {sorted(_valid_tfs)}"
                 )
+        if not (0.0 <= self.partial_tp_fraction < 1.0):
+            raise ValueError("PARTIAL_TP_FRACTION must be in [0, 1)")
+        if self.re_entry_cooldown_seconds < 0:
+            raise ValueError("RE_ENTRY_COOLDOWN_SECONDS must be non-negative")
+        if self.re_entry_dip_pct < 0:
+            raise ValueError("RE_ENTRY_DIP_PCT must be non-negative")
+        if self.adaptive_interval_min_seconds <= 0:
+            raise ValueError("ADAPTIVE_INTERVAL_MIN_SECONDS must be positive")
+        if self.max_portfolio_risk_pct < 0:
+            raise ValueError("MAX_PORTFOLIO_RISK_PCT must be non-negative")
+        if self.min_liquidity_depth_idr < 0:
+            raise ValueError("MIN_LIQUIDITY_DEPTH_IDR must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()

@@ -99,6 +99,28 @@ class WhaleActivity:
     ratio: float
 
 
+@dataclass
+class SpoofingResult:
+    """Result of order-book spoofing / manipulation detection.
+
+    Spoofing is characterised by large-volume levels placed far from the
+    current mid-price — orders that are unlikely to be filled but create the
+    illusion of strong support or resistance.
+
+    ``detected`` is ``True`` when at least one large distant wall is found.
+
+    ``side`` is ``"bid"`` (fake buy wall) or ``"ask"`` (fake sell wall), or
+    ``None`` when nothing suspicious is found.
+
+    ``distance_pct`` is how far (as a fraction of mid-price) the suspicious
+    level is from the top of book on the same side.
+    """
+
+    detected: bool
+    side: Optional[str]
+    distance_pct: float
+
+
 def _safe_float(value: str) -> float:
     try:
         return float(value)
@@ -478,4 +500,79 @@ def detect_whale_activity(
         detected=detected,
         side=best_side if detected else None,
         ratio=best_ratio,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Spoofing / order-book manipulation detection
+# ---------------------------------------------------------------------------
+
+# A level qualifies as a potential spoof wall when:
+#  1. Its volume is at least this many times larger than the average level vol.
+#  2. Its price is at least this far (as fraction) from the current top of book.
+_SPOOF_VOLUME_MULTIPLIER = 5.0
+_SPOOF_MIN_DISTANCE_PCT = 0.03   # 3% away from top of book
+_SPOOF_MIN_LEVELS = 3
+
+
+def detect_spoofing(
+    depth: Dict[str, object],
+    volume_multiplier: float = _SPOOF_VOLUME_MULTIPLIER,
+    min_distance_pct: float = _SPOOF_MIN_DISTANCE_PCT,
+    top_n: int = 30,
+) -> SpoofingResult:
+    """Detect potential spoof / wash-trading walls in the order book.
+
+    A "spoof wall" is a large-volume level positioned significantly far from
+    the best price on its side.  Spoofed orders are meant to mislead market
+    participants but are rarely filled, so they tend to appear deep in the
+    order book.
+
+    :param depth: Raw depth dict with ``"buy"`` and ``"sell"`` key lists.
+    :param volume_multiplier: Minimum ratio (level vol / avg vol) for the
+        level to be flagged.  Default 5×.
+    :param min_distance_pct: Minimum fractional price distance from the top
+        of book for the suspicious level.  Default 3%.
+    :param top_n: Number of levels to inspect per side.
+    :returns: :class:`SpoofingResult` describing the most suspicious anomaly.
+
+    Returns ``SpoofingResult(detected=False, ...)`` when no anomaly is found
+    or when there is insufficient data.
+    """
+    bids = (depth.get("buy") or [])[:top_n]
+    asks = (depth.get("sell") or [])[:top_n]
+
+    best_side: Optional[str] = None
+    best_distance = 0.0
+
+    for side_label, levels in (("bid", bids), ("ask", asks)):
+        if len(levels) < _SPOOF_MIN_LEVELS:
+            continue
+        try:
+            prices = [float(level[0]) for level in levels]
+            volumes = [float(level[1]) for level in levels]
+        except (IndexError, TypeError, ValueError):
+            continue
+
+        avg_vol = mean(volumes)
+        if avg_vol <= 0:
+            continue
+
+        top_price = prices[0]  # best price on this side (nearest to mid)
+        if top_price <= 0:
+            continue
+
+        for price, vol in zip(prices[1:], volumes[1:]):
+            ratio = vol / avg_vol
+            distance = abs(price - top_price) / top_price
+            if ratio >= volume_multiplier and distance >= min_distance_pct:
+                if distance > best_distance:
+                    best_distance = distance
+                    best_side = side_label
+
+    detected = best_distance >= min_distance_pct
+    return SpoofingResult(
+        detected=detected,
+        side=best_side if detected else None,
+        distance_pct=best_distance,
     )

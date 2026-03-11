@@ -1167,3 +1167,166 @@ class RiskExposureCapTests(unittest.TestCase):
         # Should not return "skipped" due to exposure cap
         outcome = trader.maybe_execute(snap)
         self.assertNotEqual(outcome.get("reason", ""), "exposure_cap")
+
+
+class AdaptiveIntervalTests(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_returns_config_interval_when_disabled(self):
+        config = BotConfig(api_key=None, interval_seconds=300, adaptive_interval_enabled=False)
+        trader = Trader(config)
+        self.assertEqual(trader._effective_interval(), 300)
+
+    def test_returns_config_interval_when_low_volatility(self):
+        from bot.analysis import VolatilityStats
+        config = BotConfig(api_key=None, interval_seconds=300, adaptive_interval_enabled=True, adaptive_interval_min_seconds=30)
+        trader = Trader(config)
+        snapshot = {"volatility": VolatilityStats(volatility=0.005, avg_volume=0.0)}
+        self.assertEqual(trader._effective_interval(snapshot), 300)
+
+    def test_returns_min_interval_when_high_volatility(self):
+        from bot.analysis import VolatilityStats
+        config = BotConfig(api_key=None, interval_seconds=300, adaptive_interval_enabled=True, adaptive_interval_min_seconds=30)
+        trader = Trader(config)
+        snapshot = {"volatility": VolatilityStats(volatility=0.05, avg_volume=0.0)}
+        self.assertEqual(trader._effective_interval(snapshot), 30)
+
+
+class PartialTakeProfitTests(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_snapshot(self, pair="btc_idr", price=110.0):
+        return {
+            "pair": pair,
+            "price": price,
+        }
+
+    def test_partial_tp_sells_fraction_dry_run(self):
+        config = BotConfig(api_key=None, partial_tp_fraction=0.5, dry_run=True)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 2.0)  # buy 2 coins
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["109", "1"]], "sell": []},
+        })()
+        outcome = trader.partial_take_profit(self._make_snapshot(), fraction=0.5)
+        self.assertEqual(outcome["status"], "partial_tp")
+        self.assertAlmostEqual(outcome["amount"], 1.0)  # 50% of 2
+        self.assertTrue(trader.tracker.partial_tp_taken)
+        # Position should now be 1.0 (half sold)
+        self.assertAlmostEqual(trader.tracker.base_position, 1.0)
+
+    def test_partial_tp_no_position_returns_no_position(self):
+        config = BotConfig(api_key=None, dry_run=True)
+        trader = Trader(config)
+        outcome = trader.partial_take_profit(self._make_snapshot(), fraction=0.5)
+        self.assertEqual(outcome["status"], "no_position")
+
+    def test_partial_tp_invalid_fraction(self):
+        config = BotConfig(api_key=None, dry_run=True)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        outcome = trader.partial_take_profit(self._make_snapshot(), fraction=0.0)
+        self.assertEqual(outcome["status"], "invalid_fraction")
+
+
+class ReEntryCooldownTraderTest(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_snapshot(self, pair="btc_idr", action="buy", conf=0.9):
+        return {
+            "pair": pair,
+            "price": 90.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=conf,
+                reason="test",
+                target_price=90,
+                amount=0.1,
+                stop_loss=80,
+                take_profit=100,
+            ),
+        }
+
+    def test_re_entry_blocked_within_cooldown(self):
+        import time
+        config = BotConfig(api_key=None, re_entry_cooldown_seconds=3600, dry_run=True)
+        trader = Trader(config)
+        trader.tracker.last_sell_price = 100.0
+        trader.tracker.last_sell_time = time.time()  # just sold
+        outcome = trader.maybe_execute(self._make_snapshot(action="buy"))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("re_entry", outcome["reason"])
+
+    def test_re_entry_allowed_after_cooldown(self):
+        import time
+        config = BotConfig(api_key=None, re_entry_cooldown_seconds=1, dry_run=True)
+        trader = Trader(config)
+        trader.tracker.last_sell_price = 100.0
+        trader.tracker.last_sell_time = time.time() - 5  # 5s ago, cooldown = 1s
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["89", "1"]], "sell": [["91", "1"]]},
+        })()
+        outcome = trader.maybe_execute(self._make_snapshot(action="buy"))
+        # Should not be blocked by re-entry cooldown (may be skipped for other reasons)
+        self.assertNotIn("re_entry", outcome.get("reason", ""))
+
+
+class LiquidityDepthFilterTest(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_thin_market_skipped(self):
+        config = BotConfig(api_key=None, min_liquidity_depth_idr=1_000_000_000, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["101", "10"]]
+            },  # only 2010 IDR depth — way below 1B threshold
+        })()
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=100,
+                amount=0.1,
+                stop_loss=90,
+                take_profit=110,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("thin_market", outcome["reason"])

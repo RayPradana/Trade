@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from bot.tracking import PortfolioTracker
@@ -130,3 +131,64 @@ class DailyLossCapTest(unittest.TestCase):
         tracker.load_state({"day_open_equity": 95_000.0, "day_stamp": 20250101})
         self.assertAlmostEqual(tracker._day_open_equity, 95_000.0)
         self.assertEqual(tracker._day_stamp, 20250101)
+
+
+class ReEntryAllowedTest(unittest.TestCase):
+    def test_no_config_always_allowed(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        self.assertTrue(tracker.re_entry_allowed(90_000.0, 0, 0))
+
+    def test_cooldown_blocks_immediate_re_entry(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.last_sell_price = 1000.0
+        tracker.last_sell_time = time.time()  # just sold
+        self.assertFalse(tracker.re_entry_allowed(990.0, cooldown_seconds=300))
+
+    def test_cooldown_passes_after_enough_time(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.last_sell_price = 1000.0
+        tracker.last_sell_time = time.time() - 400  # 400s ago
+        self.assertTrue(tracker.re_entry_allowed(990.0, cooldown_seconds=300))
+
+    def test_dip_pct_blocks_when_no_dip(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.last_sell_price = 1000.0
+        tracker.last_sell_time = time.time() - 100  # sold 100s ago, no cooldown restriction
+        # Price at 995, but we need 2% dip → required ≤ 980
+        self.assertFalse(tracker.re_entry_allowed(995.0, dip_pct=0.02))
+
+    def test_dip_pct_allows_when_price_dipped(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.last_sell_price = 1000.0
+        tracker.last_sell_time = time.time() - 100  # sold 100s ago, no cooldown restriction
+        # Price at 970 is 3% below last sell → 2% requirement met
+        self.assertTrue(tracker.re_entry_allowed(970.0, dip_pct=0.02))
+
+    def test_no_sell_always_allowed(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        self.assertTrue(tracker.re_entry_allowed(1000.0, cooldown_seconds=300, dip_pct=0.05))
+
+    def test_partial_tp_taken_resets_on_buy(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.partial_tp_taken = True
+        tracker.record_trade("buy", 1000.0, 1.0)
+        self.assertFalse(tracker.partial_tp_taken)
+
+    def test_to_state_includes_re_entry_fields(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.last_sell_price = 999.0
+        tracker.last_sell_time = 12345.0
+        tracker.partial_tp_taken = True
+        state = tracker.to_state()
+        self.assertIn("last_sell_price", state)
+        self.assertIn("last_sell_time", state)
+        self.assertIn("partial_tp_taken", state)
+        self.assertEqual(state["last_sell_price"], 999.0)
+        self.assertTrue(state["partial_tp_taken"])
+
+    def test_load_state_restores_re_entry_fields(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.load_state({"last_sell_price": 888.0, "last_sell_time": 9999.0, "partial_tp_taken": True})
+        self.assertAlmostEqual(tracker.last_sell_price, 888.0)
+        self.assertAlmostEqual(tracker.last_sell_time, 9999.0)
+        self.assertTrue(tracker.partial_tp_taken)
