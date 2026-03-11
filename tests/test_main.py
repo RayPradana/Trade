@@ -1,3 +1,4 @@
+import logging
 import os
 import unittest
 from unittest.mock import patch
@@ -6,6 +7,12 @@ import main
 
 
 class MainErrorHandlingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
     def test_main_exits_gracefully_on_recoverable_error_with_run_once(self) -> None:
         class StubTrader:
             def __init__(self, config) -> None:
@@ -18,9 +25,10 @@ class MainErrorHandlingTests(unittest.TestCase):
             def maybe_execute(self, snapshot):
                 return {}
 
-        with patch("main.Trader", StubTrader):
-            with patch.dict(os.environ, {"RUN_ONCE": "true"}, clear=False):
-                main.main()  # should exit without raising
+        with patch("main.configure_logging"):
+            with patch("main.Trader", StubTrader):
+                with patch.dict(os.environ, {"RUN_ONCE": "true"}, clear=False):
+                    main.main()  # should exit without raising
 
 
 if __name__ == "__main__":

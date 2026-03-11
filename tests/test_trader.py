@@ -1,3 +1,4 @@
+import logging
 import unittest
 from typing import Dict, Any
 
@@ -65,6 +66,12 @@ class AllFailTrader(Trader):
 
 
 class TraderSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
     def test_scan_and_choose_picks_best_confidence(self) -> None:
         config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="a_idr", auto_resume=False)
         snapshots = {
