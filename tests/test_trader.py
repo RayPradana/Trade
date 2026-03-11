@@ -1442,3 +1442,69 @@ class EvaluateDynamicTpTest(unittest.TestCase):
 
         # Rich tracker has larger effective capital → bigger position size
         self.assertGreater(dec_rich.amount, dec_base.amount)
+
+
+class TrailingTpFloorAdvancementTest(unittest.TestCase):
+    """Regression test: trailing TP floor must advance on each monitoring tick."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_floor_advances_when_price_rises(self):
+        """After activation the trailing TP floor must rise with the price."""
+        config = BotConfig(api_key=None, trailing_tp_pct=0.01)
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 900.0)
+
+        # Activate floor at price=125 → floor=123.75
+        tracker.activate_trailing_tp(125.0, 0.01)
+        floor_after_125 = tracker.trailing_tp_stop
+        self.assertAlmostEqual(floor_after_125, 123.75)
+
+        # Price rises to 130: simulate the main.py per-tick advancement.
+        # This replicates the code added to main.py's position monitoring loop
+        # (the bug fix: advance floor before evaluating stop_reason each tick).
+        if config.trailing_tp_pct > 0 and tracker.tp_activated:
+            tracker.activate_trailing_tp(130.0, config.trailing_tp_pct)
+
+        floor_after_130 = tracker.trailing_tp_stop
+        self.assertAlmostEqual(floor_after_130, 128.7, places=2)
+        self.assertGreater(floor_after_130, floor_after_125)
+
+    def test_floor_does_not_fall_when_price_drops(self):
+        """Trailing TP floor must never fall when the price retraces."""
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 900.0)
+        tracker.activate_trailing_tp(130.0, 0.01)  # floor=128.7
+        peak_floor = tracker.trailing_tp_stop
+
+        # Price drops to 129 — floor must not decrease
+        tracker.activate_trailing_tp(129.0, 0.01)
+        self.assertAlmostEqual(tracker.trailing_tp_stop, peak_floor)
+
+    def test_floor_triggers_exit_after_advancement(self):
+        """After advancing the floor, a price drop below the NEW floor triggers exit."""
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 900.0)
+
+        # Activate at 125 → floor=123.75
+        tracker.activate_trailing_tp(125.0, 0.01)
+        # Advance to 130 → floor=128.7
+        tracker.activate_trailing_tp(130.0, 0.01)
+
+        # Price drops to 128 (above old floor 123.75, but below new floor 128.7)
+        reason = tracker.stop_reason(128.0)
+        self.assertEqual(reason, "trailing_tp_triggered")
+
+    def test_stop_reason_still_none_above_advanced_floor(self):
+        """When price is above the advanced floor, stop_reason returns None (hold)."""
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 900.0)
+        tracker.activate_trailing_tp(130.0, 0.01)  # floor=128.7
+
+        # At 129 (above floor 128.7), equity > target → None (hold)
+        reason = tracker.stop_reason(129.0)
+        self.assertIsNone(reason)

@@ -546,6 +546,7 @@ def _log_holding(pair: str, price: float, portfolio: dict,
     cash     = portfolio["cash"]
     trail    = portfolio.get("trailing_stop")
     t_equity = portfolio.get("target_equity", 0.0)
+    trailing_tp_floor = portfolio.get("trailing_tp_stop")
 
     unrealized = (equity - cash) - pos * avg_cost if pos > 0 else 0.0
     unreal_pct = (unrealized / (pos * avg_cost) * 100) if (pos > 0 and avg_cost > 0) else 0.0
@@ -580,11 +581,12 @@ def _log_holding(pair: str, price: float, portfolio: dict,
         equity_pct_str,
         f"{_idr(cash)}",
     )
-    trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"   if trail    else f"{_DIM}—{_RESET}"
-    target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}" if t_equity else f"{_DIM}—{_RESET}"
+    trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"            if trail             else f"{_DIM}—{_RESET}"
+    ttp_str    = f"{_GREEN}{_idr(trailing_tp_floor)}{_RESET}"  if trailing_tp_floor else f"{_DIM}—{_RESET}"
+    target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}"          if t_equity          else f"{_DIM}—{_RESET}"
     logging.info(
-        "   %s└─%s trail     : %s    target : %s",
-        _DIM, _RESET, trail_str, target_str,
+        "   %s└─%s trail     : %s  trail-TP: %s    target : %s",
+        _DIM, _RESET, trail_str, ttp_str, target_str,
     )
 
 
@@ -652,6 +654,15 @@ def main() -> None:
 
                 if config.trailing_stop_pct > 0:
                     trader.tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
+
+                # Advance the trailing TP floor on every tick while the
+                # position is open and trailing TP has been activated.
+                # This ensures the floor rises with the price rather than
+                # staying fixed at the level it was first set.
+                # Without this call, the floor would remain at the initial
+                # activation level instead of rising with market gains.
+                if config.trailing_tp_pct > 0 and trader.tracker.tp_activated:
+                    trader.tracker.activate_trailing_tp(held_price, config.trailing_tp_pct)
 
                 stop_reason = trader.tracker.stop_reason(held_price)
                 held_decision = held_snapshot["decision"]
