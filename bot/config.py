@@ -46,8 +46,10 @@ class BotConfig:
     order_queue_enabled: bool = True
     order_min_interval: float = 1.5  # seconds between order requests; higher reduces 429 risk
     scan_request_delay: float = 0.2  # seconds to wait before each per-pair API call during scanning
+    trade_count: int = 1000  # recent trades to fetch per pair when building candles from trades
+    min_candles: int = 20  # minimum candle count required for reliable indicator computation
     websocket_enabled: bool = True
-    websocket_url: Optional[str] = None
+    websocket_url: Optional[str] = "wss://ws3.indodax.com/ws/"  # Indodax market-data WebSocket
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
     websocket_batch_size: int = 100  # max pairs per WebSocket connection for multi-pair feed
     pairs_per_cycle: int = 50  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
@@ -95,8 +97,10 @@ class BotConfig:
             order_queue_enabled=os.getenv("ORDER_QUEUE_ENABLED", "true").lower() in {"1", "true", "yes"},
             order_min_interval=float(os.getenv("ORDER_MIN_INTERVAL", "1.5")),
             scan_request_delay=float(os.getenv("SCAN_REQUEST_DELAY", "0.2")),
+            trade_count=int(os.getenv("TRADE_COUNT", "1000")),
+            min_candles=int(os.getenv("MIN_CANDLES", "20")),
             websocket_enabled=websocket_enabled,
-            websocket_url=os.getenv("WEBSOCKET_URL"),
+            websocket_url=os.getenv("WEBSOCKET_URL", "wss://ws3.indodax.com/ws/") or None,
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
             websocket_batch_size=int(os.getenv("WEBSOCKET_BATCH_SIZE", "100")),
             pairs_per_cycle=int(os.getenv("PAIRS_PER_CYCLE", "50")),
@@ -138,6 +142,10 @@ class BotConfig:
             raise ValueError("ORDER_MIN_INTERVAL must be positive")
         if self.scan_request_delay < 0:
             raise ValueError("SCAN_REQUEST_DELAY must be non-negative")
+        if self.trade_count <= 0:
+            raise ValueError("TRADE_COUNT must be positive")
+        if self.min_candles <= 0:
+            raise ValueError("MIN_CANDLES must be positive")
         if self.websocket_batch_size <= 0:
             raise ValueError("WEBSOCKET_BATCH_SIZE must be positive")
         if self.pairs_per_cycle < 0:

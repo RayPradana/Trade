@@ -878,3 +878,167 @@ class TraderSelectionTests(unittest.TestCase):
         # eth_idr (highest volume) must be analyzed first and returned via early exit
         self.assertEqual(returned_pair, "eth_idr")
         self.assertEqual(analysis_order[0], "eth_idr")
+
+
+class InsufficientDataTests(unittest.TestCase):
+    """Tests for insufficient_data handling in analyze_market and scan_and_choose."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def _make_snapshot(self, pair: str, action: str = "hold", confidence: float = 0.3,
+                       insufficient: bool = False) -> Dict[str, Any]:
+        return {
+            "pair": pair,
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": insufficient,
+            "decision": StrategyDecision(
+                mode="position_trading",
+                action=action,
+                confidence=confidence,
+                reason="test",
+                target_price=100,
+                amount=0.1,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+
+    def test_scan_skips_insufficient_data_pairs(self) -> None:
+        """Pairs flagged insufficient_data must not influence best_pair selection."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0, min_candles=20)
+
+        # a_idr has insufficient data; b_idr has valid "hold" data
+        snapshots = {
+            "a_idr": self._make_snapshot("a_idr", action="hold", confidence=0.9, insufficient=True),
+            "b_idr": self._make_snapshot("b_idr", action="hold", confidence=0.4, insufficient=False),
+        }
+
+        class _Client:
+            def get_pairs(self): return [{"name": p} for p in snapshots]
+            def get_summaries(self): return {}
+
+        class _StubTrader(AutoPairsTrader):
+            pass
+
+        trader = _StubTrader(config, snapshots)
+        feed = MultiPairFeed(
+            list(snapshots), mock.MagicMock(), websocket_enabled=False, summaries_interval=9999
+        )
+        feed._apply_ws_message_for_pair("a_idr", {"last": "100", "vol_idr": "100"})
+        feed._apply_ws_message_for_pair("b_idr", {"last": "100", "vol_idr": "50"})
+        trader._multi_feed = feed
+
+        with mock.patch("bot.trader.time.sleep"):
+            returned_pair, snapshot = trader.scan_and_choose()
+
+        # a_idr must be skipped; b_idr (valid hold) must be the fallback result
+        self.assertEqual(returned_pair, "b_idr")
+        self.assertFalse(snapshot.get("insufficient_data"))
+
+    def test_scan_uses_best_hold_without_extra_rest_call(self) -> None:
+        """scan_and_choose returns the best hold snapshot without re-calling analyze_market."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+
+        snapshots = {
+            "a_idr": self._make_snapshot("a_idr", action="hold", confidence=0.4),
+            "b_idr": self._make_snapshot("b_idr", action="hold", confidence=0.6),
+        }
+        trader = AutoPairsTrader(config, snapshots)
+        feed = MultiPairFeed(
+            list(snapshots), mock.MagicMock(), websocket_enabled=False, summaries_interval=9999
+        )
+        feed._apply_ws_message_for_pair("a_idr", {"last": "100", "vol_idr": "100"})
+        feed._apply_ws_message_for_pair("b_idr", {"last": "100", "vol_idr": "50"})
+        trader._multi_feed = feed
+
+        analyze_calls: list[str] = []
+        orig = trader.analyze_market
+
+        def tracking_analyze(pair=None, prefetched_ticker=None):
+            analyze_calls.append(pair or "")
+            return orig(pair, prefetched_ticker)
+
+        trader.analyze_market = tracking_analyze  # type: ignore[method-assign]
+
+        with mock.patch("bot.trader.time.sleep"):
+            returned_pair, snapshot = trader.scan_and_choose()
+
+        # Both pairs are analyzed once during the scan loop (expected).
+        # The best hold (a_idr has higher IDR vol → scanned first → b_idr second)
+        # should be returned WITHOUT an additional fallback REST call.
+        # Total analyze_market calls must be exactly 2 (one per pair in scan loop).
+        self.assertEqual(len(analyze_calls), 2, f"Expected 2 analyze calls, got {analyze_calls}")
+        # Returned pair is the one with highest _score (b_idr has confidence=0.6 > 0.4)
+        self.assertEqual(returned_pair, "b_idr")
+
+    def test_get_ohlc_in_client(self) -> None:
+        """IndodaxClient.get_ohlc builds URL params correctly."""
+        import unittest.mock as mock
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient()
+        mock_response = mock.MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = [
+            {"Time": 1000, "Open": 100.0, "High": 110.0, "Low": 90.0, "Close": 105.0, "Volume": "50"}
+        ]
+        with mock.patch.object(client.session, "get", return_value=mock_response) as mock_get:
+            result = client.get_ohlc("btc_idr", tf="15", limit=50)
+        call_kwargs = mock_get.call_args
+        url = call_kwargs[0][0]
+        params = call_kwargs[1]["params"]
+        self.assertIn("/tradingview/history_v2", url)
+        self.assertEqual(params["tf"], "15")
+        self.assertEqual(params["symbol"], "BTCIDR")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["Close"], 105.0)
+
+    def test_analyze_market_sets_insufficient_data_flag(self) -> None:
+        """analyze_market sets insufficient_data=True when candle count < min_candles."""
+        import unittest.mock as mock
+        from bot.indodax_client import IndodaxClient
+
+        config = BotConfig(api_key=None, min_candles=20, dry_run=True)
+
+        class _NoOhlcClient(IndodaxClient):
+            def get_ticker(self, pair):
+                return {"ticker": {"last": "50000"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []  # No trades → empty candles
+            def get_ohlc(self, pair, tf="15", *, limit=200, to_ts=None):
+                return []  # OHLC also fails
+
+        trader = Trader(config, client=_NoOhlcClient())
+        with mock.patch("bot.trader.time.sleep"):
+            snapshot = trader.analyze_market("btc_idr")
+
+        self.assertTrue(snapshot["insufficient_data"])
+
+    def test_config_trade_count_and_min_candles(self) -> None:
+        """BotConfig trade_count and min_candles fields are configurable."""
+        config = BotConfig(api_key=None, trade_count=500, min_candles=30)
+        self.assertEqual(config.trade_count, 500)
+        self.assertEqual(config.min_candles, 30)
+
+    def test_config_defaults(self) -> None:
+        """Default values for trade_count and min_candles are sensible."""
+        config = BotConfig(api_key=None)
+        self.assertEqual(config.trade_count, 1000)
+        self.assertEqual(config.min_candles, 20)

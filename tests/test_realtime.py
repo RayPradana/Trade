@@ -307,3 +307,55 @@ class MultiPairFeedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CentrifugeProtocolTests(unittest.TestCase):
+    """Tests for the Centrifuge-protocol WebSocket message parser."""
+
+    def _make_feed(self, pairs=None):
+        if pairs is None:
+            pairs = ["btc_idr", "eth_idr", "usdt_idr"]
+        client = _SummariesClientStub({})
+        return MultiPairFeed(pairs, client, websocket_enabled=False, summaries_interval=9999)
+
+    def test_apply_summary_rows_updates_cache(self) -> None:
+        """_apply_summary_rows must update the ticker cache for each row."""
+        feed = self._make_feed()
+        rows = [
+            ["btcidr", 1700000000, 900000000, 880000000, 920000000, 895000000,
+             "50000000000", "55.0"],
+            ["ethidr", 1700000000, 45000000, 44000000, 46000000, 44500000,
+             "10000000000", "222.0"],
+        ]
+        feed._apply_summary_rows(rows)
+        btc = feed.get_ticker("btc_idr")
+        eth = feed.get_ticker("eth_idr")
+        self.assertIsNotNone(btc)
+        self.assertEqual(btc["last"], "900000000")   # type: ignore[index]
+        self.assertEqual(btc["high"], "920000000")   # type: ignore[index]
+        self.assertIsNotNone(eth)
+        self.assertEqual(eth["last"], "45000000")    # type: ignore[index]
+
+    def test_apply_summary_rows_skips_unknown_pairs(self) -> None:
+        """Rows for pairs not in the known list must be silently skipped."""
+        feed = self._make_feed(["btc_idr"])
+        feed._apply_summary_rows([["unknownidr", 1700000000, 100, 90, 110, 95, "1000", "1"]])
+        self.assertIsNone(feed.get_ticker("unknown_idr"))
+
+    def test_apply_summary_rows_skips_short_rows(self) -> None:
+        """Rows shorter than 8 elements must be silently skipped."""
+        feed = self._make_feed()
+        feed._apply_summary_rows([["btcidr", 1700000000, 100]])
+        self.assertIsNone(feed.get_ticker("btc_idr"))
+
+    def test_default_websocket_url_is_indodax(self) -> None:
+        """Default websocket_url must point to the official Indodax WS endpoint."""
+        from bot.realtime import INDODAX_WS_URL
+        feed = self._make_feed()
+        self.assertEqual(feed._websocket_url, INDODAX_WS_URL)
+
+    def test_default_websocket_token_is_set(self) -> None:
+        """Default websocket_token must be the public Indodax static token."""
+        from bot.realtime import INDODAX_WS_TOKEN
+        feed = self._make_feed()
+        self.assertEqual(feed._websocket_token, INDODAX_WS_TOKEN)

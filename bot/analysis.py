@@ -4,7 +4,7 @@ import math
 import logging
 from dataclasses import dataclass
 from statistics import mean, pstdev
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -257,3 +257,64 @@ def derive_indicators(candles: Sequence[Candle]) -> MomentumIndicators:
         bb_mid=bb_mid,
         bb_lower=bb_lower,
     )
+
+
+# ---------------------------------------------------------------------------
+# Indodax OHLCV history helpers
+# ---------------------------------------------------------------------------
+
+# Maps Indodax timeframe strings to their duration in seconds.
+_TF_SECONDS: Dict[str, int] = {
+    "1": 60,
+    "15": 900,
+    "30": 1800,
+    "60": 3600,
+    "240": 14400,
+    "1D": 86400,
+    "3D": 259200,
+    "1W": 604800,
+}
+
+
+def interval_to_ohlc_tf(interval_seconds: int) -> str:
+    """Return the Indodax OHLCV timeframe string closest to *interval_seconds*.
+
+    The mapping always picks the smallest available timeframe that is
+    **≥** the requested interval so that each candle covers at least one
+    full bot cycle.
+
+    Available timeframes: ``"1"`` (1 min), ``"15"``, ``"30"``, ``"60"``,
+    ``"240"`` (4 h), ``"1D"``.
+    """
+    for tf, seconds in [("1", 60), ("15", 900), ("30", 1800), ("60", 3600), ("240", 14400)]:
+        if interval_seconds <= seconds:
+            return tf
+    return "1D"
+
+
+def candles_from_ohlc(ohlc_data: List[Dict[str, object]]) -> List[Candle]:
+    """Convert Indodax ``/tradingview/history_v2`` response to :class:`Candle` objects.
+
+    The API returns a list of dicts with keys ``Time``, ``Open``, ``High``,
+    ``Low``, ``Close``, ``Volume`` (capital first letter).  Invalid or
+    incomplete rows are silently skipped.  Returns list sorted oldest → newest.
+    """
+    result: List[Candle] = []
+    for row in ohlc_data:
+        if not isinstance(row, dict):
+            continue
+        try:
+            result.append(
+                Candle(
+                    timestamp=int(row["Time"]),
+                    open=float(row["Open"]),
+                    high=float(row["High"]),
+                    low=float(row["Low"]),
+                    close=float(row["Close"]),
+                    volume=float(row.get("Volume") or 0),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(result, key=lambda c: c.timestamp)
+

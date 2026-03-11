@@ -10,6 +10,18 @@ import requests
 
 from .rate_limit import RateLimitedOrderQueue
 
+# Mapping of Indodax OHLC timeframe strings to seconds.
+_OHLC_TF_SECONDS: Dict[str, int] = {
+    "1": 60,
+    "15": 900,
+    "30": 1800,
+    "60": 3600,
+    "240": 14400,
+    "1D": 86400,
+    "3D": 259200,
+    "1W": 604800,
+}
+
 
 class IndodaxClient:
     """Lightweight Indodax API wrapper supporting public and private endpoints."""
@@ -53,6 +65,36 @@ class IndodaxClient:
 
     def get_trades(self, pair: str, count: int = 200) -> List[Dict[str, Any]]:
         return self._get(f"/api/trades/{pair}", params={"count": count})
+
+    def get_ohlc(
+        self,
+        pair: str,
+        tf: str = "15",
+        *,
+        limit: int = 200,
+        to_ts: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch OHLCV candles from ``/tradingview/history_v2``.
+
+        :param pair:  Canonical pair name (e.g. ``btc_idr``).
+        :param tf:    Timeframe string accepted by the API: ``"1"``, ``"15"``,
+                      ``"30"``, ``"60"``, ``"240"``, ``"1D"``, ``"3D"``, ``"1W"``.
+                      Defaults to ``"15"`` (15-minute).
+        :param limit: Approximate number of candles to request.
+        :param to_ts: End-of-range Unix timestamp.  Defaults to *now*.
+        :returns:     List of dicts with keys ``Time``, ``Open``, ``High``,
+                      ``Low``, ``Close``, ``Volume``.  Empty list on failure.
+        """
+        if to_ts is None:
+            to_ts = int(time.time())
+        tf_seconds = _OHLC_TF_SECONDS.get(tf, 900)
+        from_ts = to_ts - limit * tf_seconds
+        symbol = pair.replace("_", "").upper()  # "btc_idr" → "BTCIDR"
+        result = self._get(
+            "/tradingview/history_v2",
+            params={"from": from_ts, "to": to_ts, "tf": tf, "symbol": symbol},
+        )
+        return result if isinstance(result, list) else []
 
     # -------------------- private API -------------------- #
     def get_account_info(self) -> Dict[str, Any]:

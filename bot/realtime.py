@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 _WS_BACKOFF_INITIAL = 2.0   # seconds before first retry
 _WS_BACKOFF_MAX = 60.0      # ceiling for exponential back-off
 
+# Official Indodax market-data WebSocket endpoint and public static token.
+# These are published in the official API docs:
+# https://github.com/btcid/indodax-official-api-docs/blob/master/Marketdata-websocket.md
+INDODAX_WS_URL = "wss://ws3.indodax.com/ws/"
+INDODAX_WS_TOKEN = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJleHAiOjE5NDY2MTg0MTV9"
+    ".UR1lBM6Eqh0yWz-PVirw1uPCxe60FdchR8eNVdsskeo"
+)
+
 
 class RealtimeFeed:
     """Realtime market data provider.
@@ -172,9 +182,11 @@ class RealtimeFeed:
             )
 
             # run_forever blocks until the connection closes or an error occurs.
+            # suppress_origin=True removes the Origin header which Indodax WS
+            # servers require to be absent (otherwise returns 403 Forbidden).
             wst = threading.Thread(
                 target=ws.run_forever,
-                kwargs={"ping_interval": 20, "ping_timeout": 10},
+                kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
                 daemon=True,
             )
             wst.start()
@@ -232,8 +244,9 @@ class MultiPairFeed:
         pairs: List[str],
         client: Any,
         *,
-        websocket_url: Optional[str] = None,
+        websocket_url: Optional[str] = INDODAX_WS_URL,
         websocket_enabled: bool = True,
+        websocket_token: Optional[str] = INDODAX_WS_TOKEN,
         batch_size: int = 100,
         summaries_interval: float = 60.0,
     ) -> None:
@@ -241,6 +254,7 @@ class MultiPairFeed:
         self._client = client
         self._websocket_url = websocket_url
         self._websocket_enabled = websocket_enabled
+        self._websocket_token = websocket_token
         self._batch_size = max(1, batch_size)
         self._summaries_interval = max(10.0, summaries_interval)
 
@@ -288,16 +302,17 @@ class MultiPairFeed:
         self._update_from_summaries()
 
         if self._websocket_enabled and websocket and self._websocket_url:
-            for i in range(0, len(self._pairs), self._batch_size):
-                batch = self._pairs[i : i + self._batch_size]
-                t = threading.Thread(
-                    target=self._run_ws_batch,
-                    args=(batch,),
-                    daemon=True,
-                    name=f"MultiPairFeed-ws-{i // self._batch_size}",
-                )
-                t.start()
-                self._threads.append(t)
+            # Use a single WebSocket connection to the official Indodax market
+            # data endpoint.  The Centrifuge protocol used by Indodax covers all
+            # pairs with one "market:summary-24h" subscription, so no batching is
+            # required.
+            t = threading.Thread(
+                target=self._run_ws_centrifuge,
+                daemon=True,
+                name="MultiPairFeed-ws",
+            )
+            t.start()
+            self._threads.append(t)
         else:
             t = threading.Thread(
                 target=self._run_summaries_polling,
@@ -349,74 +364,90 @@ class MultiPairFeed:
             self._update_from_summaries()
 
     # ------------------------------------------------------------------
-    # WebSocket batch streaming
+    # WebSocket streaming (Indodax Centrifuge protocol)
     # ------------------------------------------------------------------
 
-    def _run_ws_batch(self, batch: List[str]) -> None:
-        """Manage a single WebSocket connection covering *batch* pairs."""
+    def _run_ws_centrifuge(self) -> None:
+        """Manage a single WebSocket connection to the Indodax market-data server.
+
+        Protocol (Centrifuge-based, documented at
+        https://github.com/btcid/indodax-official-api-docs/blob/master/Marketdata-websocket.md):
+
+        1. Connect to ``wss://ws3.indodax.com/ws/`` with ``suppress_origin=True``.
+        2. Authenticate with the static public token:
+           ``{"params": {"token": "…"}, "id": 1}``
+        3. Subscribe to ``market:summary-24h`` for all-pairs ticker snapshots:
+           ``{"method": 1, "params": {"channel": "market:summary-24h"}, "id": 2}``
+        4. Parse incoming push messages:
+           ``{"result": {"channel": "market:summary-24h",
+                         "data": {"data": [["btcidr", ts, last, low, high, prev,
+                                             idr_vol, coin_vol], …]}}}``
+        """
         assert websocket is not None
         assert self._websocket_url
 
-        subscribe_msg = json.dumps({"action": "subscribe", "channel": batch})
+        token = self._websocket_token or INDODAX_WS_TOKEN
+        auth_msg = json.dumps({"params": {"token": token}, "id": 1})
+        subscribe_msg = json.dumps(
+            {"method": 1, "params": {"channel": "market:summary-24h"}, "id": 2}
+        )
         backoff = _WS_BACKOFF_INITIAL
 
         while not self._stop.is_set():
+            _authenticated = threading.Event()
+
             def _on_open(ws: Any) -> None:
                 nonlocal backoff
                 backoff = _WS_BACKOFF_INITIAL
-                logger.info(
-                    "MultiPairFeed WS connected (batch of %d, first=%s)",
-                    len(batch),
-                    batch[0],
-                )
+                logger.info("MultiPairFeed WS connected to %s", self._websocket_url)
                 try:
-                    ws.send(subscribe_msg)
-                    logger.debug(
-                        "MultiPairFeed WS subscribed: %s … (+%d more)",
-                        batch[0],
-                        len(batch) - 1,
-                    )
+                    ws.send(auth_msg)
                 except Exception:
-                    logger.debug("MultiPairFeed WS subscribe failed", exc_info=True)
+                    logger.debug("MultiPairFeed WS auth send failed", exc_info=True)
 
-            def _on_message(_: Any, message: str) -> None:
+            def _on_message(_ws: Any, message: str) -> None:
                 try:
                     parsed = json.loads(message)
                     if not isinstance(parsed, dict):
                         return
-                    # Accept common Indodax WebSocket message shapes:
-                    #   {"pair": "btc_idr", "ticker": {"last": "100", …}}
-                    #   {"channel": "btcidr", "data": {"last": "100", …}}
-                    raw_pair = (
-                        parsed.get("pair")
-                        or parsed.get("channel")
-                        or parsed.get("symbol")
-                    )
-                    if not raw_pair:
+
+                    # ── Auth response: {"id": 1, "result": {"client": …}} ────
+                    if parsed.get("id") == 1 and "result" in parsed:
+                        _authenticated.set()
+                        try:
+                            _ws.send(subscribe_msg)
+                            logger.debug(
+                                "MultiPairFeed WS subscribed to market:summary-24h"
+                            )
+                        except Exception:
+                            logger.debug(
+                                "MultiPairFeed WS subscribe send failed", exc_info=True
+                            )
                         return
-                    # Normalise to canonical pair name
-                    normalised = str(raw_pair).lower().replace("-", "_")
-                    pair_name = self._key_to_pair.get(
-                        normalised.replace("_", ""), normalised
-                    )
-                    ticker_data = (
-                        parsed.get("ticker")
-                        or parsed.get("data")
-                    )
-                    if ticker_data and isinstance(ticker_data, dict):
-                        self._apply_ws_message_for_pair(pair_name, ticker_data)
+
+                    # ── Push: {"result": {"channel": "market:summary-24h",
+                    #                      "data": {"data": [[pair, ts, last, …], …]}}}
+                    result = parsed.get("result") or parsed.get("push", {}).get("pub", {})
+                    if not isinstance(result, dict):
+                        return
+                    channel = result.get("channel", "")
+                    data_wrapper = result.get("data", {})
+                    if not isinstance(data_wrapper, dict):
+                        return
+                    rows = data_wrapper.get("data", [])
+                    if not isinstance(rows, list):
+                        return
+
+                    if "market:summary-24h" in channel:
+                        self._apply_summary_rows(rows)
                 except Exception:
                     logger.debug("MultiPairFeed WS message parse error", exc_info=True)
 
             def _on_error(_: Any, error: Any) -> None:
-                logger.debug(
-                    "MultiPairFeed WS error (batch first=%s): %s", batch[0], error
-                )
+                logger.debug("MultiPairFeed WS error: %s", error)
 
             def _on_close(_: Any, code: Any, msg: Any) -> None:
-                logger.info(
-                    "MultiPairFeed WS closed (batch first=%s, code=%s)", batch[0], code
-                )
+                logger.info("MultiPairFeed WS closed (code=%s)", code)
 
             ws_app = websocket.WebSocketApp(
                 self._websocket_url,
@@ -425,26 +456,57 @@ class MultiPairFeed:
                 on_error=_on_error,
                 on_close=_on_close,
             )
+            # suppress_origin=True is required by Indodax – without it the server
+            # returns 403 Forbidden due to Origin header mismatch.
             wst = threading.Thread(
                 target=ws_app.run_forever,
-                kwargs={"ping_interval": 20, "ping_timeout": 10},
+                kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
                 daemon=True,
             )
             wst.start()
             wst.join(timeout=30.0)
             if wst.is_alive():
-                logger.debug(
-                    "MultiPairFeed WS thread did not finish within timeout (batch first=%s)",
-                    batch[0],
-                )
+                logger.debug("MultiPairFeed WS thread did not finish within timeout")
 
             if self._stop.is_set():
                 break
 
             logger.warning(
-                "MultiPairFeed WS disconnected (batch first=%s); reconnecting in %.0fs …",
-                batch[0],
-                backoff,
+                "MultiPairFeed WS disconnected; reconnecting in %.0fs …", backoff
             )
             self._stop.wait(backoff)
             backoff = min(backoff * 2, _WS_BACKOFF_MAX)
+
+    def _apply_summary_rows(self, rows: List[Any]) -> None:
+        """Update the ticker cache from ``market:summary-24h`` push data.
+
+        Each row is an array:
+        ``[pair_key, timestamp, last, low, high, prev_price, idr_volume, coin_volume]``
+        where *pair_key* is the pair without underscore (e.g. ``"btcidr"``).
+        """
+        updates: Dict[str, Any] = {}
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 8:
+                continue
+            try:
+                raw_key = str(row[0]).lower().replace("_", "")
+                pair_name = self._key_to_pair.get(raw_key)
+                if pair_name is None:
+                    continue
+                updates[pair_name] = {
+                    "last": str(row[2]),
+                    "low": str(row[3]),
+                    "high": str(row[4]),
+                    "vol_idr": str(row[6]),
+                    "server_time": int(row[1]),
+                }
+            except (IndexError, TypeError, ValueError):
+                continue
+        if updates:
+            with self._lock:
+                self._cache.update(updates)
+            logger.debug(
+                "MultiPairFeed WS: updated %d tickers from market:summary-24h",
+                len(updates),
+            )
+

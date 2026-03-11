@@ -11,7 +11,9 @@ from .analysis import (
     analyze_trend,
     analyze_volatility,
     build_candles,
+    candles_from_ohlc,
     derive_indicators,
+    interval_to_ohlc_tf,
     MomentumIndicators,
     support_resistance,
 )
@@ -25,6 +27,10 @@ from .strategies import StrategyDecision, make_trade_decision
 from .tracking import PortfolioTracker
 
 logger = logging.getLogger(__name__)
+
+# Extra candles requested beyond slow_window when fetching OHLC history so
+# that EMA-based indicators (MACD, Bollinger) have enough warm-up data.
+_OHLC_BUFFER_CANDLES = 100
 
 
 class Trader:
@@ -200,6 +206,37 @@ class Trader:
             raise ValueError("Ticker missing price fields")
         return float(last_value)
 
+    def _fetch_candles(
+        self,
+        pair: str,
+        trades: List[Dict[str, Any]],
+    ) -> List[Any]:
+        """Return OHLCV candles for *pair*, preferring the official OHLC endpoint.
+
+        Tries ``/tradingview/history_v2`` first (reliable pre-formed candles).
+        Falls back to :func:`~bot.analysis.build_candles` from raw trades when
+        the OHLC endpoint is unavailable or returns no data.
+        """
+        try:
+            tf = interval_to_ohlc_tf(self.config.interval_seconds)
+            # Request enough candles to seed all indicators (slow_window + buffer).
+            limit = max(200, self.config.slow_window + _OHLC_BUFFER_CANDLES)
+            ohlc_data = self.client.get_ohlc(pair, tf=tf, limit=limit)
+            candles = candles_from_ohlc(ohlc_data)
+            if candles:
+                logger.debug(
+                    "OHLC candles for %s: %d candles (tf=%s)", pair, len(candles), tf
+                )
+                return candles
+        except Exception as exc:
+            logger.debug(
+                "OHLC fetch failed for %s (%s); falling back to trades", pair, exc
+            )
+        # Legacy fallback: build candles by bucketing raw trade ticks.
+        return build_candles(
+            trades, interval_seconds=self.config.interval_seconds, limit=200
+        )
+
     def _score_snapshot(self, snapshot: Dict[str, Any]) -> float:
         decision: StrategyDecision = snapshot["decision"]
         vol = snapshot.get("volatility")
@@ -296,13 +333,28 @@ class Trader:
             snap = self.realtime.snapshot()
             ticker = snap.get("ticker") or prefetched_ticker or self.client.get_ticker(pair)
             depth = snap.get("depth") or self.client.get_depth(pair, count=200)
-            trades = snap.get("trades") or self.client.get_trades(pair, count=400)
+            trades = snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
         else:
             ticker = prefetched_ticker or self.client.get_ticker(pair)
             depth = self.client.get_depth(pair, count=200)
-            trades = self.client.get_trades(pair, count=400)
+            trades = self.client.get_trades(pair, count=self.config.trade_count)
 
-        candles = build_candles(trades, interval_seconds=self.config.interval_seconds, limit=96)
+        # ── Candle data ──────────────────────────────────────────────────────
+        # Prefer the official OHLCV history endpoint which returns pre-formed
+        # candles and covers enough history for all indicators even for
+        # high-volume pairs.  Fall back to building candles from raw trades
+        # (the legacy path) when the OHLC call fails.
+        candles = self._fetch_candles(pair, trades)
+
+        insufficient_data = len(candles) < self.config.min_candles
+        if insufficient_data:
+            logger.debug(
+                "Pair %s: only %d candle(s) available (need ≥%d for reliable indicators)",
+                pair,
+                len(candles),
+                self.config.min_candles,
+            )
+
         trend = analyze_trend(candles, self.config.fast_window, self.config.slow_window)
         orderbook = analyze_orderbook(depth)
         vol = analyze_volatility(candles)
@@ -338,6 +390,7 @@ class Trader:
             "decision": decision,
             "candles": candles,
             "grid_plan": grid_plan,
+            "insufficient_data": insufficient_data,
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -699,8 +752,14 @@ class Trader:
         best_pair = pairs[0] if pairs else self.config.pair
         best_snapshot: Optional[Dict[str, Any]] = None
         best_score = -1.0
+        # Track the best "hold" result separately so we can return it as the
+        # fallback snapshot without making a redundant REST call at the end.
+        best_hold_pair: Optional[str] = None
+        best_hold_snapshot: Optional[Dict[str, Any]] = None
+        best_hold_score = -1.0
         failed_pairs: List[str] = []
         skipped_pairs: List[str] = []
+        insufficient_data_pairs: List[str] = []
 
         feed_seeded = self._multi_feed.is_seeded
 
@@ -723,8 +782,21 @@ class Trader:
                 logger.warning("Failed to analyze %s: %s", pair, exc)
                 failed_pairs.append(pair)
                 continue
+            # Skip pairs where we could not build enough candles for reliable
+            # indicators – treating them as "hold" would produce misleading
+            # default values (RSI=50, MACD=0, BB=[0/0/0]).
+            if snapshot.get("insufficient_data"):
+                insufficient_data_pairs.append(pair)
+                continue
             decision: StrategyDecision = snapshot["decision"]
             if decision.action == "hold":
+                # Keep the best hold so we can return real data in the fallback
+                # instead of triggering another REST round-trip.
+                score = self._score_snapshot(snapshot)
+                if score > best_hold_score:
+                    best_hold_score = score
+                    best_hold_pair = pair
+                    best_hold_snapshot = snapshot
                 continue
             score = self._score_snapshot(snapshot)
             if score > best_score:
@@ -748,6 +820,15 @@ class Trader:
                 )
                 break
 
+        if insufficient_data_pairs:
+            logger.debug(
+                "Skipped %d pairs with insufficient candle data (need ≥%d candles): %s",
+                len(insufficient_data_pairs),
+                self.config.min_candles,
+                ",".join(insufficient_data_pairs[:5])
+                + ("…" if len(insufficient_data_pairs) > 5 else ""),
+            )
+
         if skipped_pairs:
             logger.debug(
                 "Skipped %d pairs not in feed cache: %s",
@@ -766,5 +847,21 @@ class Trader:
             message = f"{message} (failed: {','.join(failed_pairs)})"
             raise RuntimeError(message)
 
-        # fallback to default pair if nothing tradable but no analysis errors
+        # Return the best "hold" result captured during the scan – this avoids
+        # a redundant REST round-trip and shows real indicator values rather
+        # than the default neutrals that a fresh re-analysis of an arbitrary
+        # pair might produce.
+        if best_hold_snapshot is not None and best_hold_pair is not None:
+            return best_hold_pair, best_hold_snapshot
+
+        # Last resort: re-analyse the highest-volume pair.  Log a warning if
+        # every scanned pair lacked sufficient candle data so the operator can
+        # diagnose the root cause (API issues, wrong TRADE_COUNT, etc.).
+        if insufficient_data_pairs and not best_hold_snapshot:
+            logger.warning(
+                "All %d analysed pairs had insufficient candle data. "
+                "Check the Indodax OHLC API or increase TRADE_COUNT (current: %d).",
+                len(insufficient_data_pairs),
+                self.config.trade_count,
+            )
         return best_pair, self.analyze_market(best_pair)

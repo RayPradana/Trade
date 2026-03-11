@@ -80,5 +80,60 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(math.isnan(indicators.macd_hist))
 
 
+class OhlcHelpersTests(unittest.TestCase):
+    """Tests for candles_from_ohlc and interval_to_ohlc_tf."""
+
+    def test_candles_from_ohlc_parses_rows(self) -> None:
+        from bot.analysis import candles_from_ohlc
+        ohlc = [
+            {"Time": 1000, "Open": 100.0, "High": 110.0, "Low": 90.0, "Close": 105.0, "Volume": "50"},
+            {"Time": 2000, "Open": 105.0, "High": 115.0, "Low": 100.0, "Close": 110.0, "Volume": "60.5"},
+        ]
+        candles = candles_from_ohlc(ohlc)
+        self.assertEqual(len(candles), 2)
+        self.assertEqual(candles[0].timestamp, 1000)
+        self.assertAlmostEqual(candles[0].close, 105.0)
+        self.assertAlmostEqual(candles[0].volume, 50.0)
+        self.assertAlmostEqual(candles[1].volume, 60.5)
+
+    def test_candles_from_ohlc_sorted_oldest_first(self) -> None:
+        from bot.analysis import candles_from_ohlc
+        ohlc = [
+            {"Time": 3000, "Open": 1, "High": 2, "Low": 0, "Close": 1, "Volume": "1"},
+            {"Time": 1000, "Open": 1, "High": 2, "Low": 0, "Close": 1, "Volume": "1"},
+            {"Time": 2000, "Open": 1, "High": 2, "Low": 0, "Close": 1, "Volume": "1"},
+        ]
+        candles = candles_from_ohlc(ohlc)
+        timestamps = [c.timestamp for c in candles]
+        self.assertEqual(timestamps, [1000, 2000, 3000])
+
+    def test_candles_from_ohlc_skips_invalid(self) -> None:
+        from bot.analysis import candles_from_ohlc
+        ohlc = [
+            "not_a_dict",
+            {"Time": 1000, "Open": "bad", "High": 2, "Low": 0, "Close": 1, "Volume": "1"},
+            None,
+            {"Time": 2000, "Open": 100.0, "High": 110.0, "Low": 90.0, "Close": 105.0, "Volume": "10"},
+        ]
+        candles = candles_from_ohlc(ohlc)  # type: ignore[arg-type]
+        # Only the last row is valid
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].timestamp, 2000)
+
+    def test_candles_from_ohlc_empty(self) -> None:
+        from bot.analysis import candles_from_ohlc
+        self.assertEqual(candles_from_ohlc([]), [])
+
+    def test_interval_to_ohlc_tf(self) -> None:
+        from bot.analysis import interval_to_ohlc_tf
+        self.assertEqual(interval_to_ohlc_tf(60), "1")
+        self.assertEqual(interval_to_ohlc_tf(300), "15")   # 5-min → 15-min tf
+        self.assertEqual(interval_to_ohlc_tf(900), "15")
+        self.assertEqual(interval_to_ohlc_tf(1800), "30")
+        self.assertEqual(interval_to_ohlc_tf(3600), "60")
+        self.assertEqual(interval_to_ohlc_tf(14400), "240")
+        self.assertEqual(interval_to_ohlc_tf(86400), "1D")
+
+
 if __name__ == "__main__":
     unittest.main()
