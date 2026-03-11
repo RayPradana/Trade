@@ -32,7 +32,7 @@ class StubTrader(Trader):
         super().__init__(config, client=self._Client(list(snapshots.keys())))
         self._snapshots = snapshots
 
-    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
         key = pair or self.config.pair
         return self._snapshots[key]
 
@@ -68,7 +68,7 @@ class AutoPairsTrader(Trader):
         super().__init__(config, client=self._Client(list(snapshots.keys())))
         self._snapshots = snapshots
 
-    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
         key = pair or self.config.pair
         return self._snapshots[key]
 
@@ -86,7 +86,7 @@ class AllFailTrader(Trader):
     def __init__(self, config: BotConfig) -> None:
         super().__init__(config, client=self._Client())
 
-    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def analyze_market(self, pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
         raise requests.RequestException("network unavailable")
 
 
@@ -379,7 +379,7 @@ class TraderSelectionTests(unittest.TestCase):
         }
         calls: list[int] = []
 
-        def fake_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def fake_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             calls.append(1)
             if len(calls) == 1:
                 # Build a minimal HTTPError with status 429
@@ -408,7 +408,7 @@ class TraderSelectionTests(unittest.TestCase):
         trader = GuardedTrader(config)
         sleep_calls: list[float] = []
 
-        def always_429(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def always_429(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             resp = requests.Response()
             resp.status_code = 429
             raise requests.HTTPError(response=resp)
@@ -487,6 +487,7 @@ class TraderSelectionTests(unittest.TestCase):
                 self,
                 pair: str | None = None,
                 prefetched_ticker: Dict[str, Any] | None = None,
+                skip_depth: bool = False,
             ) -> Dict[str, Any]:
                 received_prefetched.append((pair, prefetched_ticker))
                 return {
@@ -531,7 +532,7 @@ class TraderSelectionTests(unittest.TestCase):
             ),
         }
 
-        def fake_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def fake_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             calls.append(1)
             if len(calls) == 1:
                 # This is what IndodaxClient actually raises (RuntimeError wrapping HTTPError)
@@ -599,7 +600,7 @@ class TraderSelectionTests(unittest.TestCase):
         analyzed_on_first: list[str] = []
         original_analyze = trader.analyze_market
 
-        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             if pair:
                 analyzed_on_first.append(pair)
             return original_analyze(pair, prefetched_ticker)
@@ -657,7 +658,7 @@ class TraderSelectionTests(unittest.TestCase):
         analyzed: list[str] = []
         original_analyze = trader.analyze_market
 
-        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             if pair:
                 analyzed.append(pair)
             return original_analyze(pair, prefetched_ticker)
@@ -724,7 +725,7 @@ class TraderSelectionTests(unittest.TestCase):
         analyzed: list[str] = []
         original_analyze = trader.analyze_market
 
-        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             if pair:
                 analyzed.append(pair)
             return original_analyze(pair, prefetched_ticker)
@@ -767,7 +768,7 @@ class TraderSelectionTests(unittest.TestCase):
         analyzed: list[str] = []
         original_analyze = trader.analyze_market
 
-        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             if pair:
                 analyzed.append(pair)
             return original_analyze(pair, prefetched_ticker)
@@ -820,7 +821,7 @@ class TraderSelectionTests(unittest.TestCase):
         analyzed: list[str] = []
         original_analyze = trader.analyze_market
 
-        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             if pair and pair != config.pair:
                 analyzed.append(pair)
             return original_analyze(pair, prefetched_ticker)
@@ -871,7 +872,7 @@ class TraderSelectionTests(unittest.TestCase):
         analysis_order: list[str] = []
         original_analyze = trader.analyze_market
 
-        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None, skip_depth: bool = False) -> Dict[str, Any]:
             if pair and pair in all_pairs:
                 analysis_order.append(pair)
             return original_analyze(pair, prefetched_ticker)
@@ -975,7 +976,7 @@ class InsufficientDataTests(unittest.TestCase):
         analyze_calls: list[str] = []
         orig = trader.analyze_market
 
-        def tracking_analyze(pair=None, prefetched_ticker=None):
+        def tracking_analyze(pair=None, prefetched_ticker=None, skip_depth=False):
             analyze_calls.append(pair or "")
             return orig(pair, prefetched_ticker)
 

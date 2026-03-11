@@ -281,6 +281,45 @@ class Trader:
                     pass
         return 0.0
 
+    def _pair_composite_score(self, pair: str) -> float:
+        """Return a composite ranking score for *pair* used to select the top-N watchlist.
+
+        The score combines 24-h IDR trading volume with 24-h price volatility
+        (high-low range as a fraction of last price).  This surfaces pairs that
+        are both liquid *and* actively moving — the best candidates for
+        short-term trading:
+
+            score = vol_idr × ((high − low) / last)
+
+        A pair with no cached ticker or zero/invalid price data scores 0.0 and
+        is placed at the end (excluded from the top-N watchlist).
+        """
+        if self._multi_feed is None:
+            return 0.0
+        ticker = self._multi_feed.get_ticker(pair)
+        if ticker is None:
+            return 0.0
+        vol_idr = 0.0
+        for key in ("vol_idr", "idr_volume", "volume"):
+            val = ticker.get(key)
+            if val is not None:
+                try:
+                    vol_idr = float(val)
+                    break
+                except (ValueError, TypeError):
+                    pass
+        try:
+            last = float(ticker.get("last") or ticker.get("last_price") or 0)
+            high = float(ticker.get("high") or 0)
+            low = float(ticker.get("low") or 0)
+            if last > 0 and high > low:
+                daily_range_pct = (high - low) / last
+                return vol_idr * daily_range_pct
+        except (ValueError, TypeError):
+            pass
+        # Fall back to volume-only when price data is missing/invalid
+        return vol_idr
+
     def _sort_pairs_by_priority(self, pairs: List[str]) -> List[str]:
         """Return *pairs* sorted by 24-h IDR volume, highest first (stable).
 
@@ -367,13 +406,19 @@ class Trader:
         return self.config.interval_seconds
 
     def _refresh_dynamic_pairs(self) -> None:
-        """Replace the pair watchlist with the top-N most liquid pairs.
+        """Replace the pair watchlist with the top-N pairs by composite score.
 
         Called every ``dynamic_pairs_refresh_cycles`` full-scan cycles when the
         feature is enabled (``dynamic_pairs_refresh_cycles > 0``).  Reads
-        current volume data from the multi-pair feed cache to rank pairs and
+        current data from the multi-pair feed cache to rank pairs by a composite
+        score of 24-h IDR volume × daily price range (volatility proxy) and
         updates ``_all_pairs`` in-place so that the next scan uses the fresh
         watchlist.
+
+        Using volume × volatility (instead of volume alone) ensures the
+        watchlist contains pairs that are both liquid *and* actively moving,
+        which produces more consistent trading opportunities and avoids
+        scanning illiquid or stale coins.
 
         The refresh is best-effort: any exception is logged and the existing
         watchlist is kept unchanged.
@@ -384,13 +429,13 @@ class Trader:
             all_known = list(self._multi_feed._cache.keys())
             if not all_known:
                 return
-            ranked = sorted(all_known, key=self._pair_volume, reverse=True)
+            ranked = sorted(all_known, key=self._pair_composite_score, reverse=True)
             top_n = self.config.dynamic_pairs_top_n
             new_pairs = ranked[:top_n] if top_n > 0 else ranked
             if new_pairs:
                 self._all_pairs = new_pairs
                 logger.info(
-                    "Dynamic pairs: refreshed watchlist → %d pairs (top=%d by volume)",
+                    "Dynamic pairs: refreshed watchlist → %d pairs (top=%d by volume×volatility)",
                     len(new_pairs),
                     top_n,
                 )
@@ -438,19 +483,33 @@ class Trader:
         self,
         pair: Optional[str] = None,
         prefetched_ticker: Optional[Dict[str, Any]] = None,
+        skip_depth: bool = False,
     ) -> Dict[str, Any]:
         pair = pair or self.config.pair
         ticker: Dict[str, Any]
         depth: Dict[str, Any]
         trades: List[Dict[str, Any]]
+        # When ``skip_depth`` is True (used during the multi-pair scan loop
+        # when a WebSocket ticker is already available) we avoid the per-pair
+        # REST /depth call entirely.  Orderbook-based signals (whale/spoofing
+        # detection, imbalance) will return neutral defaults for the scan,
+        # which is acceptable because depth is only needed for the final trade
+        # execution decision, not for pair selection.
+        _empty_depth: Dict[str, Any] = {"buy": [], "sell": []}
         if self.realtime and self.realtime.has_snapshot and pair == self.config.pair:
             snap = self.realtime.snapshot()
             ticker = snap.get("ticker") or prefetched_ticker or self.client.get_ticker(pair)
-            depth = snap.get("depth") or self.client.get_depth(pair, count=200)
+            if skip_depth:
+                depth = _empty_depth
+            else:
+                depth = snap.get("depth") or self.client.get_depth(pair, count=200)
             trades = snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
         else:
             ticker = prefetched_ticker or self.client.get_ticker(pair)
-            depth = self.client.get_depth(pair, count=200)
+            if skip_depth:
+                depth = _empty_depth
+            else:
+                depth = self.client.get_depth(pair, count=200)
             trades = self.client.get_trades(pair, count=self.config.trade_count)
 
         # ── Candle data ──────────────────────────────────────────────────────
@@ -1070,6 +1129,7 @@ class Trader:
         self,
         pair: str,
         prefetched_ticker: Optional[Dict[str, Any]] = None,
+        skip_depth: bool = False,
     ) -> Dict[str, Any]:
         """Analyze a single pair with exponential back-off on HTTP 429 responses.
 
@@ -1081,7 +1141,7 @@ class Trader:
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(self._MAX_SCAN_RETRIES):
             try:
-                return self.analyze_market(pair, prefetched_ticker=prefetched_ticker)
+                return self.analyze_market(pair, prefetched_ticker=prefetched_ticker, skip_depth=skip_depth)
             except (requests.HTTPError, RuntimeError) as exc:
                 # Detect 429 from both the raw requests.HTTPError (test path) and
                 # from the RuntimeError wrapper that IndodaxClient raises (production).
@@ -1150,6 +1210,13 @@ class Trader:
                 len(all_pairs),
                 self.config.websocket_batch_size,
             )
+            # Apply dynamic pair selection immediately after seeding so the
+            # very first scan cycle already uses the top-N watchlist instead
+            # of all 500+ pairs.  This prevents the rate-limit burst that
+            # would otherwise occur on the first cycle.
+            if self.config.dynamic_pairs_refresh_cycles > 0 and self._multi_feed.is_seeded:
+                self._refresh_dynamic_pairs()
+                all_pairs = self._all_pairs or all_pairs
 
         # ── Rotating pair window ─────────────────────────────────────────────
         # When pairs_per_cycle > 0 we analyse a rotating window of that many
@@ -1231,8 +1298,15 @@ class Trader:
             if prefetched_ticker is None and feed_seeded:
                 skipped_pairs.append(pair)
                 continue
+            # When WebSocket ticker data is available, skip the /depth REST
+            # call for this pair during the scan loop.  Orderbook-based signals
+            # (whale/spoofing, imbalance) return neutral defaults without depth,
+            # which is acceptable for pair selection.  The final trade snapshot
+            # (returned by scan_and_choose and used by main.py) already includes
+            # depth via the full analyze_market call at the end of this method.
+            scan_skip_depth = prefetched_ticker is not None
             try:
-                snapshot = self._analyze_with_retry(pair, prefetched_ticker=prefetched_ticker)
+                snapshot = self._analyze_with_retry(pair, prefetched_ticker=prefetched_ticker, skip_depth=scan_skip_depth)
             # pragma: no cover - guard for per-pair API/parse failures
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 logger.warning("Failed to analyze %s: %s", pair, exc)

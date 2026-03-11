@@ -177,8 +177,8 @@ class AdditionalFeaturesConfigTest(TestCase):
         from unittest.mock import patch
         with patch.dict(__import__("os").environ, {}, clear=True):
             cfg = BotConfig.from_env()
-            self.assertEqual(cfg.dynamic_pairs_refresh_cycles, 0)
-            self.assertEqual(cfg.dynamic_pairs_top_n, 50)
+            self.assertEqual(cfg.dynamic_pairs_refresh_cycles, 5)
+            self.assertEqual(cfg.dynamic_pairs_top_n, 20)
 
     def test_dynamic_pairs_from_env(self):
         from unittest.mock import patch

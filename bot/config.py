@@ -52,7 +52,7 @@ class BotConfig:
     websocket_url: Optional[str] = "wss://ws3.indodax.com/ws/"  # Indodax market-data WebSocket
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
     websocket_batch_size: int = 100  # max pairs per WebSocket connection for multi-pair feed
-    pairs_per_cycle: int = 50  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
+    pairs_per_cycle: int = 20  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
     min_confidence: float = 0.52
     interval_seconds: int = 300
     fast_window: int = 12
@@ -104,10 +104,14 @@ class BotConfig:
     discord_webhook_url: Optional[str] = None
     # Number of scan cycles between dynamic-pair-list refreshes.
     # 0 = disabled (use the static pair list from get_pairs() forever).
-    dynamic_pairs_refresh_cycles: int = 0
-    # Minimum 24-h volume rank a pair must occupy (1 = highest-volume)
-    # to be added to the dynamic watchlist.  0 = no rank filter.
-    dynamic_pairs_top_n: int = 50
+    # Default 5: refresh the watchlist every 5 cycles to keep the top-N
+    # by volume+volatility without hammering the API.
+    dynamic_pairs_refresh_cycles: int = 5
+    # Number of top pairs (by composite volume×volatility score) kept in the
+    # dynamic watchlist.  Scanning fewer pairs avoids rate limits and focuses
+    # the bot on the most active instruments.  Default 20 follows the
+    # professional practice of trading only the best 20–30 pairs at a time.
+    dynamic_pairs_top_n: int = 20
     # Partial take-profit: when > 0, sell this fraction of the position when
     # price first reaches the TP level, and let the remainder run.
     # E.g. 0.5 = sell half at TP, keep the rest.  0 = sell all (default).
@@ -193,7 +197,7 @@ class BotConfig:
             websocket_url=os.getenv("WEBSOCKET_URL", "wss://ws3.indodax.com/ws/") or None,
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
             websocket_batch_size=int(os.getenv("WEBSOCKET_BATCH_SIZE", "100")),
-            pairs_per_cycle=int(os.getenv("PAIRS_PER_CYCLE", "50")),
+            pairs_per_cycle=int(os.getenv("PAIRS_PER_CYCLE", "20")),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
             interval_seconds=interval_seconds,
             fast_window=int(os.getenv("FAST_WINDOW", "12")),
@@ -222,8 +226,8 @@ class BotConfig:
             max_exposure_per_coin_pct=float(os.getenv("MAX_EXPOSURE_PER_COIN_PCT", "0")),
             max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "0")),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL") or None,
-            dynamic_pairs_refresh_cycles=int(os.getenv("DYNAMIC_PAIRS_REFRESH_CYCLES", "0")),
-            dynamic_pairs_top_n=int(os.getenv("DYNAMIC_PAIRS_TOP_N", "50")),
+            dynamic_pairs_refresh_cycles=int(os.getenv("DYNAMIC_PAIRS_REFRESH_CYCLES", "5")),
+            dynamic_pairs_top_n=int(os.getenv("DYNAMIC_PAIRS_TOP_N", "20")),
             partial_tp_fraction=float(os.getenv("PARTIAL_TP_FRACTION", "0")),
             re_entry_cooldown_seconds=float(os.getenv("RE_ENTRY_COOLDOWN_SECONDS", "0")),
             re_entry_dip_pct=float(os.getenv("RE_ENTRY_DIP_PCT", "0")),
