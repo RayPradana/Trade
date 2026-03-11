@@ -164,7 +164,13 @@ class Trader:
             self.config.pair, decision.action, reference_price, effective_amount
         )
         self.tracker.record_trade(decision.action, reference_price, effective_amount)
-        logger.info("Placed order action=%s amount=%s price=%s response=%s", decision.action, effective_amount, reference_price, order_resp)
+        logger.info(
+            "Placed order action=%s amount=%s price=%s response=%s",
+            decision.action,
+            effective_amount,
+            reference_price,
+            order_resp,
+        )
         return {
             "status": "placed",
             "order": order_resp,
