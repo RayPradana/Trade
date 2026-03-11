@@ -690,10 +690,10 @@ def main() -> None:
                         ptp_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp_fraction)
                         portfolio = trader.tracker.as_dict(held_price)
                         logging.info(
-                            "🎯 PARTIAL-TP  %s%s%s  %.0f%% @ Rp %15,.2f",
+                            "🎯 PARTIAL-TP  %s%s%s  %.0f%% @ Rp %s",
                             _BOLD, pair, _RESET,
                             config.partial_tp_fraction * 100,
-                            held_price,
+                            f"{held_price:15,.2f}",
                         )
                         _log_portfolio(portfolio, config.initial_capital)
                         _notify(
@@ -739,10 +739,10 @@ def main() -> None:
                     force_outcome = trader.force_sell(held_snapshot)
                     portfolio = trader.tracker.as_dict(held_price)
                     logging.info(
-                        "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %15,.2f",
+                        "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s",
                         _DIM, _RESET,
                         _BOLD, force_outcome.get("amount", 0), _RESET,
-                        held_price,
+                        f"{held_price:15,.2f}",
                     )
                     _log_portfolio(portfolio, config.initial_capital)
                     _notify(
@@ -809,18 +809,18 @@ def main() -> None:
                 if trader.tracker.base_position > 0:
                     force_outcome = trader.force_sell(snapshot)
                     logging.info(
-                        "   📤 Force-sold : %s%.8f%s coin  ·  Rp %15,.2f",
+                        "   📤 Force-sold : %s%.8f%s coin  ·  Rp %s",
                         _BOLD, force_outcome.get("amount", 0), _RESET,
-                        force_outcome.get("price", 0),
+                        f"{force_outcome.get('price', 0):15,.2f}",
                     )
                 # Re-compute portfolio after any liquidation
                 portfolio = trader.tracker.as_dict(snapshot["price"])
                 logging.info(
-                    "   📊 %sRotation%s : pnl=%s  equity=Rp %15,.2f  "
+                    "   📊 %sRotation%s : pnl=%s  equity=Rp %s  "
                     "trades=%d  win=%.0f%%",
                     _BOLD, _RESET,
                     _pnl_str(portfolio["realized_pnl"]),
-                    portfolio["equity"],
+                    f"{portfolio['equity']:15,.2f}",
                     portfolio["trade_count"],
                     portfolio["win_rate"] * 100,
                 )
@@ -877,11 +877,11 @@ def main() -> None:
         # Periodic performance summary every N full-scan cycles
         if scan_cycles > 0 and scan_cycles % config.cycle_summary_interval == 0:
             logging.info(
-                "📊 %sPeriodic summary%s  scan #%d : pnl=%s  equity=Rp %15,.2f  "
+                "📊 %sPeriodic summary%s  scan #%d : pnl=%s  equity=Rp %s  "
                 "trades=%d  win=%.0f%%",
                 _BOLD, _RESET, scan_cycles,
                 _pnl_str(portfolio["realized_pnl"]),
-                portfolio["equity"],
+                f"{portfolio['equity']:15,.2f}",
                 portfolio["trade_count"],
                 portfolio["win_rate"] * 100,
             )

@@ -435,3 +435,56 @@ class DiscordNotificationTest(unittest.TestCase):
             main._notify(config, "ignored")
             mt.assert_not_called()
             md.assert_not_called()
+
+
+class LoggingFormatSpecifierTest(unittest.TestCase):
+    """Regression tests: logging calls must not use invalid %-style format specifiers.
+
+    Python's logging module formats messages via ``msg % args``.  Using ``,``
+    inside a ``%``-style conversion (e.g. ``%15,.2f``) triggers
+    ``ValueError: unsupported format character ','``.  All numeric prices /
+    equity values must be pre-formatted as strings before being passed to
+    logging calls.
+    """
+
+    def setUp(self):
+        logging.disable(logging.NOTSET)
+
+    def tearDown(self):
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            h.close()
+
+    def _collect_logging_format_strings(self):
+        """Return all format strings passed to logging.* calls in main.py."""
+        import ast
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "main.py"
+        tree = ast.parse(src.read_text())
+        fmt_strings = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # Match logging.info/warning/error/exception/debug(fmt, ...)
+            if not (isinstance(func, ast.Attribute) and func.attr in
+                    {"info", "warning", "error", "exception", "debug"}):
+                continue
+            if node.args and isinstance(node.args[0], ast.Constant):
+                fmt_strings.append(node.args[0].value)
+        return fmt_strings
+
+    def test_no_comma_in_percent_format_specifiers(self):
+        """No logging format string may contain the invalid '%,' sequence."""
+        import re
+        bad_pattern = re.compile(r'%[0-9]*,')
+        violations = []
+        for fmt in self._collect_logging_format_strings():
+            if bad_pattern.search(fmt):
+                violations.append(fmt)
+        self.assertEqual(
+            violations, [],
+            "Invalid '%-style with comma' format specifiers found in logging calls:\n"
+            + "\n".join(f"  {v!r}" for v in violations),
+        )
