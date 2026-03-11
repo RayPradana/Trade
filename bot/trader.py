@@ -26,11 +26,15 @@ class Trader:
         if "ticker" in ticker:
             last = ticker["ticker"].get("last")
             if last is None:
-                last = ticker["ticker"].get("last_price", 0)
+                last = ticker["ticker"].get("last_price")
+            if last is None:
+                raise ValueError("Ticker missing price fields")
             return float(last)
         last_value = ticker.get("last")
         if last_value is None:
-            last_value = ticker.get("last_price", 0)
+            last_value = ticker.get("last_price")
+        if last_value is None:
+            raise ValueError("Ticker missing price fields")
         return float(last_value)
 
     def analyze_market(self) -> Dict[str, Any]:

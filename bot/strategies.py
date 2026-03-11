@@ -13,6 +13,7 @@ ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
 MIN_RISK_DIVISOR = 1e-8  # prevents division by zero when stop distance is extremely small
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
+RISK_EPS = 1e-10
 
 
 @dataclass
@@ -98,7 +99,7 @@ def make_trade_decision(
         amount = 0.0
     else:
         risk_per_unit = abs(current_price - stop_loss)
-        if risk_per_unit == 0:
+        if risk_per_unit < RISK_EPS:
             amount = 0.0
         else:
             desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
