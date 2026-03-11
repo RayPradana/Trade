@@ -17,7 +17,7 @@ from .analysis import (
 )
 from .config import BotConfig
 from .rate_limit import RateLimitedOrderQueue
-from .realtime import RealtimeFeed
+from .realtime import MultiPairFeed, RealtimeFeed
 from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, make_trade_decision
@@ -40,6 +40,8 @@ class Trader:
             enable_queue=config.order_queue_enabled,
         )
         self._all_pairs: Optional[List[str]] = None
+        self._scan_offset: int = 0  # rotating window index for pairs_per_cycle
+        self._multi_feed: Optional[MultiPairFeed] = None
         self.tracker = PortfolioTracker(
             initial_capital=config.initial_capital,
             target_profit_pct=config.target_profit_pct,
@@ -416,7 +418,7 @@ class Trader:
         return outcome
 
     _MAX_SCAN_RETRIES = 3
-    _SCAN_BACKOFF_BASE = 2.0  # seconds; doubled on each retry (2, 4, 8 …)
+    _SCAN_BACKOFF_BASE = 2.0  # seconds for the first retry; doubles each attempt (2 → 4 → 8 …)
     _SCAN_BACKOFF_MAX = 30.0  # hard cap so a long run of 429s never blocks indefinitely
 
     def _analyze_with_retry(
@@ -478,30 +480,62 @@ class Trader:
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 logger.warning("Failed to load pairs; fallback to default %s", exc)
                 self._all_pairs = [self.config.pair]
-        pairs = self._all_pairs or [self.config.pair]
 
-        best_pair = self.config.pair
+        all_pairs = self._all_pairs or [self.config.pair]
+
+        # ── Multi-pair feed (persistent ticker cache) ────────────────────────
+        # Start the feed once after the full pair list is known.  It seeds the
+        # cache synchronously on first start via /api/summaries and then keeps
+        # it fresh in a background thread (WebSocket or periodic summaries poll).
+        if self._multi_feed is None:
+            self._multi_feed = MultiPairFeed(
+                pairs=all_pairs,
+                client=self.client,
+                websocket_url=self.config.websocket_url,
+                websocket_enabled=self.config.websocket_enabled,
+                batch_size=self.config.websocket_batch_size,
+            )
+            self._multi_feed.start()
+            logger.info(
+                "MultiPairFeed started for %d pairs (batch_size=%d)",
+                len(all_pairs),
+                self.config.websocket_batch_size,
+            )
+
+        # ── Rotating pair window ─────────────────────────────────────────────
+        # When pairs_per_cycle > 0 we analyse a rotating window of that many
+        # pairs per call instead of the full list.  This spreads REST calls
+        # across cycles and reduces peak request rate.
+        n = len(all_pairs)
+        ppc = self.config.pairs_per_cycle
+        if ppc > 0 and n > ppc:
+            start = self._scan_offset % n
+            # Slice wrapping around the end of the list
+            if start + ppc <= n:
+                pairs = all_pairs[start : start + ppc]
+            else:
+                pairs = all_pairs[start:] + all_pairs[: (start + ppc) - n]
+            self._scan_offset = (start + ppc) % n
+            logger.debug(
+                "Rotating scan: window=[%d, %d) of %d total pairs",
+                start,
+                (start + ppc) % n,
+                n,
+            )
+        else:
+            pairs = all_pairs
+
+        best_pair = pairs[0] if pairs else self.config.pair
         best_snapshot: Optional[Dict[str, Any]] = None
         best_score = -1.0
         failed_pairs: List[str] = []
 
-        # Pre-fetch all tickers in one call to avoid per-pair REST ticker requests.
-        # Indodax summaries keys omit underscores ("btcidr") while pair names use
-        # them ("btc_idr"), so we normalise via pair.replace("_", "").
-        ticker_cache: Dict[str, Any] = {}
-        try:
-            summaries = self.client.get_summaries()
-            raw_tickers = summaries.get("tickers", {}) if isinstance(summaries, dict) else {}
-            ticker_cache = dict(raw_tickers)
-            logger.debug("Fetched summaries for %d pairs", len(ticker_cache))
-        except (requests.RequestException, RuntimeError, ValueError) as exc:
-            logger.warning("Failed to fetch summaries; will use per-pair ticker requests: %s", exc)
-
         for pair in pairs:
             if self.config.scan_request_delay > 0:
                 time.sleep(self.config.scan_request_delay)
-            # Summaries keys have no underscore; convert "btc_idr" → "btcidr"
-            prefetched_ticker = ticker_cache.get(pair.replace("_", "")) if ticker_cache else None
+            # Use the multi-pair feed's cached ticker to skip the per-pair
+            # REST ticker call entirely.
+            prefetched_ticker = self._multi_feed.get_ticker(pair)
             try:
                 snapshot = self._analyze_with_retry(pair, prefetched_ticker=prefetched_ticker)
             # pragma: no cover - guard for per-pair API/parse failures

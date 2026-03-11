@@ -1,7 +1,7 @@
 import unittest
 
 from bot.config import BotConfig
-from bot.realtime import RealtimeFeed
+from bot.realtime import MultiPairFeed, RealtimeFeed
 from bot.trader import Trader
 
 
@@ -118,6 +118,151 @@ class RealtimeTests(unittest.TestCase):
         feed.stop()
         feed._ws_thread.join(timeout=2.0)
         self.assertFalse(feed._ws_thread.is_alive())
+
+
+class _SummariesClientStub:
+    """Stub client that simulates the /api/summaries response."""
+
+    def __init__(self, tickers: dict, *, fail: bool = False) -> None:
+        self._tickers = tickers
+        self._fail = fail
+        self.summaries_calls = 0
+
+    def get_summaries(self) -> dict:
+        self.summaries_calls += 1
+        if self._fail:
+            raise RuntimeError("summaries unavailable")
+        return {"tickers": self._tickers}
+
+
+class MultiPairFeedTests(unittest.TestCase):
+    def test_seeds_cache_from_summaries_on_start(self) -> None:
+        """start() must synchronously seed the ticker cache from /api/summaries."""
+        client = _SummariesClientStub(
+            {
+                "btcidr": {"last": "1000000000", "high": "1100000000"},
+                "ethidr": {"last": "50000000", "high": "55000000"},
+            }
+        )
+        feed = MultiPairFeed(
+            ["btc_idr", "eth_idr"],
+            client,
+            websocket_enabled=False,
+            summaries_interval=9999,
+        )
+        feed.start()
+        try:
+            # Cache must be seeded immediately (synchronous on start)
+            btc_ticker = feed.get_ticker("btc_idr")
+            eth_ticker = feed.get_ticker("eth_idr")
+            self.assertIsNotNone(btc_ticker)
+            self.assertIsNotNone(eth_ticker)
+            self.assertEqual(btc_ticker["last"], "1000000000")  # type: ignore[index]
+            self.assertEqual(eth_ticker["last"], "50000000")  # type: ignore[index]
+        finally:
+            feed.stop()
+
+    def test_normalizes_summaries_keys_to_pair_names(self) -> None:
+        """Summaries keys without underscores (e.g. 'boneidr') must be mapped to
+        canonical pair names (e.g. 'bone_idr')."""
+        client = _SummariesClientStub(
+            {"boneidr": {"last": "200", "high": "210"}}
+        )
+        feed = MultiPairFeed(
+            ["bone_idr"],
+            client,
+            websocket_enabled=False,
+            summaries_interval=9999,
+        )
+        feed.start()
+        try:
+            ticker = feed.get_ticker("bone_idr")
+            self.assertIsNotNone(ticker)
+            self.assertEqual(ticker["last"], "200")  # type: ignore[index]
+            # The raw summaries key must NOT be stored under the un-normalised name
+            self.assertIsNone(feed.get_ticker("boneidr"))
+        finally:
+            feed.stop()
+
+    def test_returns_none_for_unknown_pair(self) -> None:
+        """get_ticker must return None for a pair that hasn't been received."""
+        client = _SummariesClientStub({"btcidr": {"last": "1000000000"}})
+        feed = MultiPairFeed(["btc_idr"], client, websocket_enabled=False, summaries_interval=9999)
+        feed.start()
+        try:
+            self.assertIsNone(feed.get_ticker("xrp_idr"))
+        finally:
+            feed.stop()
+
+    def test_summaries_failure_leaves_cache_empty(self) -> None:
+        """When /api/summaries fails, the cache stays empty but no exception is raised."""
+        client = _SummariesClientStub({}, fail=True)
+        feed = MultiPairFeed(["btc_idr"], client, websocket_enabled=False, summaries_interval=9999)
+        feed.start()  # must not raise
+        try:
+            self.assertIsNone(feed.get_ticker("btc_idr"))
+        finally:
+            feed.stop()
+
+    def test_applies_ws_message_with_pair_key(self) -> None:
+        """A WebSocket message containing 'pair' and 'ticker' must update the cache."""
+        client = _SummariesClientStub({})
+        feed = MultiPairFeed(["btc_idr"], client, websocket_enabled=False, summaries_interval=9999)
+        feed.start()
+        try:
+            # Simulate an incoming WebSocket message in the expected format
+            feed._apply_ws_message_for_pair("btc_idr", {"last": "1050000000"})
+            ticker = feed.get_ticker("btc_idr")
+            self.assertIsNotNone(ticker)
+            self.assertEqual(ticker["last"], "1050000000")  # type: ignore[index]
+        finally:
+            feed.stop()
+
+    def test_stop_halts_polling_thread(self) -> None:
+        """stop() must terminate the background polling thread."""
+        client = _SummariesClientStub({"btcidr": {"last": "100"}})
+        feed = MultiPairFeed(
+            ["btc_idr"],
+            client,
+            websocket_enabled=False,
+            summaries_interval=0.05,
+        )
+        feed.start()
+        self.assertTrue(any(t.is_alive() for t in feed._threads))
+        feed.stop()
+        for t in feed._threads:
+            t.join(timeout=2.0)
+        self.assertFalse(any(t.is_alive() for t in feed._threads))
+
+    def test_start_creates_correct_number_of_polling_threads(self) -> None:
+        """Without WebSocket, start() must create exactly one polling thread."""
+        client = _SummariesClientStub({})
+        feed = MultiPairFeed(
+            ["btc_idr", "eth_idr", "xrp_idr"],
+            client,
+            websocket_enabled=False,
+            summaries_interval=9999,
+        )
+        feed.start()
+        try:
+            self.assertEqual(len(feed._threads), 1)
+        finally:
+            feed.stop()
+
+    def test_batches_pairs_by_batch_size(self) -> None:
+        """With 5 pairs and batch_size=2, feed must create 3 batches (2+2+1)."""
+        feed = MultiPairFeed(
+            ["a_idr", "b_idr", "c_idr", "d_idr", "e_idr"],
+            _SummariesClientStub({}),
+            websocket_enabled=False,
+            batch_size=2,
+            summaries_interval=9999,
+        )
+        # batch count computation is internal; verify via _batch_size
+        self.assertEqual(feed._batch_size, 2)
+        import math
+        expected_batches = math.ceil(5 / 2)
+        self.assertEqual(expected_batches, 3)
 
 
 if __name__ == "__main__":

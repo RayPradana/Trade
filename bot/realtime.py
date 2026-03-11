@@ -265,6 +265,16 @@ class MultiPairFeed:
         with self._lock:
             return self._cache.get(pair)
 
+    def _apply_ws_message_for_pair(self, pair: str, ticker: Dict[str, Any]) -> None:
+        """Update the cache for *pair* with *ticker* data.
+
+        This is used internally by the WebSocket message handler and exposed
+        as a test helper so unit tests can inject ticker data without needing
+        a live WebSocket connection.
+        """
+        with self._lock:
+            self._cache[pair] = ticker
+
     def start(self) -> None:
         """Seed the cache and start background refresh threads."""
         self._stop.clear()
@@ -304,7 +314,13 @@ class MultiPairFeed:
     # ------------------------------------------------------------------
 
     def _update_from_summaries(self) -> None:
-        """Fetch /api/summaries and merge tickers into the cache."""
+        """Fetch /api/summaries and merge tickers into the cache.
+
+        Indodax returns ticker keys *without* underscores (e.g. ``btcidr``).
+        The ``_key_to_pair`` lookup maps each such key back to the canonical
+        pair name with an underscore (e.g. ``btc_idr``), so every pair present
+        in the known-pairs list is stored under its canonical name.
+        """
         try:
             summaries = self._client.get_summaries()
             raw = summaries.get("tickers", {}) if isinstance(summaries, dict) else {}
@@ -382,8 +398,7 @@ class MultiPairFeed:
                         or parsed.get("data")
                     )
                     if ticker_data and isinstance(ticker_data, dict):
-                        with self._lock:
-                            self._cache[pair_name] = ticker_data
+                        self._apply_ws_message_for_pair(pair_name, ticker_data)
                 except Exception:
                     logger.debug("MultiPairFeed WS message parse error", exc_info=True)
 

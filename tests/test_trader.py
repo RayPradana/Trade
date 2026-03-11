@@ -562,6 +562,120 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(pair, "btc_idr")
         self.assertIsNotNone(snapshot)
 
+    def test_pairs_per_cycle_scans_only_window(self) -> None:
+        """When pairs_per_cycle > 0 only that many pairs must be analyzed per call."""
+        import unittest.mock as mock
+
+        all_pairs = ["a_idr", "b_idr", "c_idr", "d_idr", "e_idr"]
+        snapshots = {
+            p: {
+                "pair": p, "price": 100.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.5, reason="ok",
+                    target_price=100, amount=1, stop_loss=99, take_profit=101,
+                ),
+            }
+            for p in all_pairs
+        }
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=2)
+        trader = StubTrader(config, snapshots)
+
+        analyzed_on_first: list[str] = []
+        original_analyze = trader.analyze_market
+
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if pair:
+                analyzed_on_first.append(pair)
+            return original_analyze(pair, prefetched_ticker)
+
+        trader.analyze_market = recording_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()
+
+        # Must have analyzed exactly pairs_per_cycle=2 pairs (not all 5)
+        self.assertEqual(len(analyzed_on_first), 2)
+
+    def test_pairs_per_cycle_offset_advances_each_call(self) -> None:
+        """_scan_offset must advance by pairs_per_cycle on each scan_and_choose() call."""
+        all_pairs = ["a_idr", "b_idr", "c_idr", "d_idr"]
+        snapshots = {
+            p: {
+                "pair": p, "price": 100.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="hold", confidence=0.2, reason="quiet",
+                    target_price=100, amount=0, stop_loss=None, take_profit=None,
+                ),
+            }
+            for p in all_pairs
+        }
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=2)
+        trader = StubTrader(config, snapshots)
+
+        import unittest.mock as mock
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()  # first call: analyzes [0,1], offset → 2
+            self.assertEqual(trader._scan_offset, 2)
+            trader.scan_and_choose()  # second call: analyzes [2,3], offset → 0 (wraps)
+            self.assertEqual(trader._scan_offset, 0)
+
+    def test_pairs_per_cycle_zero_scans_all_pairs(self) -> None:
+        """When pairs_per_cycle=0 all pairs must be scanned each cycle."""
+        import unittest.mock as mock
+
+        all_pairs = ["a_idr", "b_idr", "c_idr"]
+        snapshots = {
+            p: {
+                "pair": p, "price": 100.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.5, reason="ok",
+                    target_price=100, amount=1, stop_loss=99, take_profit=101,
+                ),
+            }
+            for p in all_pairs
+        }
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+        trader = StubTrader(config, snapshots)
+
+        analyzed: list[str] = []
+        original_analyze = trader.analyze_market
+
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if pair:
+                analyzed.append(pair)
+            return original_analyze(pair, prefetched_ticker)
+
+        trader.analyze_market = recording_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()
+
+        # All 3 pairs must have been analyzed
+        self.assertEqual(len(analyzed), 3)
+        self.assertEqual(set(analyzed), set(all_pairs))
+
+    def test_multi_feed_started_on_first_scan(self) -> None:
+        """_multi_feed must be initialized after the first scan_and_choose() call."""
+        import unittest.mock as mock
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0)
+        snapshots = {
+            "btc_idr": {
+                "pair": "btc_idr", "price": 1.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.7, reason="ok",
+                    target_price=1, amount=1, stop_loss=0.99, take_profit=1.01,
+                ),
+            }
+        }
+        trader = StubTrader(config, snapshots)
+        self.assertIsNone(trader._multi_feed)
+        with mock.patch("bot.trader.time.sleep"):
+            trader.scan_and_choose()
+        self.assertIsNotNone(trader._multi_feed)
+
 
 if __name__ == "__main__":
     unittest.main()
