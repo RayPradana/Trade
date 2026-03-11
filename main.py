@@ -850,6 +850,23 @@ def main() -> None:
                 break
             time.sleep(backoff)
             continue
+        except Exception:  # noqa: BLE001 — broad catch prevents unexpected crash
+            # Catch any unexpected exception type (KeyError, AttributeError, TypeError,
+            # IndexError, etc.) that is not explicitly in the tuple above.  Without this
+            # handler such errors would propagate all the way out of main() and crash the
+            # bot process entirely instead of retrying with back-off.
+            consecutive_errors += 1
+            exponent = min(consecutive_errors - 1, 10)
+            backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
+            logging.exception(
+                "⚠️  Unexpected error #%d  pair=%s  backing off %.0fs …",
+                consecutive_errors, pair, backoff,
+            )
+            if config.run_once:
+                logging.info("run_once enabled; exiting after unexpected error")
+                break
+            time.sleep(backoff)
+            continue
         except KeyboardInterrupt:
             logging.info("⏹️  %sBOT STOPPED%s by user", _BOLD, _RESET)
             break

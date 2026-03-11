@@ -1234,6 +1234,12 @@ class Trader:
                 logger.warning("Failed to analyze %s: %s", pair, exc)
                 failed_pairs.append(pair)
                 continue
+            except Exception as exc:  # noqa: BLE001 — isolate unexpected per-pair failures
+                # Catch KeyError, AttributeError, TypeError, etc. so one bad pair
+                # doesn't abort the entire scan cycle.
+                logger.warning("Unexpected error analyzing %s: %s", pair, exc, exc_info=True)
+                failed_pairs.append(pair)
+                continue
             # Skip pairs where we could not build enough candles for reliable
             # indicators – treating them as "hold" would produce misleading
             # default values (RSI=50, MACD=0, BB=[0/0/0]).

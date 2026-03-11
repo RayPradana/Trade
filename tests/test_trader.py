@@ -1508,3 +1508,53 @@ class TrailingTpFloorAdvancementTest(unittest.TestCase):
         # At 129 (above floor 128.7), equity > target → None (hold)
         reason = tracker.stop_reason(129.0)
         self.assertIsNone(reason)
+
+
+class ScanAndChooseUnexpectedExceptionTest(unittest.TestCase):
+    """Regression test: unexpected exception types must not escape scan_and_choose().
+
+    Before the fix, a KeyError/AttributeError/TypeError raised inside
+    _analyze_with_retry() would propagate through scan_and_choose() and all the
+    way out of main(), crashing the process at line 892.  After the fix, such
+    exceptions are caught per-pair (added to failed_pairs) and the scan cycle
+    raises the standard RuntimeError("No pairs could be analyzed") instead.
+    """
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader(self):
+        from bot.config import BotConfig
+        return Trader(BotConfig(api_key=None, dry_run=True))
+
+    def test_keyerror_caught_per_pair(self):
+        import unittest.mock as mock
+        trader = self._trader()
+        with mock.patch.object(trader, "_analyze_with_retry", side_effect=KeyError("missing_key")):
+            with self.assertRaises(RuntimeError) as ctx:
+                trader.scan_and_choose()
+        self.assertIn("No pairs could be analyzed", str(ctx.exception))
+
+    def test_attribute_error_caught_per_pair(self):
+        import unittest.mock as mock
+        trader = self._trader()
+        with mock.patch.object(trader, "_analyze_with_retry", side_effect=AttributeError("attr")):
+            with self.assertRaises(RuntimeError):
+                trader.scan_and_choose()
+
+    def test_type_error_caught_per_pair(self):
+        import unittest.mock as mock
+        trader = self._trader()
+        with mock.patch.object(trader, "_analyze_with_retry", side_effect=TypeError("type")):
+            with self.assertRaises(RuntimeError):
+                trader.scan_and_choose()
+
+    def test_index_error_caught_per_pair(self):
+        import unittest.mock as mock
+        trader = self._trader()
+        with mock.patch.object(trader, "_analyze_with_retry", side_effect=IndexError("index")):
+            with self.assertRaises(RuntimeError):
+                trader.scan_and_choose()
