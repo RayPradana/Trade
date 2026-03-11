@@ -297,6 +297,53 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertGreater(len(outcome["executed_steps"]), 1)
         self.assertLessEqual(outcome["amount"], decision.amount)
 
+    def test_force_sell_liquidates_entire_position(self) -> None:
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1000.0,
+            max_loss_pct=0.9,
+            target_profit_pct=2.0,
+            auto_resume=False,
+        )
+        trader = GuardedTrader(config)
+        # Simulate an open position: bought 5 units at 90
+        trader.tracker.record_trade("buy", 90.0, 5.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 5.0)
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=100,
+            amount=5.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 100.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertEqual(outcome["action"], "sell")
+        self.assertAlmostEqual(outcome["amount"], 5.0, places=5)
+        self.assertEqual(trader.tracker.base_position, 0.0)
+
+    def test_force_sell_returns_no_position_when_not_holding(self) -> None:
+        config = BotConfig(api_key=None, dry_run=True, auto_resume=False)
+        trader = GuardedTrader(config)
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="hold",
+            confidence=0.5,
+            reason="test",
+            target_price=100,
+            amount=0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 100.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "no_position")
+
 
 if __name__ == "__main__":
     unittest.main()

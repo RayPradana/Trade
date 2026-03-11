@@ -52,6 +52,8 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `AUTO_RESUME` | `true/false` untuk mengaktifkan pemulihan state otomatis | `true` |
 | `STATE_FILE` | Lokasi file state JSON untuk auto-resume | `bot_state.json` |
 | `STAGED_ENTRY_STEPS` | Jumlah maksimum langkah entry bertahap (mis. 3 langkah 50/30/20%) | `3` |
+| `POSITION_CHECK_INTERVAL` | Interval (detik) polling saat sedang memegang posisi | `60` |
+| `CYCLE_SUMMARY_INTERVAL` | Cetak ringkasan performa setiap N siklus scan penuh | `10` |
 
 ## Menjalankan
 
@@ -133,6 +135,16 @@ Opsi penting:
    - **Live**: mengirim **limit order** `trade` ke `tapi` Indodax (butuh API key/secret). Stop-limit dijaga secara logis lewat stop-loss/take-profit dan pengecekan slippage.
    - Risk guard: ukuran order dibatasi modal/posisi yang tersedia, tidak akan oversell; portfolio guard berhenti otomatis bila target profit tercapai atau batas rugi terlampaui.
    - **Auto-resume**: state portofolio dan keputusan terakhir disimpan di `STATE_FILE` agar bot melanjutkan sesi jika terhenti mendadak.
+
+## Operasi Mandiri 24/7
+
+Bot dirancang untuk berjalan tanpa campur tangan:
+
+- **Monitoring posisi**: Setiap siklus, jika bot sedang memegang posisi (hasil sesi sebelumnya maupun sesi saat ini), bot langsung menganalisa pair tersebut terlebih dahulu. Jika sinyal berubah ke *sell* atau kondisi stop terpenuhi, posisi ditutup otomatis sebelum mencari peluang baru.
+- **Rotasi pair**: Saat kondisi stop (target profit / batas rugi / trailing stop) tercapai, bot **tidak berhenti** — ia melikuidasi sisa posisi lalu langsung memindai pair berikutnya.
+- **Interval adaptif**: Saat memegang posisi, bot menggunakan `POSITION_CHECK_INTERVAL` (default 60 detik) yang lebih cepat daripada `INTERVAL_SECONDS` standar agar exit tidak terlambat.
+- **Ringkasan berkala**: Setiap `CYCLE_SUMMARY_INTERVAL` siklus scan penuh, log ringkasan performa (PnL, ekuitas, jumlah trade, win-rate) dicetak.
+- **Graceful shutdown**: Sinyal `SIGTERM` (mis. `docker stop`) diserap dengan aman — bot menyelesaikan siklus yang sedang berjalan baru berhenti.
 
 ## Keamanan & Catatan
 

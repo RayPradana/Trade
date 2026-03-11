@@ -61,6 +61,8 @@ class BotConfig:
     auto_resume: bool = True
     state_file: str = "bot_state.json"
     staged_entry_steps: int = 3
+    position_check_interval_seconds: int = 60  # faster poll when monitoring an open position
+    cycle_summary_interval: int = 10  # print a performance summary every N full scan cycles
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -108,6 +110,8 @@ class BotConfig:
             auto_resume=os.getenv("AUTO_RESUME", "true").lower() in {"1", "true", "yes"},
             state_file=os.getenv("STATE_FILE", "bot_state.json"),
             staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
+            position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
+            cycle_summary_interval=int(os.getenv("CYCLE_SUMMARY_INTERVAL", "10")),
         )
         cfg._validate()
         return cfg
@@ -137,6 +141,10 @@ class BotConfig:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
         if self.staged_entry_steps <= 0:
             raise ValueError("STAGED_ENTRY_STEPS must be positive")
+        if self.position_check_interval_seconds <= 0:
+            raise ValueError("POSITION_CHECK_INTERVAL must be positive")
+        if self.cycle_summary_interval <= 0:
+            raise ValueError("CYCLE_SUMMARY_INTERVAL must be positive")
         if self.trailing_stop_pct < 0:
             raise ValueError("TRAILING_STOP_PCT must be non-negative")
         if not self.dry_run and not self.api_key:

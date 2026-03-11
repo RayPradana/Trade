@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import signal
 import sys
+import threading
 import time
 
 import requests
@@ -43,6 +45,7 @@ _STATUS_ICONS = {
     "skipped": "⏭️",
     "hold": "⏸️",
     "stopped": "🛑",
+    "force_sold": "📤",
     "grid_simulated": "🔲",
     "grid_placed": "🔲",
 }
@@ -77,6 +80,21 @@ def _separator(label: str = "") -> str:
     return f"{_DIM}{'─' * width}{_RESET}"
 
 
+def _log_portfolio(portfolio: dict, prefix: str = "   portf  ") -> None:
+    logging.info(
+        "%s: equity=%,.2f  cash=%,.2f  pos=%.8f  pnl=%+,.2f  "
+        "trades=%d  win=%.0f%%  trail=%s",
+        prefix,
+        portfolio["equity"],
+        portfolio["cash"],
+        portfolio["base_position"],
+        portfolio["realized_pnl"],
+        portfolio["trade_count"],
+        portfolio["win_rate"] * 100,
+        f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—",
+    )
+
+
 def main() -> None:
     configure_logging()
 
@@ -94,15 +112,78 @@ def main() -> None:
             restored_portfolio.get("base_position"),
         )
 
+    # ── Graceful shutdown on SIGTERM (e.g. Docker / systemd stop) ──────────
+    _shutdown = threading.Event()
+
+    def _request_shutdown(signum: int, frame: object) -> None:
+        logging.info("⏹️  Shutdown signal received — finishing current cycle …")
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+
     pair = config.pair
     cycle = 0
     consecutive_errors = 0
     _max_backoff = 300  # 5 minutes cap
+    scan_cycles = 0  # counts cycles that completed a full scan (for periodic summary)
 
-    while True:
+    while not _shutdown.is_set():
         cycle += 1
         logging.info(_separator(f"Cycle #{cycle}"))
+
         try:
+            # ── Position monitoring ──────────────────────────────────────────
+            # When the bot is already holding a position (from this run or
+            # restored via auto-resume) analyse that pair first.  Decide to
+            # exit (sell) or stay in the trade before scanning new pairs.
+            if trader.tracker.base_position > 0:
+                held_snapshot = trader.analyze_market(pair)
+                held_price = held_snapshot["price"]
+
+                if config.trailing_stop_pct > 0:
+                    trader.tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
+
+                stop_reason = trader.tracker.stop_reason(held_price)
+                held_decision = held_snapshot["decision"]
+
+                # Exit if a hard stop fired or the strategy says sell.
+                should_exit = stop_reason is not None or held_decision.action == "sell"
+
+                if should_exit:
+                    exit_reason = stop_reason or f"sell signal ({held_decision.reason[:60]})"
+                    logging.info("📤 Exiting position on %s — %s", pair, exit_reason)
+                    force_outcome = trader.force_sell(held_snapshot)
+                    portfolio = trader.tracker.as_dict(held_price)
+                    logging.info(
+                        "📊 Position closed: amount=%.8f  price=%,.2f",
+                        force_outcome.get("amount", 0),
+                        held_price,
+                    )
+                    _log_portfolio(portfolio)
+                    consecutive_errors = 0
+                    if config.run_once:
+                        break
+                    logging.info(_separator())
+                    time.sleep(config.interval_seconds)
+                    continue  # scan for next opportunity
+
+                # Still holding – use faster polling interval
+                portfolio = trader.tracker.as_dict(held_price)
+                logging.info(
+                    "⏸️  Holding %s | price=%,.2f | pos=%.8f | equity=%,.2f | trail=%s",
+                    pair,
+                    held_price,
+                    trader.tracker.base_position,
+                    portfolio["equity"],
+                    f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—",
+                )
+                consecutive_errors = 0
+                if config.run_once:
+                    break
+                time.sleep(config.position_check_interval_seconds)
+                continue
+
+            # ── Scan all pairs and choose the best opportunity ───────────────
             pair, snapshot = trader.scan_and_choose()
             summary = snapshot["decision"]
             icon = _ACTION_ICONS.get(summary.action, "❓")
@@ -152,21 +233,39 @@ def main() -> None:
                 outcome.get("price", "—"),
             )
             portfolio = trader.tracker.as_dict(snapshot["price"])
-            logging.info(
-                "   portf  : equity=%,.2f  cash=%,.2f  pos=%.8f  pnl=%+,.2f  "
-                "trades=%d  win=%.0f%%  trail=%s",
-                portfolio["equity"],
-                portfolio["cash"],
-                portfolio["base_position"],
-                portfolio["realized_pnl"],
-                portfolio["trade_count"],
-                portfolio["win_rate"] * 100,
-                f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—",
-            )
+            _log_portfolio(portfolio)
+
             consecutive_errors = 0
+            scan_cycles += 1
+
+            # ── Stop condition: liquidate remaining position and rotate ───────
             if outcome.get("status") == "stopped":
-                logging.info("🛑 Stop condition reached: %s", outcome.get("reason"))
-                break
+                logging.info(
+                    "🛑 Stop condition reached: %s — liquidating and rotating …",
+                    outcome.get("reason"),
+                )
+                if trader.tracker.base_position > 0:
+                    force_outcome = trader.force_sell(snapshot)
+                    logging.info(
+                        "📤 Force-sold: amount=%s  price=%s",
+                        force_outcome.get("amount"),
+                        force_outcome.get("price"),
+                    )
+                # Re-compute portfolio after any liquidation
+                portfolio = trader.tracker.as_dict(snapshot["price"])
+                logging.info(
+                    "📊 Rotation summary: pnl=%+,.2f  equity=%,.2f  trades=%d  win=%.0f%%",
+                    portfolio["realized_pnl"],
+                    portfolio["equity"],
+                    portfolio["trade_count"],
+                    portfolio["win_rate"] * 100,
+                )
+                if config.run_once:
+                    break
+                logging.info(_separator())
+                time.sleep(config.interval_seconds)
+                continue  # find next opportunity instead of halting
+
         except (requests.RequestException, RuntimeError, ValueError):
             consecutive_errors += 1
             # Cap the exponent to avoid enormous intermediate values before min()
@@ -189,6 +288,19 @@ def main() -> None:
 
         if config.run_once:
             break
+
+        # Periodic performance summary every N full-scan cycles
+        if scan_cycles > 0 and scan_cycles % config.cycle_summary_interval == 0:
+            logging.info(
+                "📊 Periodic summary (scan #%d): pnl=%+,.2f  equity=%,.2f  "
+                "trades=%d  win=%.0f%%",
+                scan_cycles,
+                portfolio["realized_pnl"],
+                portfolio["equity"],
+                portfolio["trade_count"],
+                portfolio["win_rate"] * 100,
+            )
+
         logging.info(_separator())
         time.sleep(config.interval_seconds)
 

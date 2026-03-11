@@ -418,6 +418,63 @@ class Trader:
         self._persist_state(snapshot, decision, price, outcome)
         return outcome
 
+    def force_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Sell the entire open base position at current market price.
+
+        Used when a stop condition or an explicit exit signal requires immediate
+        liquidation before searching for the next trading opportunity.  Safe to
+        call even when there is no open position – returns ``status: no_position``
+        in that case.
+        """
+        price = snapshot["price"]
+        pair = snapshot["pair"]
+        amount = self.tracker.base_position
+
+        if amount <= 0:
+            return {"status": "no_position", "pair": pair, "price": price}
+
+        # Use top-of-book bid as reference price for the sell; fall back to
+        # the snapshot price if the order-book fetch fails.
+        reference_price = price
+        try:
+            depth = self.client.get_depth(pair, count=5)
+            bids = depth.get("buy") or []
+            if bids:
+                reference_price = float(bids[0][0])
+        except Exception:
+            pass
+
+        if self.config.dry_run:
+            logger.info("DRY-RUN force-sell %.8f %s @ %s", amount, pair, reference_price)
+            self.tracker.record_trade("sell", reference_price, amount)
+            outcome: Dict[str, Any] = {
+                "status": "force_sold",
+                "action": "sell",
+                "pair": pair,
+                "price": reference_price,
+                "amount": amount,
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
+            self._persist_state(snapshot, snapshot["decision"], reference_price, outcome)
+            return outcome
+
+        if self.config.api_key is None:
+            raise ValueError("API credentials required for live trading")
+
+        order_resp = self.client.create_order(pair, "sell", reference_price, amount)
+        self.tracker.record_trade("sell", reference_price, amount)
+        outcome = {
+            "status": "force_sold",
+            "action": "sell",
+            "pair": pair,
+            "price": reference_price,
+            "amount": amount,
+            "order": order_resp,
+            "portfolio": self.tracker.as_dict(reference_price),
+        }
+        self._persist_state(snapshot, snapshot["decision"], reference_price, outcome)
+        return outcome
+
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
         pairs: List[str] = []
         if self.config.scan_pairs:
