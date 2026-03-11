@@ -14,10 +14,14 @@ from bot.trader import Trader
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Automated Indodax trading bot")
     parser.add_argument("--pair", default=None, help="Trading pair, e.g. btc_idr")
+    parser.add_argument("--pairs", default=None, help="Comma-separated pairs to scan before trading")
     parser.add_argument("--live", action="store_true", help="Enable live trading (requires API keys)")
     parser.add_argument("--interval", type=int, default=None, help="Candle interval seconds")
     parser.add_argument("--once", action="store_true", help="Run a single iteration then exit")
     parser.add_argument("--min-confidence", type=float, default=None, help="Minimum confidence to trade")
+    parser.add_argument("--initial-capital", type=float, default=None, help="Starting capital in quote currency")
+    parser.add_argument("--target-profit", type=float, default=None, help="Target profit percentage (0.2 = 20%)")
+    parser.add_argument("--max-loss", type=float, default=None, help="Max loss percentage (0.1 = 10%)")
     return parser.parse_args()
 
 
@@ -36,10 +40,18 @@ def main() -> None:
     config = BotConfig.from_env()
     if args.pair:
         config.pair = args.pair
+    if args.pairs:
+        config.scan_pairs = [p.strip().lower() for p in args.pairs.split(",") if p.strip()]
     if args.interval:
         config.interval_seconds = args.interval
     if args.min_confidence is not None:
         config.min_confidence = args.min_confidence
+    if args.initial_capital is not None:
+        config.initial_capital = args.initial_capital
+    if args.target_profit is not None:
+        config.target_profit_pct = args.target_profit
+    if args.max_loss is not None:
+        config.max_loss_pct = args.max_loss
     if args.live:
         config.dry_run = False
         config.require_auth()
@@ -47,10 +59,11 @@ def main() -> None:
     trader = Trader(config)
     while True:
         try:
-            snapshot = trader.analyze_market()
+            pair, snapshot = trader.scan_and_choose()
             summary = snapshot["decision"]
             logging.info(
-                "mode=%s action=%s price=%.2f conf=%.2f reason=%s",
+                "pair=%s mode=%s action=%s price=%.2f conf=%.2f reason=%s",
+                pair,
                 summary.mode,
                 summary.action,
                 snapshot["price"],
@@ -59,6 +72,10 @@ def main() -> None:
             )
             outcome = trader.maybe_execute(snapshot)
             logging.info("result=%s", outcome)
+            portfolio_price = snapshot["price"]
+            logging.info("portfolio=%s", trader.tracker.as_dict(portfolio_price))
+            if outcome.get("status") == "stopped":
+                break
         except (requests.RequestException, RuntimeError, ValueError):
             logging.exception("Recoverable error in bot loop")
             if args.once:

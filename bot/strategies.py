@@ -11,9 +11,8 @@ SCALP_SPREAD_THRESHOLD = 0.0015
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
-MIN_RISK_DIVISOR = 1e-8  # prevents division by zero when stop distance is extremely small
+RISK_EPSILON = 1e-8  # prevents division by zero / extremely small stop distances
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
-RISK_EPS = 1e-10
 
 
 @dataclass
@@ -99,12 +98,12 @@ def make_trade_decision(
         amount = 0.0
     else:
         risk_per_unit = abs(current_price - stop_loss)
-        if risk_per_unit < RISK_EPS:
+        if risk_per_unit < RISK_EPSILON:
             amount = 0.0
         else:
             desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
             base_order_risk = risk_per_unit * config.base_order_size
-            scale = min(2.0, desired_risk_value / max(MIN_RISK_DIVISOR, base_order_risk))
+            scale = min(2.0, desired_risk_value / max(RISK_EPSILON, base_order_risk))
             amount = max(config.base_order_size * scale, config.base_order_size * 0.25)
 
     return StrategyDecision(

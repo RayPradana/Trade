@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from .analysis import (
     analyze_orderbook,
@@ -13,6 +15,7 @@ from .analysis import (
 from .config import BotConfig
 from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, make_trade_decision
+from .tracking import PortfolioTracker
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,12 @@ class Trader:
     def __init__(self, config: BotConfig, client: Optional[IndodaxClient] = None) -> None:
         self.config = config
         self.client = client or IndodaxClient(config.api_key, config.api_secret)
+        self._all_pairs: Optional[List[str]] = None
+        self.tracker = PortfolioTracker(
+            initial_capital=config.initial_capital,
+            target_profit_pct=config.target_profit_pct,
+            max_loss_pct=config.max_loss_pct,
+        )
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
@@ -38,9 +47,10 @@ class Trader:
         return float(last_value)
 
     def analyze_market(self) -> Dict[str, Any]:
-        ticker = self.client.get_ticker(self.config.pair)
-        depth = self.client.get_depth(self.config.pair, count=200)
-        trades = self.client.get_trades(self.config.pair, count=400)
+        pair = self.config.pair
+        ticker = self.client.get_ticker(pair)
+        depth = self.client.get_depth(pair, count=200)
+        trades = self.client.get_trades(pair, count=400)
 
         candles = build_candles(trades, interval_seconds=self.config.interval_seconds, limit=96)
         trend = analyze_trend(candles, self.config.fast_window, self.config.slow_window)
@@ -51,6 +61,7 @@ class Trader:
 
         decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels)
         return {
+            "pair": pair,
             "price": price,
             "trend": trend,
             "orderbook": orderbook,
@@ -64,13 +75,18 @@ class Trader:
         decision: StrategyDecision = snapshot["decision"]
         price = snapshot["price"]
 
+        stop_reason = self.tracker.stop_reason(price)
+        if stop_reason:
+            return {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
+
         if decision.action == "hold":
-            return {"status": "hold", "reason": decision.reason}
+            return {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
 
         if decision.confidence < self.config.min_confidence:
             return {
                 "status": "skipped",
                 "reason": f"confidence {decision.confidence} below threshold {self.config.min_confidence}",
+                "portfolio": self.tracker.as_dict(price),
             }
 
         # simple slippage guard using top of book
@@ -84,12 +100,21 @@ class Trader:
         allowed_min = price * (1 - self.config.max_slippage_pct)
 
         if decision.action == "buy" and reference_price > allowed_max:
-            return {"status": "skipped", "reason": "slippage too high for buy"}
+            return {
+                "status": "skipped",
+                "reason": "slippage too high for buy",
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
         if decision.action == "sell" and reference_price < allowed_min:
-            return {"status": "skipped", "reason": "slippage too high for sell"}
+            return {
+                "status": "skipped",
+                "reason": "slippage too high for sell",
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
 
         if self.config.dry_run:
             logger.info("DRY-RUN %s %s @ %s", decision.action, decision.amount, reference_price)
+            self.tracker.record_trade(decision.action, reference_price, decision.amount)
             return {
                 "status": "simulated",
                 "action": decision.action,
@@ -100,6 +125,7 @@ class Trader:
                 "take_profit": decision.take_profit,
                 "confidence": decision.confidence,
                 "reason": decision.reason,
+                "portfolio": self.tracker.as_dict(reference_price),
             }
 
         # live trading path
@@ -110,6 +136,7 @@ class Trader:
         order_resp = self.client.create_order(
             self.config.pair, decision.action, reference_price, decision.amount
         )
+        self.tracker.record_trade(decision.action, reference_price, decision.amount)
         return {
             "status": "placed",
             "order": order_resp,
@@ -117,4 +144,52 @@ class Trader:
             "price": reference_price,
             "amount": decision.amount,
             "mode": decision.mode,
+            "portfolio": self.tracker.as_dict(reference_price),
         }
+
+    def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
+        pairs: List[str] = []
+        if self.config.scan_pairs:
+            pairs = list(self.config.scan_pairs)
+        else:
+            if self._all_pairs is None:
+                try:
+                    pairs_data = self.client.get_pairs()
+                    names = []
+                    for p in pairs_data:
+                        if "name" in p:
+                            names.append(p["name"])
+                        elif "ticker_id" in p:
+                            names.append(p["ticker_id"])
+                    self._all_pairs = [n.lower() for n in names if n]
+                except Exception as exc:  # pragma: no cover - network guard
+                    logger.warning("Failed to load pairs; fallback to default %s", exc)
+                    self._all_pairs = [self.config.pair]
+            pairs = self._all_pairs or [self.config.pair]
+
+        best_pair = self.config.pair
+        best_snapshot: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+
+        for pair in pairs:
+            self.config.pair = pair
+            try:
+                snapshot = self.analyze_market()
+            except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for flaky pairs
+                logger.warning("Failed to analyze %s: %s", pair, exc)
+                continue
+            decision: StrategyDecision = snapshot["decision"]
+            if decision.action == "hold":
+                continue
+            if decision.confidence > best_score:
+                best_score = decision.confidence
+                best_snapshot = snapshot
+                best_pair = pair
+
+        if best_snapshot:
+            self.config.pair = best_pair
+            return best_pair, best_snapshot
+
+        # fallback to default pair if nothing tradable
+        self.config.pair = best_pair
+        return best_pair, self.analyze_market()

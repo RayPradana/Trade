@@ -32,6 +32,10 @@ Konfigurasi dapat diatur lewat variabel lingkungan:
 | `FAST_WINDOW` | Periode MA cepat | `12` |
 | `SLOW_WINDOW` | Periode MA lambat | `48` |
 | `MAX_SLIPPAGE_PCT` | Batas slippage relatif | `0.001` |
+| `INITIAL_CAPITAL` | Modal awal (quote currency, mis. IDR) | `1000000` |
+| `TARGET_PROFIT_PCT` | Target profit relatif (0.2 = 20%) | `0.2` |
+| `MAX_LOSS_PCT` | Batas kerugian relatif (0.1 = 10%) | `0.1` |
+| `TRADE_PAIRS` | Daftar pasangan dipisah koma untuk discan | `btc_idr` |
 
 ## Menjalankan
 
@@ -54,6 +58,8 @@ Opsi penting:
 - `--once` menjalankan satu siklus analisa + keputusan.
 - `--interval` menimpa interval candlestick.
 - `--min-confidence` mengubah ambang eksekusi.
+- `--initial-capital`, `--target-profit`, `--max-loss` mengontrol modal, target keuntungan, dan batas rugi.
+- `--pairs` untuk scan banyak pasangan sebelum entry (bot memilih confidence tertinggi).
 
 ## Cara Kerja Singkat
 
@@ -64,15 +70,17 @@ Opsi penting:
    - Order book dihitung spread, volume bid/ask, dan imbalance.
    - Volatilitas dihitung dari imbal hasil candle.
    - Support dan resistance dihitung dari harga penutupan terbaru untuk menghindari entry dekat level kritis.
+   - Portfolio tracker menghitung ekuitas (cash + posisi mark-to-market) terhadap target profit / batas rugi.
 3. **Pemilihan strategi**:
    - **Scalping**: spread tipis, likuiditas tinggi, volatilitas rendah.
    - **Day Trading**: tren aktif dengan volatilitas moderat.
    - **Swing Trading**: tren kuat dengan volatilitas lebih tinggi.
    - **Position Trading**: kondisi lain (lebih tenang / tren panjang).
 4. **Keputusan trading**: aksi beli/jual/hold dengan stop-loss & take-profit dinamis.
-5. **Eksekusi**: 
+5. **Eksekusi & guard**: 
    - **Dry-run**: hanya log simulasi.
    - **Live**: mengirim **limit order** `trade` ke `tapi` Indodax (butuh API key/secret). Stop-limit dijaga secara logis lewat stop-loss/take-profit dan pengecekan slippage.
+   - Portfolio guard berhenti otomatis bila target profit tercapai atau batas rugi terlampaui.
 
 ## Keamanan & Catatan
 
