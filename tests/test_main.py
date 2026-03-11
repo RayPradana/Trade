@@ -24,7 +24,8 @@ class MainErrorHandlingTests(unittest.TestCase):
         class StubTrader:
             def __init__(self, config) -> None:
                 self.config = config
-                self.restored_state = None
+                self.restored_pair = None
+                self.persistence = type("_P", (), {"backup": lambda *a: None})()
                 self.tracker = PortfolioTracker(
                     initial_capital=1000.0,
                     target_profit_pct=0.2,
@@ -82,7 +83,8 @@ class MainErrorHandlingTests(unittest.TestCase):
         class StubTrader:
             def __init__(self, config) -> None:
                 self.config = config
-                self.restored_state = None
+                self.restored_pair = None
+                self.persistence = type("_P", (), {"backup": lambda *a: None})()
                 self.tracker = PortfolioTracker(
                     initial_capital=1000.0,
                     target_profit_pct=0.2,
@@ -134,7 +136,8 @@ class MainErrorHandlingTests(unittest.TestCase):
         class StubTrader:
             def __init__(self, config) -> None:
                 self.config = config
-                self.restored_state = None
+                self.restored_pair = None
+                self.persistence = type("_P", (), {"backup": lambda *a: None})()
                 # Pre-load an open position so the position-monitoring branch fires.
                 self.tracker = PortfolioTracker(
                     initial_capital=1000.0,
@@ -199,7 +202,8 @@ class MainErrorHandlingTests(unittest.TestCase):
         class StubTrader:
             def __init__(self, config) -> None:
                 self.config = config
-                self.restored_state = None
+                self.restored_pair = None
+                self.persistence = type("_P", (), {"backup": lambda *a: None})()
                 self.tracker = PortfolioTracker(
                     initial_capital=1000.0,
                     target_profit_pct=0.2,

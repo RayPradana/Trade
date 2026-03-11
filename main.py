@@ -127,6 +127,11 @@ def main() -> None:
     # Used by TRADE_MODE=single to know when a full buy→sell cycle is complete.
     _entered_position: bool = trader.tracker.base_position > 0
 
+    # ── Auto-resume: use the pair from saved state if we're resuming ────────
+    if trader.restored_pair:
+        pair = trader.restored_pair
+        logging.info("🔄 Resuming saved position on %s  pos=%.8f", pair, trader.tracker.base_position)
+
     while not _shutdown.is_set():
         cycle += 1
         logging.info(_separator(f"Cycle #{cycle}"))
@@ -311,6 +316,18 @@ def main() -> None:
                 portfolio["trade_count"],
                 portfolio["win_rate"] * 100,
             )
+
+        # Periodic state backup every N scan cycles
+        if (
+            config.state_path is not None
+            and config.state_backup_interval > 0
+            and scan_cycles > 0
+            and scan_cycles % config.state_backup_interval == 0
+        ):
+            _backup_path = config.state_path.with_name(
+                config.state_path.stem + "_backup" + config.state_path.suffix
+            )
+            trader.persistence.backup(_backup_path)
 
         logging.info(_separator())
         time.sleep(config.interval_seconds)

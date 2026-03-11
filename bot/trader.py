@@ -16,6 +16,7 @@ from .analysis import (
     support_resistance,
 )
 from .config import BotConfig
+from .persistence import StatePersistence
 from .rate_limit import RateLimitedOrderQueue
 from .realtime import MultiPairFeed, RealtimeFeed
 from .grid import GridPlan, build_grid_plan
@@ -47,6 +48,11 @@ class Trader:
             target_profit_pct=config.target_profit_pct,
             max_loss_pct=config.max_loss_pct,
         )
+        # ── Auto-resume: persistence and state recovery ──────────────────────
+        self.persistence = StatePersistence(config.state_path)
+        self.restored_pair: Optional[str] = None  # set when state is loaded from disk
+        self._try_restore_state()
+        # ── Real-time feed ───────────────────────────────────────────────────
         self.realtime: Optional[RealtimeFeed] = None
         if config.real_time:
             self.realtime = RealtimeFeed(
@@ -58,6 +64,124 @@ class Trader:
                 subscribe_message=config.websocket_subscribe_message,
             )
             self.realtime.start()
+
+    # ------------------------------------------------------------------
+    # Auto-resume helpers
+    # ------------------------------------------------------------------
+
+    def _try_restore_state(self) -> None:
+        """Load persisted state on startup and restore PortfolioTracker.
+
+        State is only restored when:
+        - The state file exists and is valid JSON
+        - The saved ``dry_run`` flag matches the current config (prevents mixing
+          virtual and live state after the user toggles DRY_RUN)
+        - The saved position is > 0 (a position=0 file is stale and cleared)
+        """
+        state = self.persistence.load()
+        if state is None:
+            return
+        # Reject cross-mode state (dry_run live vs dry_run virtual)
+        saved_dry_run = state.get("dry_run")
+        if saved_dry_run is not None and bool(saved_dry_run) != self.config.dry_run:
+            logger.info(
+                "Ignoring saved state (dry_run mismatch: saved=%s  current=%s)",
+                saved_dry_run,
+                self.config.dry_run,
+            )
+            return
+        portfolio = state.get("portfolio")
+        if portfolio is None:
+            return
+        self.tracker.load_state(portfolio)
+        pair = state.get("pair")
+        if self.tracker.base_position <= 0:
+            # Stale state with no open position — remove to keep things clean
+            self.persistence.clear()
+            return
+        if pair:
+            self.restored_pair = str(pair)
+        logger.info(
+            "🔄 Resumed state: pair=%s  pos=%.8f  avg_cost=%s  pnl=%s",
+            pair,
+            self.tracker.base_position,
+            self.tracker.avg_cost,
+            self.tracker.realized_pnl,
+        )
+        # For live trading reconcile saved position against real API balance
+        if not self.config.dry_run:
+            self._reconcile_with_api(str(pair) if pair else self.config.pair)
+
+    def _reconcile_with_api(self, pair: str) -> None:
+        """Cross-check the saved position against the real Indodax account balance.
+
+        Called once on startup when ``dry_run=False`` and a saved position exists.
+        If the real coin balance differs from the saved value by more than 5 %
+        the tracker is updated to match reality so the bot never acts on stale data.
+        """
+        try:
+            info = self.client.get_account_info()
+            # Indodax returns {"success": 1, "return": {"balance": {"btc": "0.001", ...}}}
+            balance_dict = (info.get("return") or {}).get("balance") or {}
+            base_coin = pair.split("_")[0].lower()
+            real_balance = float(balance_dict.get(base_coin) or "0")
+            saved_position = self.tracker.base_position
+            tolerance = max(saved_position * 0.05, 1e-8)
+            if abs(real_balance - saved_position) > tolerance:
+                logger.warning(
+                    "Reconciliation mismatch for %s: saved=%.8f  real=%.8f — using real balance",
+                    pair,
+                    saved_position,
+                    real_balance,
+                )
+                self.tracker.base_position = real_balance
+                if real_balance <= 0:
+                    self.tracker.avg_cost = 0.0
+                    self.persistence.clear()
+                    self.restored_pair = None
+                    logger.info("Position cleared after reconciliation (no real balance for %s)", base_coin)
+                else:
+                    self._save_state(pair)
+            else:
+                logger.info(
+                    "Reconciliation OK for %s: saved=%.8f  real=%.8f",
+                    pair,
+                    saved_position,
+                    real_balance,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Reconciliation failed for %s: %s — trusting saved state",
+                pair,
+                exc,
+            )
+
+    def _save_state(self, pair: str) -> None:
+        """Persist the current PortfolioTracker state to disk (fire-and-forget)."""
+        try:
+            self.persistence.save(
+                {
+                    "portfolio": self.tracker.to_state(),
+                    "pair": pair,
+                    "dry_run": self.config.dry_run,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Failed to save state: %s", exc)
+
+    def _clear_state(self) -> None:
+        """Remove the state file when a position is fully closed."""
+        try:
+            self.persistence.clear()
+        except Exception as exc:
+            logger.warning("Failed to clear state: %s", exc)
+
+    def _persist_after_trade(self, pair: str) -> None:
+        """Save state if still in a position, or clear it if the position is closed."""
+        if self.tracker.base_position <= 0:
+            self._clear_state()
+        else:
+            self._save_state(pair)
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
@@ -321,6 +445,7 @@ class Trader:
                 "reason": decision.reason,
                 "portfolio": self.tracker.as_dict(reference_price),
             }
+            self._persist_after_trade(snapshot["pair"])
             return outcome
 
         # live trading path
@@ -352,6 +477,7 @@ class Trader:
             "mode": decision.mode,
             "portfolio": self.tracker.as_dict(reference_price),
         }
+        self._persist_after_trade(snapshot["pair"])
         return outcome
 
     def _execute_grid(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -433,6 +559,7 @@ class Trader:
                 "amount": amount,
                 "portfolio": self.tracker.as_dict(reference_price),
             }
+            self._persist_after_trade(pair)
             return outcome
 
         if self.config.api_key is None:
@@ -449,6 +576,7 @@ class Trader:
             "order": order_resp,
             "portfolio": self.tracker.as_dict(reference_price),
         }
+        self._persist_after_trade(pair)
         return outcome
 
     _MAX_SCAN_RETRIES = 3

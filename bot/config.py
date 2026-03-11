@@ -64,6 +64,8 @@ class BotConfig:
     position_check_interval_seconds: int = 60  # faster poll when monitoring an open position
     cycle_summary_interval: int = 10  # print a performance summary every N full scan cycles
     trade_mode: str = "continuous"  # "single": one buy→sell cycle then stop; "continuous": 24/7
+    state_path: Optional[Path] = None  # None = disabled; set via STATE_PATH env var to enable auto-resume
+    state_backup_interval: int = 10  # save a backup copy every N scan cycles (0 = disabled)
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -111,6 +113,8 @@ class BotConfig:
             position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
             cycle_summary_interval=int(os.getenv("CYCLE_SUMMARY_INTERVAL", "10")),
             trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
+            state_path=Path(os.getenv("STATE_PATH", "bot_state.json")),
+            state_backup_interval=int(os.getenv("STATE_BACKUP_INTERVAL", "10")),
         )
         cfg._validate()
         return cfg
@@ -152,5 +156,7 @@ class BotConfig:
             raise ValueError("TRADE_MODE must be 'single' or 'continuous'")
         if self.trailing_stop_pct < 0:
             raise ValueError("TRAILING_STOP_PCT must be non-negative")
+        if self.state_backup_interval < 0:
+            raise ValueError("STATE_BACKUP_INTERVAL must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()
