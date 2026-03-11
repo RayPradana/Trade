@@ -254,11 +254,15 @@ class TraderSelectionTests(unittest.TestCase):
             stop_loss=95.0,
             take_profit=110.0,
         )
+        class VolStub:
+            def __init__(self, vol: float) -> None:
+                self.volatility = vol
+
         snapshot = {
             "pair": "btc_idr",
             "price": 100.0,
             "decision": decision,
-            "volatility": type("Vol", (), {"volatility": 0.03})(),  # high vol triggers staging
+            "volatility": VolStub(0.03),  # high vol triggers staging
         }
         outcome = trader.maybe_execute(snapshot)
         self.assertEqual(outcome["status"], "simulated")

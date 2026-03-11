@@ -135,10 +135,20 @@ class Trader:
         fractions = [f / total_frac for f in fractions] if total_frac else [1.0]
 
         staged = [round(total * frac, 12) for frac in fractions]
-        # Ensure rounding does not exceed total
+        # Ensure rounding does not exceed total and the final leg absorbs rounding drift
         if staged:
             staged[-1] = max(0.0, min(total - sum(staged[:-1]), staged[-1]))
         return [s for s in staged if s > 0]
+
+    def _scale_staged_amounts(self, decision_amount: float, effective_amount: float, staged: List[float]) -> List[float]:
+        if effective_amount <= 0:
+            return []
+        if not staged:
+            return [effective_amount]
+        if decision_amount <= 0:
+            return [effective_amount]
+        scale = effective_amount / decision_amount
+        return [max(0.0, amt * scale) for amt in staged]
 
     def analyze_market(self, pair: Optional[str] = None) -> Dict[str, Any]:
         pair = pair or self.config.pair
@@ -247,12 +257,7 @@ class Trader:
             self._persist_state(snapshot, decision, reference_price, outcome)
             return outcome
 
-        staged = self._staged_amounts(decision, snapshot)
-        if staged and decision.amount > 0:
-            scale = effective_amount / decision.amount
-            staged = [max(0.0, amt * scale) for amt in staged]
-        else:
-            staged = [effective_amount]
+        staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
 
         executed_steps: List[Dict[str, Any]] = []
         remaining_amount = effective_amount
