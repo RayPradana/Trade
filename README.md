@@ -29,7 +29,8 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `TRADE_PAIR` | Pasangan dagang fallback jika pemilihan otomatis tidak menemukan kandidat | `btc_idr` |
 | `BASE_ORDER_SIZE` | Ukuran order dasar (dalam aset dasar) | `0.0001` |
 | `RISK_PER_TRADE` | Risiko per transaksi (0.01 = 1%) | `0.01` |
-| `DRY_RUN` | `true/false` untuk simulasi | `true` |
+| `DRY_RUN` | `true/false` untuk simulasi (set `false` untuk mode live) | `true` |
+| `RUN_ONCE` | Jalankan satu siklus lalu berhenti | `false` |
 | `MIN_CONFIDENCE` | Ambang kepercayaan minimum untuk eksekusi | `0.52` |
 | `INTERVAL_SECONDS` | Interval candlestick hasil agregasi trades | `300` |
 | `FAST_WINDOW` | Periode MA cepat | `12` |
@@ -58,19 +59,18 @@ DRY_RUN=true
 ### Dry-run (simulasi, aman)
 
 ```bash
-python main.py --once
+RUN_ONCE=true DRY_RUN=true python main.py
 ```
 
 ### Mode live (eksekusi order)
 
 ```bash
-export INDODAX_KEY=your_api_key
-python main.py --live
+DRY_RUN=false INDODAX_KEY=your_api_key python main.py
 ```
 
 Opsi penting:
 
-- `--once` menjalankan satu siklus analisa + keputusan.
+- `RUN_ONCE=true` menjalankan satu siklus analisa + keputusan.
 
 ## Cara Kerja Singkat
 

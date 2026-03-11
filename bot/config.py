@@ -38,6 +38,7 @@ class BotConfig:
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
     risk_per_trade: float = 0.01  # 1% default
     dry_run: bool = True
+    run_once: bool = False
     min_confidence: float = 0.52
     interval_seconds: int = 300
     fast_window: int = 12
@@ -62,6 +63,7 @@ class BotConfig:
             base_order_size=float(os.getenv("BASE_ORDER_SIZE", "0.0001")),
             risk_per_trade=float(os.getenv("RISK_PER_TRADE", "0.01")),
             dry_run=os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"},
+            run_once=os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"},
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
             interval_seconds=int(os.getenv("INTERVAL_SECONDS", "300")),
             fast_window=int(os.getenv("FAST_WINDOW", "12")),

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import logging
 import sys
 import time
@@ -9,13 +8,6 @@ import requests
 
 from bot.config import BotConfig
 from bot.trader import Trader
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Automated Indodax trading bot")
-    parser.add_argument("--live", action="store_true", help="Enable live trading (requires API keys)")
-    parser.add_argument("--once", action="store_true", help="Run a single iteration then exit")
-    return parser.parse_args()
 
 
 def configure_logging() -> None:
@@ -27,12 +19,10 @@ def configure_logging() -> None:
 
 
 def main() -> None:
-    args = parse_args()
     configure_logging()
 
     config = BotConfig.from_env()
-    if args.live:
-        config.dry_run = False
+    if not config.dry_run:
         config.require_auth()
 
     trader = Trader(config)
@@ -78,13 +68,13 @@ def main() -> None:
                 break
         except (requests.RequestException, RuntimeError, ValueError):
             logging.exception("Recoverable error in bot loop (pair=%s)", pair)
-            if args.once:
+            if config.run_once:
                 raise
         except KeyboardInterrupt:
             logging.info("Stopping bot")
             break
 
-        if args.once:
+        if config.run_once:
             break
         time.sleep(config.interval_seconds)
 
