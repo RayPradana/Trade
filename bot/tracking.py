@@ -16,10 +16,35 @@ class PortfolioSnapshot:
 
 
 class PortfolioTracker:
-    """Cash/position tracker with profit target, max-loss stops, trailing stop, and trade stats."""
+    """Cash/position tracker with profit target, max-loss stops, trailing stop, and trade stats.
+
+    Capital model
+    -------------
+    The tracker separates capital into two pools:
+
+    * **Principal** (``self.principal``) – the fixed initial capital.  This is
+      the "anchor" that is never deliberately eroded; drawdown protection
+      targets are expressed relative to it.
+    * **Profit buffer** (``self.profit_buffer``) – the cumulative realised
+      profit above the principal (i.e. ``max(0, realized_pnl)``).  As trades
+      generate returns this pool grows; it is used to compound position sizes
+      via ``effective_capital()``.
+
+    ``effective_capital()`` = principal + profit_buffer.  Passing this value
+    to strategy position-sizing gives automatic compounding: each profitable
+    trade cycle makes the next trade size slightly larger.
+
+    An optional *profit-buffer drawdown* guard (configured via
+    :attr:`~BotConfig.profit_buffer_drawdown_pct`) stops new buys when the
+    profit buffer has fallen more than the allowed fraction from its all-time
+    peak.  This protects realised profits from being eroded by a losing streak.
+    """
 
     def __init__(self, initial_capital: float, target_profit_pct: float, max_loss_pct: float) -> None:
         self.initial_capital = initial_capital
+        # Principal: the immutable starting capital used as an anchor.
+        # Exposed as a named attribute for clarity; always equals initial_capital.
+        self.principal: float = initial_capital
         self.cash = initial_capital
         self.base_position = 0.0
         self.realized_pnl = 0.0
@@ -42,6 +67,43 @@ class PortfolioTracker:
         # Partial TP state: True when the first partial TP has been taken on the
         # current position.  Reset to False on each new buy or full close.
         self.partial_tp_taken: bool = False
+        # Profit-buffer compounding: track the peak profit buffer for drawdown guard.
+        self._peak_profit_buffer: float = 0.0
+
+    @property
+    def profit_buffer(self) -> float:
+        """Accumulated realised profit above the principal (never negative).
+
+        This is the compounding pool: as the bot earns money the profit buffer
+        grows, and ``effective_capital()`` grows with it so each subsequent
+        trade is sized slightly larger.
+        """
+        return max(0.0, self.realized_pnl)
+
+    def effective_capital(self) -> float:
+        """Total capital available for position sizing = principal + profit buffer.
+
+        This is what should be passed to strategy position-sizing logic instead
+        of the bare ``initial_capital``.  When there is no profit yet it equals
+        ``initial_capital``; as profits accumulate the value grows, enabling
+        automatic compounding.
+        """
+        return self.principal + self.profit_buffer
+
+    def profit_buffer_drawdown_pct(self) -> float:
+        """Return how far the profit buffer has dropped from its all-time peak (0 → 1).
+
+        Used to implement the profit-buffer drawdown guard: if this value
+        exceeds the configured threshold, new buys are blocked to protect
+        realised profits.
+
+        Returns ``0.0`` when there has never been a profit buffer (no gains
+        yet) or when the buffer is at its all-time peak.
+        """
+        if self._peak_profit_buffer <= 0:
+            return 0.0
+        current_pb = self.profit_buffer
+        return max(0.0, (self._peak_profit_buffer - current_pb) / self._peak_profit_buffer)
 
     def record_trade(self, action: str, price: float, amount: float) -> None:
         notional = price * amount
@@ -64,6 +126,10 @@ class PortfolioTracker:
             self.base_position -= sell_qty
             self.last_sell_price = price
             self.last_sell_time = time.time()
+            # Update peak profit buffer so drawdown guard always has a reference
+            pb = self.profit_buffer
+            if pb > self._peak_profit_buffer:
+                self._peak_profit_buffer = pb
             if self.base_position <= 0:
                 self.avg_cost = 0.0
                 self.partial_tp_taken = False
@@ -126,6 +192,10 @@ class PortfolioTracker:
         ptt = state.get("partial_tp_taken")
         if ptt is not None:
             self.partial_tp_taken = bool(ptt)
+        # Restore profit-buffer peak for drawdown guard
+        ppb = state.get("peak_profit_buffer")
+        if ppb is not None:
+            self._peak_profit_buffer = float(ppb)
         # target/min equity recomputed from initial_capital to keep guard consistent
 
     def stop_reason(self, mark_price: float) -> Optional[str]:
@@ -166,6 +236,12 @@ class PortfolioTracker:
             "trade_count": self.trade_count,
             "win_rate": round(self.win_rate, 3),
             "trailing_stop": self._trailing_stop,
+            # Capital management
+            "principal": self.principal,
+            "profit_buffer": self.profit_buffer,
+            "effective_capital": self.effective_capital(),
+            "peak_profit_buffer": self._peak_profit_buffer,
+            "profit_buffer_drawdown": round(self.profit_buffer_drawdown_pct(), 4),
         }
 
     def to_state(self) -> Dict[str, object]:
@@ -185,6 +261,7 @@ class PortfolioTracker:
             "last_sell_price": self.last_sell_price,
             "last_sell_time": self.last_sell_time,
             "partial_tp_taken": self.partial_tp_taken,
+            "peak_profit_buffer": self._peak_profit_buffer,
         }
 
     # ── Daily loss cap helpers ────────────────────────────────────────────

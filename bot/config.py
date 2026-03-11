@@ -132,6 +132,11 @@ class BotConfig:
     # Minimum total order-book depth (sum of top-20 bid and ask levels in IDR)
     # a pair must have before it is analysed.  0 = no filter (default).
     min_liquidity_depth_idr: float = 0.0
+    # Profit-buffer drawdown protection: stop new buys when the profit buffer
+    # has fallen more than this fraction from its all-time peak.
+    # E.g. 0.3 = stop trading if profits drop 30% from their peak.
+    # 0 = no protection (default).
+    profit_buffer_drawdown_pct: float = 0.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -205,6 +210,7 @@ class BotConfig:
             adaptive_interval_min_seconds=int(os.getenv("ADAPTIVE_INTERVAL_MIN_SECONDS", "30")),
             max_portfolio_risk_pct=float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "0")),
             min_liquidity_depth_idr=float(os.getenv("MIN_LIQUIDITY_DEPTH_IDR", "0")),
+            profit_buffer_drawdown_pct=float(os.getenv("PROFIT_BUFFER_DRAWDOWN_PCT", "0")),
         )
         cfg._validate()
         return cfg
@@ -283,5 +289,7 @@ class BotConfig:
             raise ValueError("MAX_PORTFOLIO_RISK_PCT must be non-negative")
         if self.min_liquidity_depth_idr < 0:
             raise ValueError("MIN_LIQUIDITY_DEPTH_IDR must be non-negative")
+        if not (0.0 <= self.profit_buffer_drawdown_pct < 1.0):
+            raise ValueError("PROFIT_BUFFER_DRAWDOWN_PCT must be in [0, 1)")
         if not self.dry_run and not self.api_key:
             self.require_auth()

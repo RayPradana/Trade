@@ -101,13 +101,22 @@ def _position_size(
     risk_per_unit: float,
     confidence: float,
     vol: VolatilityStats,
+    effective_capital: Optional[float] = None,
 ) -> float:
-    """Dynamic risk-based position sizing: base size = risk_per_trade * capital / price."""
+    """Dynamic risk-based position sizing: base size = risk_per_trade * capital / price.
+
+    :param effective_capital: When provided, this is used as the capital base
+        for sizing instead of ``config.initial_capital``.  Pass
+        ``tracker.effective_capital()`` to enable automatic compounding: as
+        profits accumulate, position sizes grow proportionally.
+    """
     if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE or current_price <= 0:
         return 0.0
+    # Use compounding capital when available, otherwise fall back to initial_capital
+    capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
     # Compute how many units of the base asset represent one "risk unit" of capital
-    dynamic_base = (config.risk_per_trade * config.initial_capital) / current_price
-    desired_risk_value = config.initial_capital * config.risk_per_trade
+    dynamic_base = (config.risk_per_trade * capital) / current_price
+    desired_risk_value = capital * config.risk_per_trade
     base_order_risk = risk_per_unit * dynamic_base
     dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
     scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
@@ -128,6 +137,7 @@ def make_trade_decision(
     mtf: Optional[MultiTimeframeResult] = None,
     whale: Optional[WhaleActivity] = None,
     spoofing: Optional[SpoofingResult] = None,
+    effective_capital: Optional[float] = None,
 ) -> StrategyDecision:
     """Produce a :class:`StrategyDecision` incorporating all available signals.
 
@@ -160,6 +170,11 @@ def make_trade_decision(
     spoofing:
         Order-book spoofing / manipulation detection result.  When spoofing is
         detected, confidence is penalised to avoid entering during manipulation.
+    effective_capital:
+        When provided, position sizing uses this value instead of
+        ``config.initial_capital`` as the capital base.  Pass
+        ``tracker.effective_capital()`` to enable compounding: each profitable
+        trade cycle increases the size of the next position proportionally.
     """
     mode = select_strategy(trend, orderbook, vol)
     conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
