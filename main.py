@@ -158,7 +158,94 @@ def _log_startup_banner(config: BotConfig) -> None:
     logging.info(sep)
 
 
-# ── Signal display (BUY/SELL decision) ───────────────────────────────────
+# ── Account info / balance display ───────────────────────────────────────
+
+def _log_account_info(info: dict) -> None:
+    """Log the Indodax account balance and account details in a rich tree format.
+
+    *info* is the raw ``getInfo`` response dict from the private API:
+    ``{"success": 1, "return": {"balance": {"idr": "...","btc": "...",...}, ...}}``.
+    """
+    ret = info.get("return") or {}
+    balance = ret.get("balance") or {}
+    balance_hold = ret.get("balance_hold") or {}
+    name  = ret.get("name")   or ret.get("server_time") or "—"
+    email = ret.get("email")  or "—"
+    address = ret.get("address") or {}  # address dict keyed by coin
+    server_time_raw = ret.get("server_time")
+    server_ts = (
+        datetime.datetime.fromtimestamp(int(server_time_raw)).strftime("%Y-%m-%d %H:%M:%S")
+        if server_time_raw else "—"
+    )
+
+    sep = f"{_DIM}{'─' * 50}{_RESET}"
+    logging.info(sep)
+    logging.info("💼  %s%sACCOUNT INFO%s  %sIndodax%s",
+                 _BOLD, _WHITE, _RESET, _DIM, _RESET)
+    logging.info(sep)
+
+    if name and name != "—":
+        logging.info("   %-14s %s%s%s", "name     :", _BOLD, name, _RESET)
+    if email and email != "—":
+        logging.info("   %-14s %s%s%s", "email    :", _DIM, email, _RESET)
+    logging.info("   %-14s %s%s%s", "server   :", _DIM, server_ts, _RESET)
+    logging.info(sep)
+
+    # ── IDR cash balance ─────────────────────────────────────────────────
+    idr_free = float(balance.get("idr") or "0")
+    idr_hold = float(balance_hold.get("idr") or "0")
+    idr_total = idr_free + idr_hold
+    logging.info("   %s%s%s", _BOLD, "💰  Balances", _RESET)
+    logging.info(
+        "   %s├─%s %s%-6s%s  free : %s    hold : %s    total : %s%s%s",
+        _DIM, _RESET,
+        _BOLD, "IDR", _RESET,
+        f"{_GREEN}Rp {idr_free:>18,.2f}{_RESET}",
+        f"{_YELLOW}Rp {idr_hold:>18,.2f}{_RESET}",
+        _BOLD, f"Rp {idr_total:>18,.2f}", _RESET,
+    )
+
+    # ── Non-zero coin balances ────────────────────────────────────────────
+    coin_rows = []
+    for coin, free_str in sorted(balance.items()):
+        if coin == "idr":
+            continue
+        free  = float(free_str or "0")
+        held  = float(balance_hold.get(coin) or "0")
+        if free <= 0 and held <= 0:
+            continue
+        coin_rows.append((coin, free, held))
+
+    for i, (coin, free, held) in enumerate(coin_rows):
+        is_last = (i == len(coin_rows) - 1)
+        connector = "└─" if is_last else "├─"
+        total = free + held
+        logging.info(
+            "   %s%s%s %s%-6s%s  free : %s%.8f%s    hold : %s%.8f%s    total : %s%.8f%s",
+            _DIM, connector, _RESET,
+            _BOLD, coin.upper(), _RESET,
+            _GREEN,  free,  _RESET,
+            _YELLOW, held,  _RESET,
+            _BOLD,   total, _RESET,
+        )
+
+    if not coin_rows:
+        logging.info("   %s└─%s %sno open coin positions%s", _DIM, _RESET, _DIM, _RESET)
+
+    logging.info(sep)
+
+
+def _log_account_info_dry() -> None:
+    """Placeholder account display used when running in dry-run mode."""
+    sep = f"{_DIM}{'─' * 50}{_RESET}"
+    logging.info(sep)
+    logging.info(
+        "💼  %sACCOUNT INFO%s  %s(dry-run — no API call made)%s",
+        _BOLD, _RESET, _DIM, _RESET,
+    )
+    logging.info(sep)
+
+
 
 def _log_signal(snapshot: dict) -> None:
     """Log a buy/sell signal with market data and indicators in tree format."""
@@ -403,6 +490,15 @@ def main() -> None:
 
     trader = Trader(config)
     _log_startup_banner(config)
+
+    # ── Account info / balance (live mode only) ──────────────────────────
+    if not config.dry_run:
+        try:
+            _log_account_info(trader.client.get_account_info())
+        except Exception as _exc:
+            logging.warning("⚠️  Could not fetch account info: %s", _exc)
+    else:
+        _log_account_info_dry()
 
     # ── Graceful shutdown on SIGTERM (e.g. Docker / systemd stop) ──────────
     _shutdown = threading.Event()
