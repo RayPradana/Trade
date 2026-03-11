@@ -129,7 +129,12 @@ def analyze_orderbook(depth: Dict[str, object]) -> OrderbookInsight:
     ask_volume = sum(_to_float(a[1]) for a in asks[:20])
     total = bid_volume + ask_volume
     imbalance = (bid_volume - ask_volume) / total if total else 0.0
-    return OrderbookInsight(spread_pct=spread_pct, bid_volume=bid_volume, ask_volume=ask_volume, imbalance=imbalance)
+    return OrderbookInsight(
+        spread_pct=spread_pct,
+        bid_volume=bid_volume,
+        ask_volume=ask_volume,
+        imbalance=imbalance,
+    )
 
 
 def analyze_volatility(candles: Sequence[Candle]) -> VolatilityStats:

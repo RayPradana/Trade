@@ -5,6 +5,8 @@ import logging
 import sys
 import time
 
+import requests
+
 from bot.config import BotConfig
 from bot.trader import Trader
 
@@ -57,8 +59,13 @@ def main() -> None:
             )
             outcome = trader.maybe_execute(snapshot)
             logging.info("result=%s", outcome)
-        except Exception as exc:  # pragma: no cover - runtime guard
-            logging.exception("Failed to execute bot loop: %s", exc)
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            logging.exception("Recoverable error in bot loop: %s", exc)
+            if args.once:
+                raise
+        except KeyboardInterrupt:
+            logging.info("Stopping bot")
+            break
 
         if args.once:
             break

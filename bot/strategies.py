@@ -7,6 +7,11 @@ from typing import Optional
 from .analysis import OrderbookInsight, TrendResult, VolatilityStats
 from .config import BotConfig
 
+SCALP_SPREAD_THRESHOLD = 0.0015
+ORDERBOOK_SPREAD_BONUS = 0.002
+ORDERBOOK_IMBALANCE_WEIGHT = 50
+VOLATILITY_PENALTY_CAP = 0.8
+
 
 @dataclass
 class StrategyDecision:
@@ -21,7 +26,11 @@ class StrategyDecision:
 
 
 def select_strategy(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> str:
-    if orderbook.spread_pct < 0.0015 and abs(orderbook.imbalance) > 0.25 and vol.volatility < 0.01:
+    if (
+        orderbook.spread_pct < SCALP_SPREAD_THRESHOLD
+        and abs(orderbook.imbalance) > 0.25
+        and vol.volatility < 0.01
+    ):
         return "scalping"
     if trend.direction != "flat" and vol.volatility >= 0.01 and vol.volatility <= 0.03:
         return "day_trading"
@@ -32,8 +41,9 @@ def select_strategy(trend: TrendResult, orderbook: OrderbookInsight, vol: Volati
 
 def _confidence(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> float:
     trend_score = min(trend.strength * 10, 1.0)
-    orderbook_score = min(abs(orderbook.imbalance) + max(0, 0.002 - orderbook.spread_pct) * 50, 1.0)
-    vol_score = 1 - min(vol.volatility * 10, 0.8)
+    spread_bonus = max(0, ORDERBOOK_SPREAD_BONUS - orderbook.spread_pct) * ORDERBOOK_IMBALANCE_WEIGHT
+    orderbook_score = min(abs(orderbook.imbalance) + spread_bonus, 1.0)
+    vol_score = 1 - min(vol.volatility * 10, VOLATILITY_PENALTY_CAP)
     return round(max(0.0, min(1.0, (trend_score * 0.45 + orderbook_score * 0.35 + vol_score * 0.2))), 3)
 
 

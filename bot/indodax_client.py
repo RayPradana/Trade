@@ -52,14 +52,13 @@ class IndodaxClient:
         return self._post_private("tradeHistory", {"pair": pair, "count": count})
 
     def create_order(self, pair: str, order_type: str, price: float, amount: float) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "pair": pair,
-            "type": order_type,
-            "price": f"{price:.8f}",
-        }
+        payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": f"{price:.8f}"}
+        is_idr_pair = pair.endswith("_idr")
         if order_type == "buy":
-            payload["idr"] = f"{price * amount:.8f}" if pair.endswith("_idr") else None
-            payload["amount"] = f"{amount:.8f}" if not pair.endswith("_idr") else None
+            if is_idr_pair:
+                payload["idr"] = f"{price * amount:.8f}"
+            else:
+                payload["amount"] = f"{amount:.8f}"
         else:
             payload["amount"] = f"{amount:.8f}"
         return self._post_private("trade", payload)
