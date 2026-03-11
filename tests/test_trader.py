@@ -1104,3 +1104,66 @@ class MinVolumeFilterTests(unittest.TestCase):
             chosen_pair, _ = trader.scan_and_choose()
         # low_idr volume is 0 < 1_000_000 → must be filtered out
         self.assertEqual(chosen_pair, "btc_idr")
+
+
+class RiskExposureCapTests(unittest.TestCase):
+    """Tests for MAX_EXPOSURE_PER_COIN_PCT and MAX_DAILY_LOSS_PCT caps."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def _make_snapshot(self, pair: str = "btc_idr", action: str = "buy", conf: float = 0.9) -> dict:
+        return {
+            "pair": pair,
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=conf,
+                reason="test",
+                target_price=100,
+                amount=0.1,
+                stop_loss=90,
+                take_profit=110,
+            ),
+        }
+
+    def test_exposure_cap_skips_buy_when_over_limit(self):
+        """maybe_execute should skip buy when per-coin exposure cap is reached."""
+        config = BotConfig(api_key=None, max_exposure_per_coin_pct=0.05, dry_run=True)
+        trader = Trader(config)
+        # Simulate: 1000 coins at price 100 = 100_000 exposure on initial capital 1_000_000 → 10%
+        trader.tracker.base_position = 1000.0
+        trader.tracker.avg_cost = 100.0
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["99", "1"]], "sell": [["101", "1"]]},
+        })()
+
+        snap = self._make_snapshot(action="buy")
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("exposure_cap", outcome["reason"])
+
+    def test_exposure_cap_zero_means_no_cap(self):
+        """max_exposure_per_coin_pct=0 should never block a buy."""
+        config = BotConfig(api_key=None, max_exposure_per_coin_pct=0.0, dry_run=True)
+        trader = Trader(config)
+        trader.tracker.base_position = 1000.0
+        trader.tracker.avg_cost = 100.0
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["99", "1"]], "sell": [["101", "1"]]},
+        })()
+        snap = self._make_snapshot(action="buy")
+        # Should not return "skipped" due to exposure cap
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome.get("reason", ""), "exposure_cap")

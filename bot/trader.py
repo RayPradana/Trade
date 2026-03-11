@@ -13,8 +13,12 @@ from .analysis import (
     build_candles,
     candles_from_ohlc,
     derive_indicators,
+    detect_whale_activity,
     interval_to_ohlc_tf,
+    multi_timeframe_confirm,
     MomentumIndicators,
+    MultiTimeframeResult,
+    WhaleActivity,
     support_resistance,
 )
 from .config import BotConfig
@@ -49,6 +53,7 @@ class Trader:
         self._all_pairs: Optional[List[str]] = None
         self._scan_offset: int = 0  # rotating window index for pairs_per_cycle
         self._multi_feed: Optional[MultiPairFeed] = None
+        self._scan_cycle_count: int = 0  # total completed full-scan cycles (for dynamic refresh)
         self.tracker = PortfolioTracker(
             initial_capital=config.initial_capital,
             target_profit_pct=config.target_profit_pct,
@@ -283,6 +288,37 @@ class Trader:
         """
         return sorted(pairs, key=self._pair_volume, reverse=True)
 
+    def _refresh_dynamic_pairs(self) -> None:
+        """Replace the pair watchlist with the top-N most liquid pairs.
+
+        Called every ``dynamic_pairs_refresh_cycles`` full-scan cycles when the
+        feature is enabled (``dynamic_pairs_refresh_cycles > 0``).  Reads
+        current volume data from the multi-pair feed cache to rank pairs and
+        updates ``_all_pairs`` in-place so that the next scan uses the fresh
+        watchlist.
+
+        The refresh is best-effort: any exception is logged and the existing
+        watchlist is kept unchanged.
+        """
+        if self._multi_feed is None:
+            return
+        try:
+            all_known = list(self._multi_feed._cache.keys())
+            if not all_known:
+                return
+            ranked = sorted(all_known, key=self._pair_volume, reverse=True)
+            top_n = self.config.dynamic_pairs_top_n
+            new_pairs = ranked[:top_n] if top_n > 0 else ranked
+            if new_pairs:
+                self._all_pairs = new_pairs
+                logger.info(
+                    "Dynamic pairs: refreshed watchlist → %d pairs (top=%d by volume)",
+                    len(new_pairs),
+                    top_n,
+                )
+        except Exception:
+            logger.warning("Dynamic pair refresh failed", exc_info=True)
+
     def _staged_amounts(self, decision: StrategyDecision, snapshot: Dict[str, Any]) -> List[float]:
         total = decision.amount
         if total <= 0:
@@ -362,6 +398,25 @@ class Trader:
         price = self._extract_price(ticker)
         indicators: MomentumIndicators = derive_indicators(candles)
 
+        # ── Multi-timeframe analysis ─────────────────────────────────────────
+        mtf: Optional[MultiTimeframeResult] = None
+        if self.config.mtf_timeframes:
+            candles_by_tf: Dict[str, Any] = {}
+            for tf in self.config.mtf_timeframes:
+                try:
+                    ohlc = self.client.get_ohlc(pair, tf=tf, limit=max(200, self.config.slow_window + _OHLC_BUFFER_CANDLES))
+                    candles_by_tf[tf] = candles_from_ohlc(ohlc)
+                except Exception:
+                    logger.debug("MTF: failed to fetch tf=%s for %s", tf, pair, exc_info=True)
+            if candles_by_tf:
+                mtf = multi_timeframe_confirm(candles_by_tf, self.config.fast_window, self.config.slow_window)
+                logger.debug("MTF %s: direction=%s aligned=%s tf=%s", pair, mtf.direction, mtf.aligned, mtf.tf_directions)
+
+        # ── Whale / smart-money detection ────────────────────────────────────
+        whale: WhaleActivity = detect_whale_activity(depth)
+        if whale.detected:
+            logger.debug("Whale detected on %s: side=%s ratio=%.1f×", pair, whale.side, whale.ratio)
+
         grid_plan: Optional[GridPlan] = None
         decision: StrategyDecision
         if self.config.grid_enabled:
@@ -378,7 +433,9 @@ class Trader:
                 take_profit=None,
             )
         else:
-            decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels, indicators)
+            decision = make_trade_decision(
+                trend, orderbook, vol, price, self.config, levels, indicators, mtf=mtf, whale=whale
+            )
         return {
             "pair": pair,
             "price": price,
@@ -391,6 +448,8 @@ class Trader:
             "candles": candles,
             "grid_plan": grid_plan,
             "insufficient_data": insufficient_data,
+            "mtf": mtf,
+            "whale": whale,
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -406,6 +465,41 @@ class Trader:
             logger.info("Stop triggered (%s) equity=%s", stop_reason, self.tracker.as_dict(price))
             outcome = {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
             return outcome
+
+        # ── Daily loss cap ────────────────────────────────────────────────────
+        if self.config.max_daily_loss_pct > 0 and decision.action == "buy":
+            daily_loss_pct = self.tracker.daily_loss_pct(price)
+            if daily_loss_pct >= self.config.max_daily_loss_pct:
+                logger.warning(
+                    "Daily loss cap reached: %.2f%% ≥ %.2f%% — skipping buy",
+                    daily_loss_pct * 100,
+                    self.config.max_daily_loss_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"daily_loss_cap {daily_loss_pct:.2%} ≥ {self.config.max_daily_loss_pct:.2%}",
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
+        # ── Per-coin exposure cap ─────────────────────────────────────────────
+        if self.config.max_exposure_per_coin_pct > 0 and decision.action == "buy":
+            current_equity = self.tracker.snapshot(price).equity
+            current_exposure = self.tracker.base_position * price
+            exposure_pct = current_exposure / current_equity if current_equity > 0 else 0.0
+            if exposure_pct >= self.config.max_exposure_per_coin_pct:
+                logger.info(
+                    "Exposure cap reached: %.2f%% ≥ %.2f%% — skipping buy on %s",
+                    exposure_pct * 100,
+                    self.config.max_exposure_per_coin_pct * 100,
+                    snapshot["pair"],
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"exposure_cap {exposure_pct:.2%} ≥ {self.config.max_exposure_per_coin_pct:.2%}"
+                    ),
+                    "portfolio": self.tracker.as_dict(price),
+                }
 
         if self.config.grid_enabled and snapshot.get("grid_plan"):
             return self._execute_grid(snapshot)
@@ -869,6 +963,12 @@ class Trader:
 
         if failed_pairs:
             logger.warning("Skipped %s pairs due to errors: %s", len(failed_pairs), ",".join(failed_pairs))
+
+        # ── Dynamic pair refresh ──────────────────────────────────────────────
+        self._scan_cycle_count += 1
+        refresh = self.config.dynamic_pairs_refresh_cycles
+        if refresh > 0 and self._scan_cycle_count % refresh == 0:
+            self._refresh_dynamic_pairs()
 
         if best_snapshot:
             return best_pair, best_snapshot

@@ -168,10 +168,31 @@ def _send_telegram(token: str, chat_id: str, text: str) -> None:
         logging.warning("Telegram notification error: %s", exc)
 
 
+def _send_discord(webhook_url: str, text: str) -> None:
+    """Send a plain-text message to a Discord channel via an Incoming Webhook.
+
+    Failures are logged as warnings and never propagated.
+    """
+    try:
+        resp = requests.post(
+            webhook_url,
+            json={"content": text},
+            timeout=10,
+        )
+        if not resp.ok:
+            logging.warning(
+                "Discord notification failed (HTTP %d): %s", resp.status_code, resp.text[:200]
+            )
+    except Exception as exc:
+        logging.warning("Discord notification error: %s", exc)
+
+
 def _notify(config: BotConfig, text: str) -> None:
-    """Send a Telegram notification when the bot is configured to do so."""
+    """Send notifications via Telegram and/or Discord when configured."""
     if config.telegram_token and config.telegram_chat_id:
         _send_telegram(config.telegram_token, config.telegram_chat_id, text)
+    if config.discord_webhook_url:
+        _send_discord(config.discord_webhook_url, text)
 
 def _separator(label: str = "") -> str:
     ts = datetime.datetime.now().strftime("%H:%M:%S")

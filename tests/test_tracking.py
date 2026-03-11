@@ -87,3 +87,46 @@ class TrackingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DailyLossCapTest(unittest.TestCase):
+    def test_no_loss_returns_zero(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        self.assertAlmostEqual(tracker.daily_loss(100_000.0), 0.0)
+        self.assertAlmostEqual(tracker.daily_loss_pct(100_000.0), 0.0)
+
+    def test_loss_detected(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        # Simulate buying coin then price drops
+        tracker.record_trade("buy", 100.0, 100.0)   # spend 10_000 IDR on 100 coins
+        loss = tracker.daily_loss(80.0)   # coin price drops to 80 — equity drops
+        self.assertGreater(loss, 0.0)
+
+    def test_daily_loss_pct_proportion(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 100.0)
+        pct = tracker.daily_loss_pct(90.0)
+        self.assertGreater(pct, 0.0)
+        self.assertLess(pct, 1.0)
+
+    def test_day_reset_changes_baseline(self):
+        import datetime
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        # Simulate day change by faking the stamp
+        tracker._day_stamp = 20000101  # a day in the past
+        tracker._day_open_equity = 50_000.0  # old baseline
+        # After reset, day_open_equity should be current equity
+        _ = tracker.daily_loss(100_000.0)  # triggers reset
+        self.assertAlmostEqual(tracker._day_open_equity, 100_000.0)
+
+    def test_to_state_includes_daily_fields(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        state = tracker.to_state()
+        self.assertIn("day_open_equity", state)
+        self.assertIn("day_stamp", state)
+
+    def test_load_state_restores_daily_fields(self):
+        tracker = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker.load_state({"day_open_equity": 95_000.0, "day_stamp": 20250101})
+        self.assertAlmostEqual(tracker._day_open_equity, 95_000.0)
+        self.assertEqual(tracker._day_stamp, 20250101)

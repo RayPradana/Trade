@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 
 def _load_dotenv(path: Optional[Path] = None) -> None:
@@ -86,6 +86,28 @@ class BotConfig:
     # not received any ticker update within this window the feed is considered
     # stale and the REST summaries fallback is triggered immediately.
     ws_stale_threshold: float = 120.0
+    # Multi-timeframe analysis — list of additional OHLC timeframes to fetch
+    # per pair (beyond the primary one derived from interval_seconds).  Each
+    # entry is a string accepted by the Indodax OHLCV API: "1", "15", "30",
+    # "60", "240".  E.g. ["1", "15", "60"] fetches 1-min, 15-min and 1-h candles.
+    # Empty list (default) disables multi-timeframe analysis.
+    mtf_timeframes: List[str] = field(default_factory=list)
+    # Maximum fraction of initial capital that can be exposed to a single
+    # coin at any time (0 = no cap).  E.g. 0.3 = max 30% in one coin.
+    max_exposure_per_coin_pct: float = 0.0
+    # Maximum daily realised loss expressed as a fraction of initial capital.
+    # When the daily loss exceeds this threshold the bot stops trading until
+    # the next calendar day (UTC).  0 = no cap.
+    max_daily_loss_pct: float = 0.0
+    # Discord webhook URL for order / error notifications.  When set, the
+    # bot posts a plain-text message to this webhook.
+    discord_webhook_url: Optional[str] = None
+    # Number of scan cycles between dynamic-pair-list refreshes.
+    # 0 = disabled (use the static pair list from get_pairs() forever).
+    dynamic_pairs_refresh_cycles: int = 0
+    # Minimum 24-h volume rank a pair must occupy (1 = highest-volume)
+    # to be added to the dynamic watchlist.  0 = no rank filter.
+    dynamic_pairs_top_n: int = 50
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -142,6 +164,16 @@ class BotConfig:
             telegram_token=os.getenv("TELEGRAM_TOKEN") or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
             ws_stale_threshold=float(os.getenv("WS_STALE_THRESHOLD", "120")),
+            mtf_timeframes=[
+                tf.strip()
+                for tf in os.getenv("MTF_TIMEFRAMES", "").split(",")
+                if tf.strip()
+            ],
+            max_exposure_per_coin_pct=float(os.getenv("MAX_EXPOSURE_PER_COIN_PCT", "0")),
+            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "0")),
+            discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL") or None,
+            dynamic_pairs_refresh_cycles=int(os.getenv("DYNAMIC_PAIRS_REFRESH_CYCLES", "0")),
+            dynamic_pairs_top_n=int(os.getenv("DYNAMIC_PAIRS_TOP_N", "50")),
         )
         cfg._validate()
         return cfg
@@ -193,5 +225,20 @@ class BotConfig:
             raise ValueError("MIN_VOLUME_IDR must be non-negative")
         if self.ws_stale_threshold <= 0:
             raise ValueError("WS_STALE_THRESHOLD must be positive")
+        if self.max_exposure_per_coin_pct < 0:
+            raise ValueError("MAX_EXPOSURE_PER_COIN_PCT must be non-negative")
+        if self.max_daily_loss_pct < 0:
+            raise ValueError("MAX_DAILY_LOSS_PCT must be non-negative")
+        if self.dynamic_pairs_refresh_cycles < 0:
+            raise ValueError("DYNAMIC_PAIRS_REFRESH_CYCLES must be non-negative")
+        if self.dynamic_pairs_top_n < 0:
+            raise ValueError("DYNAMIC_PAIRS_TOP_N must be non-negative")
+        _valid_tfs = {"1", "15", "30", "60", "240", "1D", "3D", "1W"}
+        for tf in self.mtf_timeframes:
+            if tf not in _valid_tfs:
+                raise ValueError(
+                    f"MTF_TIMEFRAMES contains invalid timeframe '{tf}'; "
+                    f"valid options: {sorted(_valid_tfs)}"
+                )
         if not self.dry_run and not self.api_key:
             self.require_auth()

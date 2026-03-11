@@ -137,3 +137,77 @@ class OhlcHelpersTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultiTimeframeTest(unittest.TestCase):
+    def _make_candles(self, direction: str, n: int = 60) -> list:
+        from bot.analysis import Candle
+        candles = []
+        price = 1000.0
+        for i in range(n):
+            if direction == "up":
+                price *= 1.001
+            elif direction == "down":
+                price *= 0.999
+            candles.append(Candle(timestamp=i, open=price, high=price * 1.001, low=price * 0.999, close=price, volume=100.0))
+        return candles
+
+    def test_aligned_up_returns_up(self):
+        from bot.analysis import multi_timeframe_confirm
+        candles = self._make_candles("up")
+        result = multi_timeframe_confirm({"1m": candles, "15m": candles, "60m": candles})
+        self.assertEqual(result.direction, "up")
+        self.assertTrue(result.aligned)
+
+    def test_aligned_down_returns_down(self):
+        from bot.analysis import multi_timeframe_confirm
+        candles = self._make_candles("down")
+        result = multi_timeframe_confirm({"1m": candles, "15m": candles})
+        self.assertEqual(result.direction, "down")
+        self.assertTrue(result.aligned)
+
+    def test_mixed_returns_not_aligned(self):
+        from bot.analysis import multi_timeframe_confirm
+        up = self._make_candles("up")
+        down = self._make_candles("down")
+        result = multi_timeframe_confirm({"1m": up, "15m": down})
+        self.assertFalse(result.aligned)
+
+    def test_empty_input_returns_flat(self):
+        from bot.analysis import multi_timeframe_confirm
+        result = multi_timeframe_confirm({})
+        self.assertEqual(result.direction, "flat")
+        self.assertFalse(result.aligned)
+
+    def test_tf_directions_populated(self):
+        from bot.analysis import multi_timeframe_confirm
+        candles = self._make_candles("up")
+        result = multi_timeframe_confirm({"1m": candles, "15m": candles})
+        self.assertIn("1m", result.tf_directions)
+        self.assertIn("15m", result.tf_directions)
+
+
+class WhaleDetectionTest(unittest.TestCase):
+    def test_detects_large_bid_wall(self):
+        from bot.analysis import detect_whale_activity
+        # Create bids where one level has 10x average volume
+        levels = [[str(100 - i), "1.0"] for i in range(19)]  # 19 small levels
+        levels.insert(0, ["101", "100.0"])  # one huge level
+        depth = {"buy": levels, "sell": levels}
+        result = detect_whale_activity(depth)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.side, "bid")
+        self.assertGreater(result.ratio, 5.0)
+
+    def test_no_whale_on_flat_book(self):
+        from bot.analysis import detect_whale_activity
+        levels = [[str(100 - i), "1.0"] for i in range(20)]
+        depth = {"buy": levels, "sell": levels}
+        result = detect_whale_activity(depth)
+        self.assertFalse(result.detected)
+        self.assertIsNone(result.side)
+
+    def test_empty_book_no_whale(self):
+        from bot.analysis import detect_whale_activity
+        result = detect_whale_activity({"buy": [], "sell": []})
+        self.assertFalse(result.detected)

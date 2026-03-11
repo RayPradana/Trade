@@ -122,3 +122,67 @@ class NewConfigFieldsTest(TestCase):
         with patch.dict(__import__("os").environ, {"WS_STALE_THRESHOLD": "0"}, clear=True):
             with self.assertRaises(ValueError):
                 BotConfig.from_env()
+
+
+class AdditionalFeaturesConfigTest(TestCase):
+    def test_mtf_timeframes_default_empty(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.mtf_timeframes, [])
+
+    def test_mtf_timeframes_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MTF_TIMEFRAMES": "1,15,60"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.mtf_timeframes, ["1", "15", "60"])
+
+    def test_mtf_timeframes_invalid_raises(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MTF_TIMEFRAMES": "999"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_max_exposure_default_zero(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.max_exposure_per_coin_pct, 0.0)
+
+    def test_max_exposure_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MAX_EXPOSURE_PER_COIN_PCT": "0.3"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.max_exposure_per_coin_pct, 0.3)
+
+    def test_max_daily_loss_default_zero(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.max_daily_loss_pct, 0.0)
+
+    def test_discord_webhook_default_none(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertIsNone(cfg.discord_webhook_url)
+
+    def test_discord_webhook_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/x"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.discord_webhook_url, "https://discord.com/api/webhooks/x")
+
+    def test_dynamic_pairs_defaults(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.dynamic_pairs_refresh_cycles, 0)
+            self.assertEqual(cfg.dynamic_pairs_top_n, 50)
+
+    def test_dynamic_pairs_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"DYNAMIC_PAIRS_REFRESH_CYCLES": "10", "DYNAMIC_PAIRS_TOP_N": "20"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.dynamic_pairs_refresh_cycles, 10)
+            self.assertEqual(cfg.dynamic_pairs_top_n, 20)

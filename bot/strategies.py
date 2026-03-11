@@ -6,10 +6,12 @@ from typing import Optional
 
 from .analysis import (
     MomentumIndicators,
+    MultiTimeframeResult,
     OrderbookInsight,
     SupportResistance,
     TrendResult,
     VolatilityStats,
+    WhaleActivity,
 )
 from .config import BotConfig
 
@@ -120,7 +122,38 @@ def make_trade_decision(
     config: BotConfig,
     levels: Optional[SupportResistance] = None,
     indicators: Optional[MomentumIndicators] = None,
+    mtf: Optional[MultiTimeframeResult] = None,
+    whale: Optional[WhaleActivity] = None,
 ) -> StrategyDecision:
+    """Produce a :class:`StrategyDecision` incorporating all available signals.
+
+    Parameters
+    ----------
+    trend:
+        Short-timeframe trend derived from the primary candle series.
+    orderbook:
+        Current order-book analysis.
+    vol:
+        Volatility metrics from the primary candle series.
+    current_price:
+        Latest trade price.
+    config:
+        Bot configuration (risk, capital, etc.).
+    levels:
+        Support/resistance levels from the primary candle series.
+    indicators:
+        RSI, MACD, Bollinger Band values.
+    mtf:
+        Multi-timeframe consensus.  When ``mtf.aligned`` is ``True`` and the
+        direction matches the primary trend, confidence receives a small bonus.
+        When aligned but *opposite* to the primary trend, confidence is reduced
+        (noise filter).
+    whale:
+        Smart-money / large-order detection result.  A bullish whale wall
+        (``side="bid"``) adds a confidence bonus on buy signals; a bearish wall
+        (``side="ask"``) adds a bonus on sell signals.  Opposing walls reduce
+        confidence.
+    """
     mode = select_strategy(trend, orderbook, vol)
     conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
 
@@ -160,9 +193,49 @@ def make_trade_decision(
         if indicators.rsi < 30 and action == "sell":
             conf *= 0.8  # avoid shorting oversold
 
+    # ── Multi-timeframe noise filter ─────────────────────────────────────────
+    mtf_note = ""
+    if mtf is not None and action != "hold":
+        if mtf.aligned and mtf.direction == trend.direction:
+            # All timeframes agree → boost confidence
+            conf = min(1.0, conf + 0.07)
+            mtf_note = "mtf_aligned"
+        elif mtf.aligned and mtf.direction != trend.direction:
+            # Timeframes aligned but *against* the primary signal → noise filter
+            conf *= 0.6
+            mtf_note = "mtf_opposing"
+        elif not mtf.aligned:
+            # Mixed signals → mild penalty
+            conf *= 0.9
+            mtf_note = "mtf_mixed"
+
+    # ── Whale / smart money confirmation ─────────────────────────────────────
+    whale_note = ""
+    if whale is not None and whale.detected:
+        if action == "buy" and whale.side == "bid":
+            # Large bid wall → buy pressure confirmed
+            conf = min(1.0, conf + 0.05)
+            whale_note = "whale_bid"
+        elif action == "sell" and whale.side == "ask":
+            # Large ask wall → sell pressure confirmed
+            conf = min(1.0, conf + 0.05)
+            whale_note = "whale_ask"
+        elif action == "buy" and whale.side == "ask":
+            # Large ask wall resists buy → reduce confidence
+            conf *= 0.85
+            whale_note = "whale_ask_resist"
+        elif action == "sell" and whale.side == "bid":
+            # Large bid wall supports price → reduce sell confidence
+            conf *= 0.85
+            whale_note = "whale_bid_support"
+
+    conf = round(max(0.0, min(1.0, conf)), 3)
+
     reason = (
         f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
-        f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} rsi={indicators.rsi if indicators else float('nan'):.2f} {sr_note}"
+        f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} "
+        f"rsi={indicators.rsi if indicators else float('nan'):.2f} "
+        f"{sr_note} {mtf_note} {whale_note}"
     ).strip()
 
     # size based on risk per trade relative to stop distance

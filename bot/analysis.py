@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import math
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import mean, pstdev
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,46 @@ class MomentumIndicators:
     bb_upper: float
     bb_mid: float
     bb_lower: float
+
+
+@dataclass
+class MultiTimeframeResult:
+    """Aggregated directional signal across multiple timeframes.
+
+    ``aligned`` is ``True`` when all sampled timeframes agree on the same
+    direction (all up or all down), giving higher confidence.
+
+    ``direction`` is the majority-vote direction: ``"up"``, ``"down"``, or
+    ``"flat"`` (tie).
+
+    ``strength`` is the average trend strength across timeframes.
+
+    ``tf_directions`` maps each timeframe label to its individual direction
+    string so callers can log the per-TF breakdown.
+    """
+
+    direction: str
+    aligned: bool
+    strength: float
+    tf_directions: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class WhaleActivity:
+    """Result of large-order / smart-money detection in the order book.
+
+    ``detected`` is ``True`` when at least one side has an anomalously large
+    wall relative to the average level size.
+
+    ``side`` is ``"bid"`` (large buy wall — bullish) or ``"ask"`` (large sell
+    wall — bearish), or ``None`` when nothing significant is detected.
+
+    ``ratio`` is the largest-level-volume / average-level-volume multiple.
+    """
+
+    detected: bool
+    side: Optional[str]
+    ratio: float
 
 
 def _safe_float(value: str) -> float:
@@ -318,3 +358,124 @@ def candles_from_ohlc(ohlc_data: List[Dict[str, object]]) -> List[Candle]:
             continue
     return sorted(result, key=lambda c: c.timestamp)
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe analysis
+# ---------------------------------------------------------------------------
+
+def multi_timeframe_confirm(
+    candles_by_tf: Dict[str, Sequence[Candle]],
+    fast_window: int = 12,
+    slow_window: int = 48,
+) -> MultiTimeframeResult:
+    """Compute a consensus directional signal across multiple candle timeframes.
+
+    :param candles_by_tf: Mapping of timeframe label (e.g. ``"1m"``, ``"15m"``)
+        to the corresponding :class:`Candle` sequence for that timeframe.  Each
+        sequence is analysed independently with :func:`analyze_trend`.
+    :param fast_window: Fast EMA window forwarded to :func:`analyze_trend`.
+    :param slow_window: Slow EMA window forwarded to :func:`analyze_trend`.
+    :returns: :class:`MultiTimeframeResult` with aggregated signal.
+
+    Empty or missing timeframe sequences are silently skipped.
+    """
+    if not candles_by_tf:
+        return MultiTimeframeResult(
+            direction="flat", aligned=False, strength=0.0, tf_directions={}
+        )
+
+    tf_directions: Dict[str, str] = {}
+    strengths: List[float] = []
+
+    for tf_label, candles in candles_by_tf.items():
+        if not candles:
+            continue
+        trend = analyze_trend(list(candles), fast_window, slow_window)
+        tf_directions[tf_label] = trend.direction
+        strengths.append(trend.strength)
+
+    if not tf_directions:
+        return MultiTimeframeResult(
+            direction="flat", aligned=False, strength=0.0, tf_directions={}
+        )
+
+    up_count = sum(1 for d in tf_directions.values() if d == "up")
+    down_count = sum(1 for d in tf_directions.values() if d == "down")
+    total = len(tf_directions)
+
+    if up_count > down_count:
+        direction = "up"
+    elif down_count > up_count:
+        direction = "down"
+    else:
+        direction = "flat"
+
+    aligned = (up_count == total) or (down_count == total)
+    avg_strength = mean(strengths) if strengths else 0.0
+
+    return MultiTimeframeResult(
+        direction=direction,
+        aligned=aligned,
+        strength=avg_strength,
+        tf_directions=tf_directions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Smart money / whale detection
+# ---------------------------------------------------------------------------
+
+# A level is classified as a "whale wall" when its volume is at least this
+# many times larger than the average level volume on that side.
+_WHALE_MULTIPLIER_THRESHOLD = 5.0
+# Minimum number of levels required to compute a meaningful average.
+_WHALE_MIN_LEVELS = 3
+
+
+def detect_whale_activity(
+    depth: Dict[str, object],
+    multiplier_threshold: float = _WHALE_MULTIPLIER_THRESHOLD,
+    top_n: int = 20,
+) -> WhaleActivity:
+    """Detect abnormally large orders (whale walls) in the order book.
+
+    Iterates over the top *top_n* bid and ask levels and flags the side with
+    the largest single-level volume when that volume exceeds
+    *multiplier_threshold* × average-level-volume on the same side.
+
+    :param depth:  Raw depth dict with ``"buy"`` and ``"sell"`` keys, each a
+        list of ``[price, volume]`` pairs (strings or numbers).
+    :param multiplier_threshold: How many times above the mean a level must be
+        to qualify as a whale wall.  Default is 5×.
+    :param top_n: Number of levels to inspect on each side.
+    :returns: :class:`WhaleActivity` describing the strongest anomaly found.
+    """
+    bids = (depth.get("buy") or [])[:top_n]
+    asks = (depth.get("sell") or [])[:top_n]
+
+    best_side: Optional[str] = None
+    best_ratio = 0.0
+
+    for side_label, levels in (("bid", bids), ("ask", asks)):
+        if len(levels) < _WHALE_MIN_LEVELS:
+            continue
+        try:
+            volumes = [float(level[1]) for level in levels]
+        except (IndexError, TypeError, ValueError):
+            continue
+        avg_vol = mean(volumes)
+        if avg_vol <= 0:
+            continue
+        max_vol = max(volumes)
+        ratio = max_vol / avg_vol
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_side = side_label
+
+    detected = best_ratio >= multiplier_threshold
+    return WhaleActivity(
+        detected=detected,
+        side=best_side if detected else None,
+        ratio=best_ratio,
+    )

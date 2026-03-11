@@ -399,3 +399,43 @@ class LoggingTests(unittest.TestCase):
         with unittest.mock.patch("requests.post", side_effect=OSError("no network")):
             # Should not raise
             main._send_telegram("tok", "chat", "msg")
+
+
+class DiscordNotificationTest(unittest.TestCase):
+    def test_send_discord_handles_request_error(self):
+        """_send_discord must not propagate network errors."""
+        with unittest.mock.patch("requests.post", side_effect=OSError("no network")):
+            main._send_discord("https://discord.com/api/webhooks/x", "msg")
+
+    def test_notify_sends_discord_when_configured(self):
+        """_notify should call _send_discord when discord_webhook_url is set."""
+        from bot.config import BotConfig
+        config = BotConfig(api_key=None, discord_webhook_url="https://discord.com/api/webhooks/x")
+        with unittest.mock.patch("main._send_discord") as mock_discord:
+            main._notify(config, "test message")
+            mock_discord.assert_called_once_with("https://discord.com/api/webhooks/x", "test message")
+
+    def test_notify_sends_both_when_both_configured(self):
+        """_notify must call both Telegram and Discord when both are configured."""
+        from bot.config import BotConfig
+        config = BotConfig(
+            api_key=None,
+            telegram_token="tok",
+            telegram_chat_id="chat",
+            discord_webhook_url="https://discord.com/api/webhooks/x",
+        )
+        with unittest.mock.patch("main._send_telegram") as mt, \
+             unittest.mock.patch("main._send_discord") as md:
+            main._notify(config, "both")
+            mt.assert_called_once()
+            md.assert_called_once()
+
+    def test_notify_does_nothing_without_any_config(self):
+        """_notify must not call anything when no notification config is set."""
+        from bot.config import BotConfig
+        config = BotConfig(api_key=None)
+        with unittest.mock.patch("main._send_telegram") as mt, \
+             unittest.mock.patch("main._send_discord") as md:
+            main._notify(config, "ignored")
+            mt.assert_not_called()
+            md.assert_not_called()
