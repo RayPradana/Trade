@@ -16,19 +16,22 @@ def _load_dotenv(path: Optional[Path] = None) -> None:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, value = line.split("=", 1)
+        key, _, value = line.partition("=")
         key = key.strip()
         if not key:
             continue
         if key in os.environ:
             continue
-        os.environ[key] = value.strip().strip('"').strip("'")
+        cleaned = value.strip()
+        if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
+            cleaned = cleaned[1:-1]
+        os.environ[key] = cleaned
 
 
 @dataclass
 class BotConfig:
     api_key: Optional[str]
-    # Default/fallback pair when pemindaian otomatis tidak menghasilkan kandidat
+# Default/fallback pair when automatic scanning yields no candidates
     pair: str = "btc_idr"
     scan_pairs: Optional[List[str]] = None
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)

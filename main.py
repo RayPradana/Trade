@@ -36,6 +36,7 @@ def main() -> None:
         config.require_auth()
 
     trader = Trader(config)
+    pair = config.pair
     while True:
         try:
             pair, snapshot = trader.scan_and_choose()
@@ -68,7 +69,7 @@ def main() -> None:
             if outcome.get("status") == "stopped":
                 break
         except (requests.RequestException, RuntimeError, ValueError):
-            logging.exception("Recoverable error in bot loop (pair=%s)", config.pair)
+            logging.exception("Recoverable error in bot loop (pair=%s)", pair)
             if args.once:
                 raise
         except KeyboardInterrupt:

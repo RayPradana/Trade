@@ -196,7 +196,7 @@ class Trader:
                         elif "ticker_id" in p:
                             names.append(p["ticker_id"])
                     self._all_pairs = [n.lower() for n in names if n]
-                except Exception as exc:  # pragma: no cover - network guard
+                except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - network guard
                     logger.warning("Failed to load pairs; fallback to default %s", exc)
                     self._all_pairs = [self.config.pair]
             pairs = self._all_pairs or [self.config.pair]
@@ -204,12 +204,14 @@ class Trader:
         best_pair = self.config.pair
         best_snapshot: Optional[Dict[str, Any]] = None
         best_score = -1.0
+        failed_pairs: List[str] = []
 
         for pair in pairs:
             try:
                 snapshot = self.analyze_market(pair)
             except (requests.RequestException, RuntimeError, ValueError) as exc:  # pragma: no cover - guard for flaky pairs
                 logger.warning("Failed to analyze %s: %s", pair, exc)
+                failed_pairs.append(pair)
                 continue
             decision: StrategyDecision = snapshot["decision"]
             if decision.action == "hold":
@@ -218,6 +220,9 @@ class Trader:
                 best_score = decision.confidence
                 best_snapshot = snapshot
                 best_pair = pair
+
+        if failed_pairs:
+            logger.warning("Skipped %s pairs due to errors: %s", len(failed_pairs), ",".join(failed_pairs))
 
         if best_snapshot:
             return best_pair, best_snapshot
