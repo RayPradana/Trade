@@ -31,8 +31,9 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `RISK_PER_TRADE` | Risiko per transaksi (0.01 = 1%) | `0.01` |
 | `DRY_RUN` | `true/false` untuk simulasi (set `false` untuk mode live) | `true` |
 | `RUN_ONCE` | Jalankan satu siklus lalu berhenti | `false` |
+| `REALTIME_MODE` | Aktifkan polling cepat untuk data hampir real-time (default 1s jika aktif) | `false` |
 | `MIN_CONFIDENCE` | Ambang kepercayaan minimum untuk eksekusi | `0.52` |
-| `INTERVAL_SECONDS` | Interval candlestick hasil agregasi trades | `300` |
+| `INTERVAL_SECONDS` | Interval candlestick hasil agregasi trades (default 1 detik bila `REALTIME_MODE=true`) | `300` |
 | `FAST_WINDOW` | Periode MA cepat | `12` |
 | `SLOW_WINDOW` | Periode MA lambat | `48` |
 | `MAX_SLIPPAGE_PCT` | Batas slippage relatif | `0.001` |
@@ -66,6 +67,15 @@ RUN_ONCE=true DRY_RUN=true python main.py
 
 ```bash
 DRY_RUN=false INDODAX_KEY=your_api_key python main.py
+```
+
+### Mode hampir real-time (polling 1 detik)
+
+- Set `REALTIME_MODE=true` agar `INTERVAL_SECONDS` default menjadi 1 detik (bisa diubah jika dibutuhkan).
+- Contoh:
+
+```bash
+REALTIME_MODE=true DRY_RUN=true python main.py
 ```
 
 Opsi penting:

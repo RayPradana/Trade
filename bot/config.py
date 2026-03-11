@@ -39,6 +39,7 @@ class BotConfig:
     risk_per_trade: float = 0.01  # 1% default
     dry_run: bool = True
     run_once: bool = False
+    real_time: bool = False
     min_confidence: float = 0.52
     interval_seconds: int = 300
     fast_window: int = 12
@@ -56,6 +57,8 @@ class BotConfig:
         _load_dotenv()
         pairs_env = os.getenv("TRADE_PAIRS")
         scan_pairs = [p.strip().lower() for p in pairs_env.split(",")] if pairs_env else None
+        real_time = os.getenv("REALTIME_MODE", os.getenv("REAL_TIME", "false")).lower() in {"1", "true", "yes"}
+        interval_default = "1" if real_time else "300"
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
@@ -64,8 +67,9 @@ class BotConfig:
             risk_per_trade=float(os.getenv("RISK_PER_TRADE", "0.01")),
             dry_run=os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"},
             run_once=os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"},
+            real_time=real_time,
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
-            interval_seconds=int(os.getenv("INTERVAL_SECONDS", "300")),
+            interval_seconds=int(os.getenv("INTERVAL_SECONDS", interval_default)),
             fast_window=int(os.getenv("FAST_WINDOW", "12")),
             slow_window=int(os.getenv("SLOW_WINDOW", "48")),
             max_slippage_pct=float(os.getenv("MAX_SLIPPAGE_PCT", "0.001")),
