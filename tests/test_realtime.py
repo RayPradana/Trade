@@ -359,3 +359,77 @@ class CentrifugeProtocolTests(unittest.TestCase):
         from bot.realtime import INDODAX_WS_TOKEN
         feed = self._make_feed()
         self.assertEqual(feed._websocket_token, INDODAX_WS_TOKEN)
+
+
+class StaleFeedTests(unittest.TestCase):
+    """Tests for stale WS data detection."""
+
+    def _make_feed(self, pairs=None):
+        class _Stub:
+            def get_summaries(self):
+                return {}
+        return MultiPairFeed(
+            pairs=pairs or ["btc_idr", "eth_idr"],
+            client=_Stub(),
+            websocket_url=None,
+            websocket_enabled=False,
+        )
+
+    def test_not_stale_when_ws_never_updated(self):
+        """is_ws_stale returns False when WS has never received any data."""
+        feed = self._make_feed()
+        self.assertFalse(feed.is_ws_stale(threshold_seconds=5.0))
+
+    def test_stale_after_threshold_exceeded(self):
+        """is_ws_stale returns True after an update older than the threshold."""
+        import time
+        feed = self._make_feed()
+        feed._apply_ws_message_for_pair("btc_idr", {"last": "100"})
+        # Fake the timestamp to be 200s ago
+        feed._last_ws_update = time.time() - 200
+        self.assertTrue(feed.is_ws_stale(threshold_seconds=120.0))
+
+    def test_not_stale_within_threshold(self):
+        """is_ws_stale returns False right after an update."""
+        feed = self._make_feed()
+        feed._apply_ws_message_for_pair("btc_idr", {"last": "100"})
+        self.assertFalse(feed.is_ws_stale(threshold_seconds=120.0))
+
+    def test_last_ws_update_set_on_apply(self):
+        """_last_ws_update is set when _apply_ws_message_for_pair is called."""
+        import time
+        feed = self._make_feed()
+        before = time.time()
+        feed._apply_ws_message_for_pair("btc_idr", {"last": "100"})
+        after = time.time()
+        self.assertIsNotNone(feed._last_ws_update)
+        self.assertGreaterEqual(feed._last_ws_update, before)
+        self.assertLessEqual(feed._last_ws_update, after)
+
+
+class PrivateFeedImportTest(unittest.TestCase):
+    """Smoke-tests that PrivateFeed can be imported and instantiated."""
+
+    def test_import(self):
+        from bot.realtime import PrivateFeed
+        self.assertTrue(callable(PrivateFeed))
+
+    def test_start_stop_without_ws(self):
+        """PrivateFeed.start/stop must not crash when websocket is unavailable."""
+        import bot.realtime as rt_mod
+        original_ws = rt_mod.websocket
+        rt_mod.websocket = None
+        try:
+            from bot.realtime import PrivateFeed
+
+            class _Stub:
+                def generate_private_ws_token(self):
+                    return {"connToken": "tok", "channel": "pws:#abc"}
+
+            feed = PrivateFeed(client=_Stub())
+            feed.start()
+            import time as _t
+            _t.sleep(0.05)
+            feed.stop()
+        finally:
+            rt_mod.websocket = original_ws

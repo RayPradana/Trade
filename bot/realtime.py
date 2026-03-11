@@ -20,6 +20,9 @@ _WS_BACKOFF_MAX = 60.0      # ceiling for exponential back-off
 # Official Indodax market-data WebSocket endpoint and public static token.
 # These are published in the official API docs:
 # https://github.com/btcid/indodax-official-api-docs/blob/master/Marketdata-websocket.md
+# The token is intentionally public (shared by all clients). It contains an
+# exp claim in the far future (~2031) and must NOT be confused with the
+# user-specific private WS token obtained from /api/private_ws/v1/generate_token.
 INDODAX_WS_URL = "wss://ws3.indodax.com/ws/"
 INDODAX_WS_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
@@ -269,6 +272,9 @@ class MultiPairFeed:
         self._key_to_pair: Dict[str, str] = {
             p.replace("_", ""): p for p in self._pairs
         }
+        # Timestamp of the last WebSocket message that updated the cache.
+        # Used by :meth:`is_ws_stale` to detect a silent disconnect.
+        self._last_ws_update: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -285,6 +291,16 @@ class MultiPairFeed:
         with self._lock:
             return bool(self._cache)
 
+    def is_ws_stale(self, threshold_seconds: float = 120.0) -> bool:
+        """Return ``True`` when no WS ticker update has been received within *threshold_seconds*.
+
+        Returns ``False`` when the WebSocket feed was never started (REST-only mode).
+        """
+        with self._lock:
+            if self._last_ws_update is None:
+                return False  # WS never received data — not considered stale
+            return (time.time() - self._last_ws_update) > threshold_seconds
+
     def _apply_ws_message_for_pair(self, pair: str, ticker: Dict[str, Any]) -> None:
         """Update the cache for *pair* with *ticker* data.
 
@@ -294,6 +310,7 @@ class MultiPairFeed:
         """
         with self._lock:
             self._cache[pair] = ticker
+            self._last_ws_update = time.time()
 
     def start(self) -> None:
         """Seed the cache and start background refresh threads."""
@@ -313,6 +330,18 @@ class MultiPairFeed:
             )
             t.start()
             self._threads.append(t)
+            # Always run a companion REST-polling thread even when WebSocket is
+            # active.  It detects WS stale conditions and keeps the cache fresh
+            # when the WS connection is silent for longer than the summaries
+            # interval.  The polling interval is deliberately slower than the
+            # public API rate limit (180 req/min) to avoid contributing to 429s.
+            poll_t = threading.Thread(
+                target=self._run_stale_aware_polling,
+                daemon=True,
+                name="MultiPairFeed-stale-poll",
+            )
+            poll_t.start()
+            self._threads.append(poll_t)
         else:
             t = threading.Thread(
                 target=self._run_summaries_polling,
@@ -359,8 +388,29 @@ class MultiPairFeed:
             logger.debug("MultiPairFeed: summaries fetch failed", exc_info=True)
 
     def _run_summaries_polling(self) -> None:
-        """Periodically refresh ticker cache from /api/summaries (skip initial – already done in start)."""
+        """Periodically refresh ticker cache from /api/summaries.
+
+        When the WebSocket feed is enabled but has gone stale the polling
+        interval is halved so the REST fallback keeps the cache fresh.
+        """
         while not self._stop.wait(self._summaries_interval):
+            self._update_from_summaries()
+
+    def _run_stale_aware_polling(self) -> None:
+        """Companion REST poller that activates when the WebSocket feed goes stale.
+
+        Polls ``/api/summaries`` at the normal interval *and* triggers an
+        immediate refresh whenever the WS has been silent for longer than
+        ``_summaries_interval`` seconds (a sign of a silent disconnect).
+        """
+        while not self._stop.wait(self._summaries_interval):
+            stale = self.is_ws_stale(self._summaries_interval)
+            if stale:
+                logger.warning(
+                    "MultiPairFeed: WS data is stale (no update in ≥%.0fs) — "
+                    "refreshing from REST summaries",
+                    self._summaries_interval,
+                )
             self._update_from_summaries()
 
     # ------------------------------------------------------------------
@@ -510,3 +560,169 @@ class MultiPairFeed:
                 len(updates),
             )
 
+
+
+# ---------------------------------------------------------------------------
+# Private WebSocket feed (order updates)
+# ---------------------------------------------------------------------------
+
+_PRIVATE_WS_URL = "wss://pws.indodax.com/ws/?cf_ws_frame_ping_pong=true"
+
+
+class PrivateFeed:
+    """Real-time private order-update feed using the Indodax Private WebSocket.
+
+    Connects to ``wss://pws.indodax.com/ws/`` and subscribes to the user's
+    private channel to receive order-fill and status-change events.
+
+    Usage::
+
+        def on_order(event: dict) -> None:
+            print(event)  # {"eventType": "order_update", "order": {...}}
+
+        feed = PrivateFeed(client=trader.client, on_order_update=on_order)
+        feed.start()   # non-blocking; runs in a daemon thread
+        …
+        feed.stop()
+
+    The *on_order_update* callback is called from the WS reader thread with
+    each ``order_update`` event dict from the ``pub.data`` list.  Keep it
+    fast and non-blocking.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        on_order_update: Optional[Any] = None,
+        *,
+        ws_url: str = _PRIVATE_WS_URL,
+    ) -> None:
+        self._client = client
+        self._on_order_update = on_order_update
+        self._ws_url = ws_url
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the private feed in a background daemon thread."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="PrivateFeed-ws",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the background thread to stop and wait for it."""
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _run(self) -> None:
+        backoff = _WS_BACKOFF_INITIAL
+        while not self._stop.is_set():
+            try:
+                token_info = self._client.generate_private_ws_token()
+                conn_token = token_info["connToken"]
+                channel = token_info["channel"]
+            except Exception as exc:
+                logger.warning("PrivateFeed: could not obtain WS token: %s", exc)
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, _WS_BACKOFF_MAX)
+                continue
+
+            backoff = _WS_BACKOFF_INITIAL  # reset on successful token fetch
+            self._connect_once(conn_token, channel)
+
+            if self._stop.is_set():
+                break
+            logger.warning(
+                "PrivateFeed: disconnected; reconnecting in %.0fs …", backoff
+            )
+            self._stop.wait(backoff)
+            backoff = min(backoff * 2, _WS_BACKOFF_MAX)
+
+    def _connect_once(self, conn_token: str, channel: str) -> None:
+        """Open one WS connection, authenticate, subscribe and block until close."""
+        if websocket is None:
+            logger.warning("PrivateFeed: websocket-client not installed; cannot connect")
+            return
+
+        auth_msg = json.dumps({"connect": {"token": conn_token}, "id": 1})
+        subscribe_msg = json.dumps({"subscribe": {"channel": channel}, "id": 2})
+
+        def _on_open(ws: Any) -> None:
+            logger.info("PrivateFeed: WS connected")
+            try:
+                ws.send(auth_msg)
+            except Exception:
+                logger.debug("PrivateFeed: auth send failed", exc_info=True)
+
+        def _on_message(_ws: Any, message: str) -> None:
+            try:
+                parsed = json.loads(message)
+                if not isinstance(parsed, dict):
+                    return
+
+                # Auth confirmation → send subscribe
+                if parsed.get("id") == 1 and "connect" in parsed:
+                    try:
+                        _ws.send(subscribe_msg)
+                        logger.debug("PrivateFeed: subscribed to %s", channel)
+                    except Exception:
+                        logger.debug("PrivateFeed: subscribe send failed", exc_info=True)
+                    return
+
+                # Order update push
+                # Format: {"push":{"channel":"pws:#...","pub":{"data":[{"eventType":"order_update","order":{...}}]}}}
+                push = parsed.get("push", {})
+                pub = push.get("pub", {})
+                data_list = pub.get("data", [])
+                if not isinstance(data_list, list):
+                    return
+                for event in data_list:
+                    if isinstance(event, dict) and event.get("eventType") == "order_update":
+                        if self._on_order_update:
+                            try:
+                                self._on_order_update(event)
+                            except Exception:
+                                logger.debug(
+                                    "PrivateFeed: on_order_update callback error",
+                                    exc_info=True,
+                                )
+            except Exception:
+                logger.debug("PrivateFeed: message parse error", exc_info=True)
+
+        def _on_error(_: Any, error: Any) -> None:
+            logger.debug("PrivateFeed: WS error: %s", error)
+
+        def _on_close(_: Any, code: Any, msg: Any) -> None:
+            logger.info("PrivateFeed: WS closed (code=%s)", code)
+
+        ws_app = websocket.WebSocketApp(
+            self._ws_url,
+            on_open=_on_open,
+            on_message=_on_message,
+            on_error=_on_error,
+            on_close=_on_close,
+        )
+        wst = threading.Thread(
+            target=ws_app.run_forever,
+            kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
+            daemon=True,
+        )
+        wst.start()
+        wst.join(timeout=30.0)
+        if wst.is_alive():
+            logger.debug("PrivateFeed: WS thread did not finish within timeout")

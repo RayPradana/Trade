@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 import signal
 import sys
 import threading
 import time
+from typing import Optional
 
 import requests
 
@@ -104,18 +106,72 @@ class _ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 
-def configure_logging() -> None:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
+def configure_logging(log_file: Optional[str] = None) -> None:
+    """Configure root logger with a coloured console handler.
+
+    When *log_file* is provided an additional plain-text :class:`FileHandler`
+    is attached so every log record is written to both the terminal and the
+    file simultaneously.  The file is opened in *append* mode so restarting
+    the bot does not overwrite previous runs.
+    """
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(
         _ColoredFormatter(
             fmt=f"{_DIM}%(asctime)s{_RESET} [%(levelname)s] {_CYAN}%(name)s{_RESET}: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    handlers: list = [console_handler]
+
+    if log_file:
+        try:
+            # Ensure parent directory exists
+            log_dir = os.path.dirname(os.path.abspath(log_file))
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setFormatter(
+                logging.Formatter(
+                    fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            handlers.append(file_handler)
+        except OSError as exc:
+            # Don't crash if the log file can't be created; just warn.
+            logging.basicConfig(level=logging.INFO, handlers=[console_handler])
+            logging.warning("Could not open log file '%s': %s", log_file, exc)
+            return
+
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
 
 
-# ── Section separators ───────────────────────────────────────────────────
+# ── Telegram notifications ───────────────────────────────────────────────
+
+def _send_telegram(token: str, chat_id: str, text: str) -> None:
+    """Send a plain-text message to a Telegram chat via the Bot API.
+
+    Failures are logged as warnings and never propagated — notifications are
+    best-effort and must not interrupt the trading loop.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+        if not resp.ok:
+            logging.warning(
+                "Telegram notification failed (HTTP %d): %s", resp.status_code, resp.text[:200]
+            )
+    except Exception as exc:
+        logging.warning("Telegram notification error: %s", exc)
+
+
+def _notify(config: BotConfig, text: str) -> None:
+    """Send a Telegram notification when the bot is configured to do so."""
+    if config.telegram_token and config.telegram_chat_id:
+        _send_telegram(config.telegram_token, config.telegram_chat_id, text)
 
 def _separator(label: str = "") -> str:
     ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -488,9 +544,10 @@ def _log_holding(pair: str, price: float, portfolio: dict,
 
 
 def main() -> None:
-    configure_logging()
-
+    configure_logging()  # early bootstrap logging before config is available
     config = BotConfig.from_env()
+    configure_logging(log_file=config.log_file)  # re-configure with file handler if set
+
     if not config.dry_run:
         config.require_auth()
 
@@ -573,6 +630,13 @@ def main() -> None:
                         held_price,
                     )
                     _log_portfolio(portfolio, config.initial_capital)
+                    _notify(
+                        config,
+                        f"📤 EXIT {pair} @ Rp {held_price:,.0f}\n"
+                        f"Reason: {exit_reason}\n"
+                        f"Amount: {force_outcome.get('amount', 0):.8f}\n"
+                        f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
+                    )
                     consecutive_errors = 0
                     # single-trade mode: one complete cycle (buy → sell) is enough
                     if config.trade_mode == "single" and _entered_position:
@@ -600,6 +664,19 @@ def main() -> None:
             _log_outcome(outcome)
             portfolio = trader.tracker.as_dict(snapshot["price"])
             _log_portfolio(portfolio, config.initial_capital)
+
+            # Telegram notification for actionable outcomes
+            _out_action = outcome.get("action", "hold")
+            _out_status = outcome.get("status", "")
+            if _out_action in ("buy", "sell") and _out_status in ("simulated", "placed"):
+                _notify(
+                    config,
+                    f"{'📈 BUY' if _out_action == 'buy' else '📉 SELL'} "
+                    f"{snapshot['pair']} @ Rp {snapshot['price']:,.0f}\n"
+                    f"Amount: {outcome.get('amount', 0):.8f}\n"
+                    f"Status: {_out_status}\n"
+                    f"Equity: Rp {portfolio['equity']:,.2f}",
+                )
 
             consecutive_errors = 0
             scan_cycles += 1
@@ -646,6 +723,7 @@ def main() -> None:
             # Cap the exponent so the computed delay doesn't grow beyond _max_backoff.
             # Without this cap the multiplication could produce a very large intermediate
             # value even though min() would ultimately clamp it.
+            # 2^10 = 1024 s, which is well above the _max_backoff ceiling of 300 s.
             exponent = min(consecutive_errors - 1, 10)
             backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(

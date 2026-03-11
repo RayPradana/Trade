@@ -1042,3 +1042,65 @@ class InsufficientDataTests(unittest.TestCase):
         config = BotConfig(api_key=None)
         self.assertEqual(config.trade_count, 1000)
         self.assertEqual(config.min_candles, 20)
+
+
+class MinVolumeFilterTests(unittest.TestCase):
+    """Tests that MIN_VOLUME_IDR correctly filters low-volume pairs from the scan."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def _make_snapshot(self, pair: str, action: str = "buy", conf: float = 0.9) -> dict:
+        return {
+            "pair": pair,
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=conf,
+                reason="test",
+                target_price=100,
+                amount=0.1,
+                stop_loss=90,
+                take_profit=110,
+            ),
+        }
+
+    def test_low_volume_pair_is_skipped(self) -> None:
+        """A pair whose 24-h volume is below min_volume_idr must be skipped."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        config = BotConfig(
+            api_key=None,
+            min_volume_idr=1_000_000.0,
+            scan_request_delay=0.0,
+            pairs_per_cycle=0,
+        )
+        snapshots = {
+            "btc_idr": self._make_snapshot("btc_idr", "buy", 0.9),
+            "low_idr": self._make_snapshot("low_idr", "buy", 0.95),
+        }
+
+        trader = AutoPairsTrader(config, snapshots)
+        feed = MultiPairFeed(
+            list(snapshots), mock.MagicMock(), websocket_enabled=False, summaries_interval=9999
+        )
+        # btc_idr has high volume; low_idr has none
+        feed._apply_ws_message_for_pair("btc_idr", {"last": "500000000", "vol_idr": "5000000000"})
+        feed._apply_ws_message_for_pair("low_idr", {"last": "100", "vol_idr": "0"})
+        trader._multi_feed = feed
+
+        with mock.patch("bot.trader.time.sleep"):
+            chosen_pair, _ = trader.scan_and_choose()
+        # low_idr volume is 0 < 1_000_000 → must be filtered out
+        self.assertEqual(chosen_pair, "btc_idr")

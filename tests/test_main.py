@@ -339,3 +339,63 @@ class AccountInfoDisplayTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class LoggingTests(unittest.TestCase):
+    """Tests for file logging and Telegram notification helpers."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def tearDown(self) -> None:
+        # Clean up any file handlers added by configure_logging
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            h.close()
+
+    def test_configure_logging_no_file(self):
+        """configure_logging() without log_file should not add a FileHandler."""
+        main.configure_logging(log_file=None)
+        root = logging.getLogger()
+        file_handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+        self.assertEqual(len(file_handlers), 0)
+
+    def test_configure_logging_with_file(self):
+        """configure_logging() with a valid log_file should add a FileHandler."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tmp:
+            path = tmp.name
+        try:
+            main.configure_logging(log_file=path)
+            root = logging.getLogger()
+            file_handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+            self.assertGreater(len(file_handlers), 0)
+        finally:
+            os.unlink(path)
+
+    def test_notify_sends_telegram_when_configured(self):
+        """_notify should call _send_telegram when token+chat_id are set."""
+        from bot.config import BotConfig
+        config = BotConfig(
+            api_key=None,
+            telegram_token="tok123",
+            telegram_chat_id="chat456",
+        )
+        with unittest.mock.patch("main._send_telegram") as mock_send:
+            main._notify(config, "test message")
+            mock_send.assert_called_once_with("tok123", "chat456", "test message")
+
+    def test_notify_does_nothing_without_token(self):
+        """_notify must not call _send_telegram when telegram_token is None."""
+        from bot.config import BotConfig
+        config = BotConfig(api_key=None)
+        with unittest.mock.patch("main._send_telegram") as mock_send:
+            main._notify(config, "ignored")
+            mock_send.assert_not_called()
+
+    def test_send_telegram_handles_request_error(self):
+        """_send_telegram must not propagate network errors."""
+        with unittest.mock.patch("requests.post", side_effect=OSError("no network")):
+            # Should not raise
+            main._send_telegram("tok", "chat", "msg")

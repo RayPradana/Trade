@@ -749,6 +749,30 @@ class Trader:
         # stay at the end.
         pairs = self._sort_pairs_by_priority(pairs)
 
+        # ── Minimum volume filter ─────────────────────────────────────────
+        # Skip pairs whose 24-h IDR trading volume is below the configured
+        # threshold so the scan focuses only on liquid instruments.
+        low_volume_pairs: List[str] = []
+        if self.config.min_volume_idr > 0:
+            filtered: List[str] = []
+            for p in pairs:
+                if self._pair_volume(p) >= self.config.min_volume_idr:
+                    filtered.append(p)
+                else:
+                    low_volume_pairs.append(p)
+            pairs = filtered
+            if not pairs:
+                # All pairs below threshold — fall back to unfiltered list to
+                # avoid analysing nothing.
+                logger.warning(
+                    "All %d pairs are below MIN_VOLUME_IDR=%.0f; ignoring filter for this cycle",
+                    len(low_volume_pairs),
+                    self.config.min_volume_idr,
+                )
+                pairs = self._sort_pairs_by_priority(
+                    self._all_pairs or [self.config.pair]
+                )
+
         best_pair = pairs[0] if pairs else self.config.pair
         best_snapshot: Optional[Dict[str, Any]] = None
         best_score = -1.0
@@ -834,6 +858,13 @@ class Trader:
                 "Skipped %d pairs not in feed cache: %s",
                 len(skipped_pairs),
                 ",".join(skipped_pairs[:10]) + ("…" if len(skipped_pairs) > 10 else ""),
+            )
+
+        if low_volume_pairs:
+            logger.debug(
+                "Skipped %d pairs below MIN_VOLUME_IDR=%.0f",
+                len(low_volume_pairs),
+                self.config.min_volume_idr,
             )
 
         if failed_pairs:

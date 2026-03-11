@@ -9,18 +9,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .rate_limit import RateLimitedOrderQueue
-
-# Mapping of Indodax OHLC timeframe strings to seconds.
-_OHLC_TF_SECONDS: Dict[str, int] = {
-    "1": 60,
-    "15": 900,
-    "30": 1800,
-    "60": 3600,
-    "240": 14400,
-    "1D": 86400,
-    "3D": 259200,
-    "1W": 604800,
-}
+from .analysis import _TF_SECONDS as _OHLC_TF_SECONDS  # shared timeframe → seconds map
 
 
 class IndodaxClient:
@@ -105,6 +94,43 @@ class IndodaxClient:
 
     def trade_history(self, pair: str, count: int = 50) -> Dict[str, Any]:
         return self._post_private("tradeHistory", {"pair": pair, "count": count})
+
+    def generate_private_ws_token(self) -> Dict[str, str]:
+        """Request a Private WebSocket connection token and channel identifier.
+
+        Calls ``POST /api/private_ws/v1/generate_token`` as documented at:
+        https://github.com/btcid/indodax-official-api-docs/blob/master/Private-websocket.md
+
+        :returns: ``{"connToken": "...", "channel": "pws:#..."}``
+        :raises ValueError: when API key/secret are not set.
+        :raises RuntimeError: when the API returns a non-success response.
+        """
+        if not self.api_key:
+            raise ValueError("API key is required for private WebSocket token")
+        if not self.api_secret:
+            raise ValueError("API secret is required for private WebSocket token")
+
+        request_body = f"client=tapi&tapi_key={self.api_key}"
+        sign = hmac.new(
+            self.api_secret.encode("utf-8"),
+            request_body.encode("utf-8"),
+            hashlib.sha512,
+        ).hexdigest()
+        headers = {
+            "Sign": sign,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        response = self.session.post(
+            f"{self.base_url}/api/private_ws/v1/generate_token",
+            data=request_body,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        data = self._handle_response(response)
+        ret = data.get("return") if isinstance(data, dict) else None
+        if not ret or not ret.get("connToken"):
+            raise RuntimeError(f"Failed to obtain private WS token: {data}")
+        return {"connToken": ret["connToken"], "channel": ret["channel"]}
 
     def create_order(self, pair: str, order_type: str, price: float, amount: float) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": f"{price:.8f}"}

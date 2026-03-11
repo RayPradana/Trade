@@ -56,3 +56,69 @@ class ConfigRealTimeTest(TestCase):
         with patch.dict(os.environ, {"TRADE_MODE": "invalid"}, clear=True):
             with self.assertRaises(ValueError):
                 BotConfig.from_env()
+
+
+class NewConfigFieldsTest(TestCase):
+    def test_min_volume_idr_default(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_volume_idr, 0.0)
+
+    def test_min_volume_idr_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MIN_VOLUME_IDR": "500000000"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.min_volume_idr, 500_000_000.0)
+
+    def test_min_volume_idr_negative_raises(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MIN_VOLUME_IDR": "-1"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_log_file_default_none(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertIsNone(cfg.log_file)
+
+    def test_log_file_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"LOG_FILE": "/tmp/bot.log"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.log_file, "/tmp/bot.log")
+
+    def test_telegram_fields_default_none(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertIsNone(cfg.telegram_token)
+            self.assertIsNone(cfg.telegram_chat_id)
+
+    def test_telegram_fields_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ,
+                        {"TELEGRAM_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "456"},
+                        clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.telegram_token, "123:abc")
+            self.assertEqual(cfg.telegram_chat_id, "456")
+
+    def test_ws_stale_threshold_default(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.ws_stale_threshold, 120.0)
+
+    def test_ws_stale_threshold_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"WS_STALE_THRESHOLD": "60"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.ws_stale_threshold, 60.0)
+
+    def test_ws_stale_threshold_zero_raises(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"WS_STALE_THRESHOLD": "0"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()

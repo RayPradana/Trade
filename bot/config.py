@@ -68,6 +68,24 @@ class BotConfig:
     trade_mode: str = "continuous"  # "single": one buy→sell cycle then stop; "continuous": 24/7
     state_path: Optional[Path] = None  # None = disabled; set via STATE_PATH env var to enable auto-resume
     state_backup_interval: int = 10  # save a backup copy every N scan cycles (0 = disabled)
+    # Minimum 24-h IDR trading volume a pair must have to be analysed.
+    # Pairs below this threshold are skipped during multi-pair scanning.
+    # Set to 0 to disable the filter (default).
+    min_volume_idr: float = 0.0
+    # Optional path to a log file.  When set, every log line is written to
+    # both stdout/stderr *and* this file.  Rotation is not handled here;
+    # use an external log-rotation daemon (logrotate / Docker logging driver)
+    # or set LOG_FILE to a new path on each restart.
+    log_file: Optional[str] = None
+    # Telegram bot integration – when both fields are set the bot sends a
+    # message to the specified chat whenever an order is placed/simulated or
+    # a portfolio stop fires.
+    telegram_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    # WebSocket stale-data threshold (seconds).  If the MultiPairFeed WS has
+    # not received any ticker update within this window the feed is considered
+    # stale and the REST summaries fallback is triggered immediately.
+    ws_stale_threshold: float = 120.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -119,6 +137,11 @@ class BotConfig:
             trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
             state_path=Path(os.getenv("STATE_PATH", "bot_state.json")),
             state_backup_interval=int(os.getenv("STATE_BACKUP_INTERVAL", "10")),
+            min_volume_idr=float(os.getenv("MIN_VOLUME_IDR", "0")),
+            log_file=os.getenv("LOG_FILE") or None,
+            telegram_token=os.getenv("TELEGRAM_TOKEN") or None,
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+            ws_stale_threshold=float(os.getenv("WS_STALE_THRESHOLD", "120")),
         )
         cfg._validate()
         return cfg
@@ -166,5 +189,9 @@ class BotConfig:
             raise ValueError("TRAILING_STOP_PCT must be non-negative")
         if self.state_backup_interval < 0:
             raise ValueError("STATE_BACKUP_INTERVAL must be non-negative")
+        if self.min_volume_idr < 0:
+            raise ValueError("MIN_VOLUME_IDR must be non-negative")
+        if self.ws_stale_threshold <= 0:
+            raise ValueError("WS_STALE_THRESHOLD must be positive")
         if not self.dry_run and not self.api_key:
             self.require_auth()
