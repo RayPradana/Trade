@@ -270,7 +270,7 @@ def make_trade_decision(
 
     # size based on risk per trade relative to stop distance
     risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
-    amount = _position_size(current_price, stop_loss, config, risk_per_unit, conf, vol)
+    amount = _position_size(current_price, stop_loss, config, risk_per_unit, conf, vol, effective_capital)
 
     return StrategyDecision(
         mode=mode,

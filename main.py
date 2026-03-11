@@ -466,6 +466,13 @@ def _log_portfolio(portfolio: dict, initial_capital: float = 0.0) -> None:
     trail    = portfolio.get("trailing_stop")
     t_equity = portfolio.get("target_equity", 0.0)
     m_equity = portfolio.get("min_equity", 0.0)
+    # Capital management fields
+    principal      = portfolio.get("principal", initial_capital)
+    profit_buffer  = portfolio.get("profit_buffer", 0.0)
+    eff_capital    = portfolio.get("effective_capital", principal)
+    pb_drawdown    = portfolio.get("profit_buffer_drawdown", 0.0)
+    # Trailing TP
+    trailing_tp    = portfolio.get("trailing_tp_stop")
 
     # unrealized = (equity - cash) - pos * avg_cost   [equity = cash + pos * mark_price]
     unrealized = (equity - cash) - pos * avg_cost if pos > 0 else 0.0
@@ -502,12 +509,29 @@ def _log_portfolio(portfolio: dict, initial_capital: float = 0.0) -> None:
         _BOLD, trades, _RESET,
         _GREEN if win_rate >= 0.5 else _RED, win_rate * 100, _RESET,
     )
+    # Capital management row: principal / profit buffer / effective capital
+    pb_str = (
+        f"{_GREEN}{_idr(profit_buffer)}{_RESET}"
+        if profit_buffer > 0
+        else f"{_DIM}Rp 0{_RESET}"
+    )
+    pb_dd_str = (
+        f"  {_RED}▼{pb_drawdown:.1%}{_RESET}" if pb_drawdown > 0 else ""
+    )
+    logging.info(
+        "   %s├─%s principal: %s    profit buf: %s%s    eff cap: %s",
+        _DIM, _RESET,
+        _idr(principal),
+        pb_str, pb_dd_str,
+        f"{_BOLD}{_idr(eff_capital)}{_RESET}",
+    )
     trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"    if trail    else f"{_DIM}—{_RESET}"
+    ttp_str    = f"{_GREEN}{_idr(trailing_tp)}{_RESET}" if trailing_tp else f"{_DIM}—{_RESET}"
     target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}"  if t_equity else f"{_DIM}—{_RESET}"
     floor_str  = f"{_RED}{_idr(m_equity)}{_RESET}"    if m_equity else f"{_DIM}—{_RESET}"
     logging.info(
-        "   %s└─%s trail    : %s    target : %s    floor : %s",
-        _DIM, _RESET, trail_str, target_str, floor_str,
+        "   %s└─%s trail    : %s  trail-TP: %s    target : %s    floor : %s",
+        _DIM, _RESET, trail_str, ttp_str, target_str, floor_str,
     )
 
 
@@ -670,6 +694,27 @@ def main() -> None:
                         )
 
                 # Exit if a hard stop fired or the strategy says sell.
+                # For target_profit_reached: give dynamic TP a chance to override.
+                if stop_reason == "target_profit_reached":
+                    dynamic_reason = trader.evaluate_dynamic_tp(held_snapshot)
+                    if dynamic_reason is None:
+                        # Dynamic TP says hold — log and continue monitoring
+                        trailing_tp_floor = trader.tracker.trailing_tp_stop
+                        logging.info(
+                            "🚀 %sDYNAMIC-TP%s  %s%s%s  · holding past TP%s",
+                            _BOLD, _RESET,
+                            _BOLD, pair, _RESET,
+                            f"  trailing_floor=Rp {trailing_tp_floor:,.2f}" if trailing_tp_floor else "",
+                        )
+                        portfolio = trader.tracker.as_dict(held_price)
+                        _log_portfolio(portfolio, config.initial_capital)
+                        consecutive_errors = 0
+                        if config.run_once:
+                            break
+                        time.sleep(config.position_check_interval_seconds)
+                        continue
+                    stop_reason = dynamic_reason  # use the resolved reason for exit
+
                 should_exit = stop_reason is not None or held_decision.action == "sell"
 
                 if should_exit:

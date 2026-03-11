@@ -69,6 +69,11 @@ class PortfolioTracker:
         self.partial_tp_taken: bool = False
         # Profit-buffer compounding: track the peak profit buffer for drawdown guard.
         self._peak_profit_buffer: float = 0.0
+        # Trailing take-profit: activates once price crosses the initial TP level and
+        # trailing_tp_pct > 0.  Tracks a floor price that rises with the market.
+        self._tp_activated: bool = False
+        self._trailing_tp_stop: Optional[float] = None
+        self._trailing_tp_peak: Optional[float] = None
 
     @property
     def profit_buffer(self) -> float:
@@ -136,6 +141,40 @@ class PortfolioTracker:
                 # Reset trailing stop when position is fully closed
                 self._trailing_stop = None
                 self._peak_price = None
+                # Reset trailing TP state for the next trade
+                self._tp_activated = False
+                self._trailing_tp_stop = None
+                self._trailing_tp_peak = None
+
+    def activate_trailing_tp(self, mark_price: float, trailing_tp_pct: float) -> None:
+        """Activate or tighten the trailing take-profit floor.
+
+        Call this every tick once the position's equity has crossed the initial
+        TP target.  The trailing floor rises with the price but never falls, so
+        profits are locked in progressively.
+
+        :param mark_price: Current market price.
+        :param trailing_tp_pct: Distance below the peak price to place the
+            floor, expressed as a fraction (e.g. ``0.01`` = 1% below peak).
+        """
+        if trailing_tp_pct <= 0 or self.base_position <= 0:
+            return
+        self._tp_activated = True
+        if self._trailing_tp_peak is None or mark_price > self._trailing_tp_peak:
+            self._trailing_tp_peak = mark_price
+        new_stop = self._trailing_tp_peak * (1 - trailing_tp_pct)
+        if self._trailing_tp_stop is None or new_stop > self._trailing_tp_stop:
+            self._trailing_tp_stop = new_stop
+
+    @property
+    def trailing_tp_stop(self) -> Optional[float]:
+        """Current trailing take-profit floor price, or ``None`` when not active."""
+        return self._trailing_tp_stop
+
+    @property
+    def tp_activated(self) -> bool:
+        """``True`` once the initial TP level has been reached in the current position."""
+        return self._tp_activated
 
     def update_trailing_stop(self, mark_price: float, trailing_pct: float) -> None:
         """Update the trailing stop based on the current market price.
@@ -196,11 +235,28 @@ class PortfolioTracker:
         ppb = state.get("peak_profit_buffer")
         if ppb is not None:
             self._peak_profit_buffer = float(ppb)
+        # Restore trailing TP state
+        tp_act = state.get("tp_activated")
+        if tp_act is not None:
+            self._tp_activated = bool(tp_act)
+        ttp_stop = state.get("trailing_tp_stop")
+        if ttp_stop is not None:
+            self._trailing_tp_stop = float(ttp_stop)
+        ttp_peak = state.get("trailing_tp_peak")
+        if ttp_peak is not None:
+            self._trailing_tp_peak = float(ttp_peak)
         # target/min equity recomputed from initial_capital to keep guard consistent
 
     def stop_reason(self, mark_price: float) -> Optional[str]:
         snap = self.snapshot(mark_price)
+        # Trailing TP: if floor is active and price fell below it, take profit
+        if self._trailing_tp_stop is not None and mark_price <= self._trailing_tp_stop:
+            return "trailing_tp_triggered"
         if snap.equity >= self.target_equity:
+            # When the trailing TP is already active, hold — the trailing
+            # floor protects profits while letting the position run.
+            if self._trailing_tp_stop is not None:
+                return None
             return "target_profit_reached"
         if snap.equity <= snap.min_equity:
             return "max_loss_reached"
@@ -242,6 +298,9 @@ class PortfolioTracker:
             "effective_capital": self.effective_capital(),
             "peak_profit_buffer": self._peak_profit_buffer,
             "profit_buffer_drawdown": round(self.profit_buffer_drawdown_pct(), 4),
+            # Trailing TP
+            "tp_activated": self._tp_activated,
+            "trailing_tp_stop": self._trailing_tp_stop,
         }
 
     def to_state(self) -> Dict[str, object]:
@@ -262,6 +321,10 @@ class PortfolioTracker:
             "last_sell_time": self.last_sell_time,
             "partial_tp_taken": self.partial_tp_taken,
             "peak_profit_buffer": self._peak_profit_buffer,
+            # Trailing TP
+            "tp_activated": self._tp_activated,
+            "trailing_tp_stop": self._trailing_tp_stop,
+            "trailing_tp_peak": self._trailing_tp_peak,
         }
 
     # ── Daily loss cap helpers ────────────────────────────────────────────

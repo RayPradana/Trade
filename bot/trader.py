@@ -531,6 +531,7 @@ class Trader:
             decision = make_trade_decision(
                 trend, orderbook, vol, price, self.config, levels, indicators,
                 mtf=mtf, whale=whale, spoofing=spoofing,
+                effective_capital=self.tracker.effective_capital(),
             )
             # Apply correlated-pair confidence boost when reference trend aligns
             if reference_trend == "up" and decision.action == "buy":
@@ -620,6 +621,21 @@ class Trader:
                 return {
                     "status": "skipped",
                     "reason": f"portfolio_risk_cap {portfolio_risk_pct:.2%} ≥ {self.config.max_portfolio_risk_pct:.2%}",
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
+        # ── Profit-buffer drawdown guard ──────────────────────────────────────
+        if self.config.profit_buffer_drawdown_pct > 0 and decision.action == "buy":
+            pb_drawdown = self.tracker.profit_buffer_drawdown_pct()
+            if pb_drawdown >= self.config.profit_buffer_drawdown_pct:
+                logger.warning(
+                    "Profit-buffer drawdown guard: buffer dropped %.1f%% from peak (limit=%.1f%%) — skipping buy",
+                    pb_drawdown * 100,
+                    self.config.profit_buffer_drawdown_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"profit_buffer_drawdown {pb_drawdown:.2%} ≥ {self.config.profit_buffer_drawdown_pct:.2%}",
                     "portfolio": self.tracker.as_dict(price),
                 }
 
@@ -896,6 +912,98 @@ class Trader:
         }
         self._persist_after_trade(pair)
         return outcome
+
+    def _conditions_allow_holding(self, snapshot: Dict[str, Any]) -> bool:
+        """Return ``True`` when market indicators suggest holding past the TP target.
+
+        Used by :meth:`evaluate_dynamic_tp` to decide whether to postpone
+        taking profit.  Returns ``True`` when all *configured* conditions pass
+        (any condition with a threshold of 0 is disabled and always passes).
+        """
+        config = self.config
+        trend = snapshot.get("trend")
+        orderbook = snapshot.get("orderbook")
+        indicators = snapshot.get("indicators")
+
+        # Trend strength must be strong enough to justify holding
+        if config.conditional_tp_min_trend_strength > 0:
+            strength = getattr(trend, "strength", 0.0) if trend else 0.0
+            if strength < config.conditional_tp_min_trend_strength:
+                return False
+
+        # Order-book must still show bullish imbalance
+        if config.conditional_tp_min_ob_imbalance > 0:
+            imbalance = getattr(orderbook, "imbalance", 0.0) if orderbook else 0.0
+            if imbalance < config.conditional_tp_min_ob_imbalance:
+                return False
+
+        # RSI must not be overbought
+        if config.conditional_tp_max_rsi > 0:
+            rsi = getattr(indicators, "rsi", 50.0) if indicators else 50.0
+            if rsi >= config.conditional_tp_max_rsi:
+                return False
+
+        return True
+
+    def evaluate_dynamic_tp(self, snapshot: Dict[str, Any]) -> Optional[str]:
+        """Decide what to do when equity has hit the take-profit target.
+
+        Called from the position-monitoring loop in ``main.py`` whenever
+        :meth:`~PortfolioTracker.stop_reason` returns
+        ``"target_profit_reached"``.
+
+        Returns
+        -------
+        ``"target_profit_reached"``
+            Close the position now — conditions don't support holding.
+        ``"trailing_tp_triggered"``
+            Close now — the trailing TP floor was hit.
+        ``None``
+            Hold — either trailing TP is active and price is above the floor,
+            or conditional checks say the trend is still bullish.
+        """
+        config = self.config
+        price = snapshot["price"]
+
+        # If neither feature is configured → standard TP behaviour (close now)
+        dynamic_tp_enabled = (
+            config.trailing_tp_pct > 0
+            or config.conditional_tp_min_trend_strength > 0
+            or config.conditional_tp_max_rsi > 0
+            or config.conditional_tp_min_ob_imbalance > 0
+        )
+        if not dynamic_tp_enabled:
+            return "target_profit_reached"
+
+        # If trailing TP is already active and price fell through the floor → close
+        if (
+            self.tracker.trailing_tp_stop is not None
+            and price <= self.tracker.trailing_tp_stop
+        ):
+            return "trailing_tp_triggered"
+
+        # Check whether market conditions allow holding
+        conditions_ok = self._conditions_allow_holding(snapshot)
+
+        if not conditions_ok:
+            # Conditions no longer support holding → take profit now
+            logger.debug(
+                "Conditional TP: conditions failed at price=%.2f — taking profit",
+                price,
+            )
+            return "target_profit_reached"
+
+        # Conditions still bullish — activate / advance the trailing TP floor
+        if config.trailing_tp_pct > 0:
+            self.tracker.activate_trailing_tp(price, config.trailing_tp_pct)
+            logger.debug(
+                "Dynamic TP: trailing floor updated to %.2f (price=%.2f)",
+                self.tracker.trailing_tp_stop or 0.0,
+                price,
+            )
+
+        # Hold the position — let profits run
+        return None
 
     def force_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """Sell the entire open base position at current market price.

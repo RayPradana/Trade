@@ -252,3 +252,45 @@ class NewFeaturesConfigTest(TestCase):
         with patch.dict(__import__("os").environ, {"MIN_LIQUIDITY_DEPTH_IDR": "50000000"}, clear=True):
             cfg = BotConfig.from_env()
             self.assertAlmostEqual(cfg.min_liquidity_depth_idr, 50_000_000.0)
+
+
+class DynamicTpConfigTest(TestCase):
+    def test_trailing_tp_defaults(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.trailing_tp_pct, 0.0)
+            self.assertEqual(cfg.conditional_tp_min_trend_strength, 0.0)
+            self.assertEqual(cfg.conditional_tp_min_ob_imbalance, 0.0)
+            self.assertEqual(cfg.conditional_tp_max_rsi, 0.0)
+
+    def test_trailing_tp_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"TRAILING_TP_PCT": "0.01"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.trailing_tp_pct, 0.01)
+
+    def test_conditional_tp_from_env(self):
+        from unittest.mock import patch
+        env = {
+            "CONDITIONAL_TP_MIN_TREND_STRENGTH": "0.4",
+            "CONDITIONAL_TP_MIN_OB_IMBALANCE": "0.1",
+            "CONDITIONAL_TP_MAX_RSI": "70",
+        }
+        with patch.dict(__import__("os").environ, env, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertAlmostEqual(cfg.conditional_tp_min_trend_strength, 0.4)
+            self.assertAlmostEqual(cfg.conditional_tp_min_ob_imbalance, 0.1)
+            self.assertAlmostEqual(cfg.conditional_tp_max_rsi, 70.0)
+
+    def test_trailing_tp_negative_invalid(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"TRAILING_TP_PCT": "-0.01"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()
+
+    def test_profit_buffer_drawdown_pct_boundary(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"PROFIT_BUFFER_DRAWDOWN_PCT": "1.0"}, clear=True):
+            with self.assertRaises(ValueError):
+                BotConfig.from_env()

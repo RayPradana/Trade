@@ -137,6 +137,27 @@ class BotConfig:
     # E.g. 0.3 = stop trading if profits drop 30% from their peak.
     # 0 = no protection (default).
     profit_buffer_drawdown_pct: float = 0.0
+    # ── Dynamic / trailing take-profit ───────────────────────────────────────
+    # When > 0, once price crosses the initial TP target the bot activates a
+    # trailing floor this far below the running peak price.  The position is
+    # only closed when price falls back through the floor, locking in the best
+    # available exit rather than a fixed 20%.
+    # E.g. 0.01 = trail 1% below the highest price since TP was hit.
+    trailing_tp_pct: float = 0.0
+    # Conditional TP: extra market-condition checks before closing at TP.
+    # If the conditions below are met the bot holds the position and waits
+    # (using the trailing TP if configured, or a bare hold if not).
+    # 0 = disabled (default).
+    #
+    # Hold past TP while trend strength >= this value (0 = disabled).
+    conditional_tp_min_trend_strength: float = 0.0
+    # Hold past TP while order-book imbalance (bid dominance) >= this value.
+    # Positive imbalance means more buy pressure; negative means sell pressure.
+    # E.g. 0.1 = hold only while bids dominate by at least 10%.  0 = disabled.
+    conditional_tp_min_ob_imbalance: float = 0.0
+    # Hold past TP while RSI < this threshold (not yet overbought).
+    # E.g. 70 = close only when RSI >= 70.  0 = disabled.
+    conditional_tp_max_rsi: float = 0.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -211,6 +232,10 @@ class BotConfig:
             max_portfolio_risk_pct=float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "0")),
             min_liquidity_depth_idr=float(os.getenv("MIN_LIQUIDITY_DEPTH_IDR", "0")),
             profit_buffer_drawdown_pct=float(os.getenv("PROFIT_BUFFER_DRAWDOWN_PCT", "0")),
+            trailing_tp_pct=float(os.getenv("TRAILING_TP_PCT", "0")),
+            conditional_tp_min_trend_strength=float(os.getenv("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0")),
+            conditional_tp_min_ob_imbalance=float(os.getenv("CONDITIONAL_TP_MIN_OB_IMBALANCE", "0")),
+            conditional_tp_max_rsi=float(os.getenv("CONDITIONAL_TP_MAX_RSI", "0")),
         )
         cfg._validate()
         return cfg
@@ -291,5 +316,9 @@ class BotConfig:
             raise ValueError("MIN_LIQUIDITY_DEPTH_IDR must be non-negative")
         if not (0.0 <= self.profit_buffer_drawdown_pct < 1.0):
             raise ValueError("PROFIT_BUFFER_DRAWDOWN_PCT must be in [0, 1)")
+        if self.trailing_tp_pct < 0:
+            raise ValueError("TRAILING_TP_PCT must be non-negative")
+        if self.conditional_tp_max_rsi < 0:
+            raise ValueError("CONDITIONAL_TP_MAX_RSI must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()

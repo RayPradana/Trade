@@ -1330,3 +1330,115 @@ class LiquidityDepthFilterTest(unittest.TestCase):
         outcome = trader.maybe_execute(snap)
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("thin_market", outcome["reason"])
+
+
+class EvaluateDynamicTpTest(unittest.TestCase):
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _snap(self, price=110.0, trend_strength=0.5, imbalance=0.2, rsi=60.0):
+        from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats, MomentumIndicators
+        trend = TrendResult(direction="up", strength=trend_strength, fast_ma=100.0, slow_ma=95.0)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=10.0, ask_volume=8.0, imbalance=imbalance)
+        indicators = MomentumIndicators(rsi=rsi, macd=1.0, macd_signal=0.5, macd_hist=0.5, bb_upper=115.0, bb_mid=105.0, bb_lower=95.0)
+        return {
+            "pair": "btc_idr",
+            "price": price,
+            "trend": trend,
+            "orderbook": ob,
+            "volatility": VolatilityStats(volatility=0.01, avg_volume=100.0),
+            "indicators": indicators,
+        }
+
+    def test_no_dynamic_tp_configured_returns_target_profit(self):
+        config = BotConfig(api_key=None, trailing_tp_pct=0.0)
+        trader = Trader(config)
+        result = trader.evaluate_dynamic_tp(self._snap())
+        self.assertEqual(result, "target_profit_reached")
+
+    def test_trailing_tp_activates_and_holds(self):
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        # Price at 110 — trailing TP not yet triggered (just activated)
+        result = trader.evaluate_dynamic_tp(self._snap(price=110.0))
+        self.assertIsNone(result)
+        # Trailing floor should be set at 110 * 0.98 = 107.8
+        self.assertAlmostEqual(trader.tracker.trailing_tp_stop, 107.8)
+
+    def test_trailing_tp_triggered_returns_correct_reason(self):
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        trader.tracker.activate_trailing_tp(120.0, 0.02)  # floor = 117.6
+        # Price falls below floor
+        result = trader.evaluate_dynamic_tp(self._snap(price=116.0))
+        self.assertEqual(result, "trailing_tp_triggered")
+
+    def test_conditional_tp_holds_when_conditions_met(self):
+        config = BotConfig(
+            api_key=None,
+            conditional_tp_min_trend_strength=0.3,
+            conditional_tp_max_rsi=80.0,
+        )
+        trader = Trader(config)
+        # Trend strength 0.5 > 0.3 and RSI 60 < 80 → hold
+        result = trader.evaluate_dynamic_tp(self._snap(trend_strength=0.5, rsi=60.0))
+        self.assertIsNone(result)
+
+    def test_conditional_tp_closes_when_rsi_overbought(self):
+        config = BotConfig(
+            api_key=None,
+            conditional_tp_max_rsi=70.0,
+        )
+        trader = Trader(config)
+        # RSI 75 >= 70 → overbought → close
+        result = trader.evaluate_dynamic_tp(self._snap(rsi=75.0))
+        self.assertEqual(result, "target_profit_reached")
+
+    def test_conditional_tp_closes_when_trend_weak(self):
+        config = BotConfig(
+            api_key=None,
+            conditional_tp_min_trend_strength=0.5,
+        )
+        trader = Trader(config)
+        # Trend strength 0.2 < 0.5 → close
+        result = trader.evaluate_dynamic_tp(self._snap(trend_strength=0.2))
+        self.assertEqual(result, "target_profit_reached")
+
+    def test_conditional_tp_closes_when_ob_imbalance_low(self):
+        config = BotConfig(
+            api_key=None,
+            conditional_tp_min_ob_imbalance=0.15,
+        )
+        trader = Trader(config)
+        # Imbalance 0.05 < 0.15 → sell pressure → close
+        result = trader.evaluate_dynamic_tp(self._snap(imbalance=0.05))
+        self.assertEqual(result, "target_profit_reached")
+
+    def test_effective_capital_used_in_position_sizing(self):
+        """After a profitable trade, effective_capital > initial_capital → larger position."""
+        from bot.strategies import make_trade_decision
+        from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats, MomentumIndicators
+        config = BotConfig(api_key=None, risk_per_trade=0.01, initial_capital=100_000.0)
+        tracker_base = PortfolioTracker(100_000.0, 0.2, 0.1)
+        tracker_rich = PortfolioTracker(100_000.0, 0.2, 0.1)
+        # Simulate rich tracker having 50k profit buffer
+        tracker_rich.record_trade("buy", 100.0, 1.0)
+        tracker_rich.record_trade("sell", 150_000.0, 1.0)  # +50k profit
+
+        trend = TrendResult(direction="up", strength=0.6, fast_ma=100.0, slow_ma=90.0)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=10.0, ask_volume=7.0, imbalance=0.3)
+        vol = VolatilityStats(volatility=0.01, avg_volume=100.0)
+        ind = MomentumIndicators(rsi=55.0, macd=1.0, macd_signal=0.5, macd_hist=0.5, bb_upper=110.0, bb_mid=100.0, bb_lower=90.0)
+
+        dec_base = make_trade_decision(trend, ob, vol, 100.0, config,
+                                       effective_capital=tracker_base.effective_capital())
+        dec_rich = make_trade_decision(trend, ob, vol, 100.0, config,
+                                       effective_capital=tracker_rich.effective_capital())
+
+        # Rich tracker has larger effective capital → bigger position size
+        self.assertGreater(dec_rich.amount, dec_base.amount)
