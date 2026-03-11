@@ -45,6 +45,7 @@ class BotConfig:
     grid_order_size: Optional[float] = None
     order_queue_enabled: bool = True
     order_min_interval: float = 0.25  # seconds between order requests
+    scan_request_delay: float = 0.2  # seconds to wait before each per-pair API call during scanning
     websocket_enabled: bool = True
     websocket_url: Optional[str] = None
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
@@ -89,6 +90,7 @@ class BotConfig:
             grid_order_size=float(os.getenv("GRID_ORDER_SIZE")) if os.getenv("GRID_ORDER_SIZE") else None,
             order_queue_enabled=os.getenv("ORDER_QUEUE_ENABLED", "true").lower() in {"1", "true", "yes"},
             order_min_interval=float(os.getenv("ORDER_MIN_INTERVAL", "0.25")),
+            scan_request_delay=float(os.getenv("SCAN_REQUEST_DELAY", "0.2")),
             websocket_enabled=websocket_enabled,
             websocket_url=os.getenv("WEBSOCKET_URL"),
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
@@ -126,6 +128,8 @@ class BotConfig:
             raise ValueError("GRID_ORDER_SIZE must be positive when set")
         if self.order_min_interval <= 0:
             raise ValueError("ORDER_MIN_INTERVAL must be positive")
+        if self.scan_request_delay < 0:
+            raise ValueError("SCAN_REQUEST_DELAY must be non-negative")
         if self.interval_seconds <= 0:
             raise ValueError("INTERVAL_SECONDS must be positive")
         if self.max_slippage_pct < 0:

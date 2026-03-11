@@ -38,6 +38,7 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `GRID_ORDER_SIZE` | (Opsional) Ukuran order per level; default memakai `RISK_PER_TRADE × INITIAL_CAPITAL / harga` | - |
 | `ORDER_QUEUE_ENABLED` | Aktifkan antrean permintaan order dengan rate limit | `true` |
 | `ORDER_MIN_INTERVAL` | Jeda minimal antar permintaan order (detik) | `0.25` |
+| `SCAN_REQUEST_DELAY` | Jeda antar request saat scan pasangan (mencegah HTTP 429) | `0.2` |
 | `WEBSOCKET_ENABLED` | Coba gunakan WebSocket untuk data real-time (fallback ke REST) | `true` |
 | `WEBSOCKET_URL` | URL WebSocket jika ingin override | - |
 | `FAST_WINDOW` | Periode MA cepat | `12` |

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -410,6 +411,29 @@ class Trader:
         }
         return outcome
 
+    _MAX_SCAN_RETRIES = 3
+    _SCAN_BACKOFF_BASE = 2.0  # seconds; doubled on each retry (2, 4, 8 …)
+    _SCAN_BACKOFF_MAX = 30.0  # hard cap so a long run of 429s never blocks indefinitely
+
+    def _analyze_with_retry(self, pair: str) -> Dict[str, Any]:
+        """Analyze a single pair with exponential back-off on HTTP 429 responses."""
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(self._MAX_SCAN_RETRIES):
+            try:
+                return self.analyze_market(pair)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 429:
+                    backoff = min(self._SCAN_BACKOFF_BASE * (2 ** attempt), self._SCAN_BACKOFF_MAX)
+                    logger.warning(
+                        "Rate-limited on %s (attempt %d/%d); backing off %.1fs",
+                        pair, attempt + 1, self._MAX_SCAN_RETRIES, backoff,
+                    )
+                    time.sleep(backoff)
+                    last_exc = exc
+                else:
+                    raise
+        raise last_exc
+
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
         if self._all_pairs is None:
             try:
@@ -433,8 +457,10 @@ class Trader:
         failed_pairs: List[str] = []
 
         for pair in pairs:
+            if self.config.scan_request_delay > 0:
+                time.sleep(self.config.scan_request_delay)
             try:
-                snapshot = self.analyze_market(pair)
+                snapshot = self._analyze_with_retry(pair)
             # pragma: no cover - guard for per-pair API/parse failures
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 logger.warning("Failed to analyze %s: %s", pair, exc)

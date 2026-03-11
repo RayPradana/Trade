@@ -354,6 +354,89 @@ class TraderSelectionTests(unittest.TestCase):
         outcome = trader.force_sell(snapshot)
         self.assertEqual(outcome["status"], "no_position")
 
+    def test_analyze_with_retry_succeeds_after_429(self) -> None:
+        """_analyze_with_retry must back off and succeed when the first call gets a 429."""
+        config = BotConfig(api_key=None, scan_request_delay=0.0)
+        trader = GuardedTrader(config)
+        # Simulate a snapshot that would be returned on success
+        success_snapshot: Dict[str, Any] = {
+            "pair": "btc_idr", "price": 100.0, "decision": StrategyDecision(
+                mode="scalping", action="buy", confidence=0.7, reason="ok",
+                target_price=100, amount=0.01, stop_loss=99, take_profit=101,
+            ),
+        }
+        calls: list[int] = []
+
+        def fake_analyze(pair: str | None = None) -> Dict[str, Any]:
+            calls.append(1)
+            if len(calls) == 1:
+                # Build a minimal HTTPError with status 429
+                resp = requests.Response()
+                resp.status_code = 429
+                raise requests.HTTPError(response=resp)
+            return success_snapshot
+
+        trader.analyze_market = fake_analyze  # type: ignore[method-assign]
+        import unittest.mock as mock
+        with mock.patch("bot.trader.time.sleep") as mock_sleep:
+            result = trader._analyze_with_retry("btc_idr")
+        self.assertEqual(result["pair"], "btc_idr")
+        self.assertEqual(len(calls), 2)  # failed once, succeeded on retry
+        # Verify exponential backoff: first retry = BACKOFF_BASE * 2^0 = 2.0s
+        mock_sleep.assert_called_once_with(trader._SCAN_BACKOFF_BASE)
+
+    def test_analyze_with_retry_raises_after_max_retries(self) -> None:
+        """After MAX_SCAN_RETRIES 429s, _analyze_with_retry must re-raise the last error."""
+        config = BotConfig(api_key=None, scan_request_delay=0.0)
+        trader = GuardedTrader(config)
+        sleep_calls: list[float] = []
+
+        def always_429(pair: str | None = None) -> Dict[str, Any]:
+            resp = requests.Response()
+            resp.status_code = 429
+            raise requests.HTTPError(response=resp)
+
+        trader.analyze_market = always_429  # type: ignore[method-assign]
+        import unittest.mock as mock
+        with mock.patch("bot.trader.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
+            with self.assertRaises(requests.HTTPError):
+                trader._analyze_with_retry("btc_idr")
+        # Should have slept exactly MAX_SCAN_RETRIES times with increasing delays
+        self.assertEqual(len(sleep_calls), trader._MAX_SCAN_RETRIES)
+        for i, delay in enumerate(sleep_calls):
+            expected = min(trader._SCAN_BACKOFF_BASE * (2 ** i), trader._SCAN_BACKOFF_MAX)
+            self.assertAlmostEqual(delay, expected)
+
+    def test_scan_request_delay_is_honoured(self) -> None:
+        """scan_and_choose must call time.sleep(scan_request_delay) before each pair."""
+        config = BotConfig(api_key=None, scan_request_delay=0.5)
+        snapshots = {
+            "a_idr": {
+                "pair": "a_idr", "price": 1.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.7, reason="ok",
+                    target_price=1, amount=10, stop_loss=0.99, take_profit=1.01,
+                ),
+            },
+            "b_idr": {
+                "pair": "b_idr", "price": 2.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.6, reason="ok",
+                    target_price=2, amount=5, stop_loss=1.98, take_profit=2.02,
+                ),
+            },
+        }
+        trader = StubTrader(config, snapshots)
+        import unittest.mock as mock
+        with mock.patch("bot.trader.time.sleep") as mock_sleep:
+            trader.scan_and_choose()
+        # sleep should be called once per pair (2 pairs)
+        self.assertEqual(mock_sleep.call_count, 2)
+        for call_args in mock_sleep.call_args_list:
+            self.assertEqual(call_args, mock.call(0.5))
+
 
 if __name__ == "__main__":
     unittest.main()
