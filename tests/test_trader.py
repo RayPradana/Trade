@@ -7,6 +7,11 @@ from bot.trader import Trader
 from bot.tracking import PortfolioTracker
 
 
+class VolStub:
+    def __init__(self, volatility: float) -> None:
+        self.volatility = volatility
+
+
 class StubTrader(Trader):
     def __init__(self, config: BotConfig, snapshots: Dict[str, Dict[str, Any]]) -> None:
         super().__init__(config, client=None)  # client not used due to override
@@ -254,10 +259,6 @@ class TraderSelectionTests(unittest.TestCase):
             stop_loss=95.0,
             take_profit=110.0,
         )
-        class VolStub:
-            def __init__(self, vol: float) -> None:
-                self.volatility = vol
-
         snapshot = {
             "pair": "btc_idr",
             "price": 100.0,

@@ -137,7 +137,7 @@ class Trader:
         staged = [round(total * frac, 12) for frac in fractions]
         # Ensure rounding does not exceed total and the final leg absorbs rounding drift
         if staged:
-            staged[-1] = max(0.0, min(total - sum(staged[:-1]), staged[-1]))
+            staged[-1] = max(0.0, total - sum(staged[:-1]))
         return [s for s in staged if s > 0]
 
     def _scale_staged_amounts(self, decision_amount: float, effective_amount: float, staged: List[float]) -> List[float]:
