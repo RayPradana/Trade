@@ -1,6 +1,7 @@
 import logging
 import os
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 import main
@@ -255,5 +256,86 @@ class MainErrorHandlingTests(unittest.TestCase):
         self.assertGreaterEqual(scan_count["n"], 1)
 
 
+class AccountInfoDisplayTests(unittest.TestCase):
+    """Unit tests for _log_account_info and _log_account_info_dry."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fake_info(**overrides):
+        """Return a minimal getInfo-style response dict."""
+        data = {
+            "success": 1,
+            "return": {
+                "server_time": 1741628400,
+                "name": "Test User",
+                "email": "test@example.com",
+                "user_id": "123456",
+                "verification_status": "verified",
+                "balance": {
+                    "idr": "5000000.00",
+                    "btc": "0.00345600",
+                    "eth": "0.00000000",
+                },
+                "balance_hold": {
+                    "idr": "0.00",
+                    "btc": "0.00100000",
+                },
+            },
+        }
+        data["return"].update(overrides)
+        return data
+
+    # ── tests ─────────────────────────────────────────────────────────────────
+
+    def test_log_account_info_runs_without_error(self) -> None:
+        """_log_account_info should not raise for a well-formed response."""
+        main._log_account_info(self._fake_info())
+
+    def test_log_account_info_handles_empty_response(self) -> None:
+        """_log_account_info should not raise for a missing/empty return dict."""
+        main._log_account_info({})
+        main._log_account_info({"return": {}})
+        main._log_account_info({"return": {"balance": {}, "balance_hold": {}}})
+
+    def test_log_account_info_hides_zero_coins(self) -> None:
+        """Coins with zero free AND zero hold should be excluded."""
+        # ETH has 0 free and no hold entry — should produce no log lines for ETH.
+        with unittest.mock.patch("logging.info") as mock_log:
+            main._log_account_info(self._fake_info())
+        all_msgs = " ".join(str(a) for call in mock_log.call_args_list for a in call[0])
+        self.assertIn("BTC", all_msgs)
+        self.assertNotIn("ETH", all_msgs)  # zero balance — hidden
+
+    def test_log_account_info_no_open_positions(self) -> None:
+        """When all coins are zero, 'no open coin positions' line should appear."""
+        with unittest.mock.patch("logging.info") as mock_log:
+            main._log_account_info(
+                {"return": {"balance": {"idr": "1000", "btc": "0"}, "balance_hold": {}}}
+            )
+        all_msgs = " ".join(str(a) for call in mock_log.call_args_list for a in call[0])
+        self.assertIn("no open coin positions", all_msgs)
+
+    def test_log_account_info_verified_icon(self) -> None:
+        """Verified account should show ✅, unverified should show ⚠️."""
+        with unittest.mock.patch("logging.info") as mock_log:
+            main._log_account_info(self._fake_info(verification_status="verified"))
+            main._log_account_info(self._fake_info(verification_status="unverified"))
+        all_msgs = " ".join(str(a) for call in mock_log.call_args_list for a in call[0])
+        self.assertIn("✅", all_msgs)
+        self.assertIn("⚠️", all_msgs)
+
+    def test_log_account_info_dry_runs_without_error(self) -> None:
+        """_log_account_info_dry should not raise."""
+        main._log_account_info_dry()
+
+
 if __name__ == "__main__":
     unittest.main()
+

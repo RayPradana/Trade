@@ -169,9 +169,10 @@ def _log_account_info(info: dict) -> None:
     ret = info.get("return") or {}
     balance = ret.get("balance") or {}
     balance_hold = ret.get("balance_hold") or {}
-    name  = ret.get("name")   or ret.get("server_time") or "—"
-    email = ret.get("email")  or "—"
-    address = ret.get("address") or {}  # address dict keyed by coin
+    name  = ret.get("name")  or "—"
+    email = ret.get("email") or "—"
+    user_id = ret.get("user_id") or "—"
+    verification = ret.get("verification_status") or "—"
     server_time_raw = ret.get("server_time")
     server_ts = (
         datetime.datetime.fromtimestamp(int(server_time_raw)).strftime("%Y-%m-%d %H:%M:%S")
@@ -186,8 +187,13 @@ def _log_account_info(info: dict) -> None:
 
     if name and name != "—":
         logging.info("   %-14s %s%s%s", "name     :", _BOLD, name, _RESET)
+    if user_id and user_id != "—":
+        logging.info("   %-14s %s%s%s", "user id  :", _DIM, user_id, _RESET)
     if email and email != "—":
         logging.info("   %-14s %s%s%s", "email    :", _DIM, email, _RESET)
+    if verification and verification != "—":
+        verified_icon = "✅" if str(verification).lower() == "verified" else "⚠️"
+        logging.info("   %-14s %s %s%s", "status   :", verified_icon, verification, _RESET)
     logging.info("   %-14s %s%s%s", "server   :", _DIM, server_ts, _RESET)
     logging.info(sep)
 
