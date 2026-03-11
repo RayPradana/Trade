@@ -46,13 +46,15 @@ class BotConfig:
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
+    auto_resume: bool = True
+    state_file: str = "bot_state.json"
 
     @classmethod
     def from_env(cls) -> "BotConfig":
         _load_dotenv()
         pairs_env = os.getenv("TRADE_PAIRS")
         scan_pairs = [p.strip().lower() for p in pairs_env.split(",")] if pairs_env else None
-        return cls(
+        cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
             scan_pairs=scan_pairs,
@@ -67,8 +69,24 @@ class BotConfig:
             initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000000")),
             target_profit_pct=float(os.getenv("TARGET_PROFIT_PCT", "0.2")),
             max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
+            auto_resume=os.getenv("AUTO_RESUME", "true").lower() in {"1", "true", "yes"},
+            state_file=os.getenv("STATE_FILE", "bot_state.json"),
         )
+        cfg._validate()
+        return cfg
 
     def require_auth(self) -> None:
         if not self.api_key:
             raise ValueError("INDODAX_KEY is required for live trading")
+
+    def _validate(self) -> None:
+        if not (0 < self.risk_per_trade <= 0.5):
+            raise ValueError("RISK_PER_TRADE must be between 0 and 0.5")
+        if self.base_order_size <= 0:
+            raise ValueError("BASE_ORDER_SIZE must be positive")
+        if self.interval_seconds <= 0:
+            raise ValueError("INTERVAL_SECONDS must be positive")
+        if self.max_slippage_pct < 0:
+            raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
+        if not self.dry_run and not self.api_key:
+            self.require_auth()

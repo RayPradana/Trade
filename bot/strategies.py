@@ -4,7 +4,13 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from .analysis import OrderbookInsight, SupportResistance, TrendResult, VolatilityStats
+from .analysis import (
+    MomentumIndicators,
+    OrderbookInsight,
+    SupportResistance,
+    TrendResult,
+    VolatilityStats,
+)
 from .config import BotConfig
 
 SCALP_SPREAD_THRESHOLD = 0.0015
@@ -52,7 +58,45 @@ def _confidence(trend: TrendResult, orderbook: OrderbookInsight, vol: Volatility
     return round(max(0.0, min(1.0, (trend_score * 0.45 + orderbook_score * 0.35 + vol_score * 0.2))), 3)
 
 
-def _position_size(current_price: float, stop_loss: Optional[float], config: BotConfig, risk_per_unit: float) -> float:
+def _confidence_with_indicators(
+    trend: TrendResult,
+    orderbook: OrderbookInsight,
+    vol: VolatilityStats,
+    price: float,
+    indicators: Optional[MomentumIndicators],
+) -> float:
+    base_conf = _confidence(trend, orderbook, vol)
+    if not indicators:
+        return base_conf
+
+    bonus = 0.0
+    # RSI: favour oversold in uptrend / overbought in downtrend
+    if trend.direction == "up" and indicators.rsi < 35:
+        bonus += 0.08
+    if trend.direction == "down" and indicators.rsi > 65:
+        bonus += 0.08
+
+    # MACD histogram trend strength
+    macd_bias = max(-0.1, min(0.1, indicators.macd_hist))
+    bonus += macd_bias
+
+    # Bollinger band mean reversion confidence
+    if indicators.bb_mid:
+        distance_mid = abs(price - indicators.bb_mid) / indicators.bb_mid
+        bonus += max(0.0, 0.05 - distance_mid * 0.1)
+
+    conf = base_conf + bonus
+    return round(max(0.0, min(1.0, conf)), 3)
+
+
+def _position_size(
+    current_price: float,
+    stop_loss: Optional[float],
+    config: BotConfig,
+    risk_per_unit: float,
+    confidence: float,
+    vol: VolatilityStats,
+) -> float:
     """Risk-based position sizing capped by configured risk_per_trade."""
     if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
         return 0.0
@@ -60,7 +104,10 @@ def _position_size(current_price: float, stop_loss: Optional[float], config: Bot
     base_order_risk = risk_per_unit * config.base_order_size
     dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
     scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
-    return max(config.base_order_size * scale, config.base_order_size * 0.25)
+    confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
+    volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
+    size = config.base_order_size * scale * confidence_multiplier * volatility_multiplier
+    return max(size, config.base_order_size * 0.25)
 
 
 def make_trade_decision(
@@ -70,9 +117,10 @@ def make_trade_decision(
     current_price: float,
     config: BotConfig,
     levels: Optional[SupportResistance] = None,
+    indicators: Optional[MomentumIndicators] = None,
 ) -> StrategyDecision:
     mode = select_strategy(trend, orderbook, vol)
-    conf = _confidence(trend, orderbook, vol)
+    conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
 
     if trend.direction == "up":
         action = "buy"
@@ -100,14 +148,24 @@ def make_trade_decision(
                 conf *= 0.7
                 sr_note = "near_support"
 
+    if indicators:
+        if action == "buy" and indicators.bb_upper:
+            take_profit = min(take_profit, indicators.bb_upper)
+        if action == "sell" and indicators.bb_lower:
+            take_profit = max(take_profit, indicators.bb_lower)
+        if indicators.rsi > 70 and action == "buy":
+            conf *= 0.8  # avoid buying overbought
+        if indicators.rsi < 30 and action == "sell":
+            conf *= 0.8  # avoid shorting oversold
+
     reason = (
         f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
-        f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} {sr_note}"
+        f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} rsi={indicators.rsi if indicators else float('nan'):.2f} {sr_note}"
     ).strip()
 
     # size based on risk per trade relative to stop distance
     risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
-    amount = _position_size(current_price, stop_loss, config, risk_per_unit)
+    amount = _position_size(current_price, stop_loss, config, risk_per_unit, conf, vol)
 
     return StrategyDecision(
         mode=mode,

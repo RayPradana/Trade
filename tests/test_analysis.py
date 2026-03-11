@@ -7,6 +7,7 @@ from bot.analysis import (
     analyze_trend,
     analyze_volatility,
     build_candles,
+    derive_indicators,
     moving_average,
     support_resistance,
 )
@@ -60,6 +61,15 @@ class AnalysisTests(unittest.TestCase):
         levels = support_resistance(candles, lookback=3)
         self.assertEqual(levels.support, 90)
         self.assertEqual(levels.resistance, 110)
+
+    def test_indicators_include_rsi_and_macd(self) -> None:
+        candles = [
+            Candle(i, 100 + i, 101 + i, 99 + i, 100 + i, 1.0) for i in range(40)
+        ]
+        indicators = derive_indicators(candles)
+        self.assertTrue(0 <= indicators.rsi <= 100)
+        # MACD histogram should be finite
+        self.assertFalse(math.isnan(indicators.macd_hist))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -10,10 +12,13 @@ from .analysis import (
     analyze_trend,
     analyze_volatility,
     build_candles,
+    derive_indicators,
+    MomentumIndicators,
     support_resistance,
 )
 from .config import BotConfig
 from .indodax_client import IndodaxClient
+from .persistence import StatePersistence
 from .strategies import StrategyDecision, make_trade_decision
 from .tracking import PortfolioTracker
 
@@ -30,6 +35,22 @@ class Trader:
             target_profit_pct=config.target_profit_pct,
             max_loss_pct=config.max_loss_pct,
         )
+        self.persistence = StatePersistence(Path(config.state_file))
+        self._restored_state: Optional[Dict[str, Any]] = None
+        if config.auto_resume:
+            restored = self.persistence.load()
+            if restored and isinstance(restored, dict):
+                portfolio_state = restored.get("portfolio")
+                if isinstance(portfolio_state, dict):
+                    self.tracker.load_state(portfolio_state)
+                restored_pair = restored.get("pair")
+                if restored_pair:
+                    self.config.pair = str(restored_pair)
+                self._restored_state = restored
+
+    @property
+    def restored_state(self) -> Optional[Dict[str, Any]]:
+        return self._restored_state
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
@@ -46,6 +67,52 @@ class Trader:
             raise ValueError("Ticker missing price fields")
         return float(last_value)
 
+    def _decision_to_dict(self, decision: StrategyDecision) -> Dict[str, Any]:
+        return {
+            "mode": decision.mode,
+            "action": decision.action,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+            "target_price": decision.target_price,
+            "amount": decision.amount,
+            "stop_loss": decision.stop_loss,
+            "take_profit": decision.take_profit,
+            "support": decision.support,
+            "resistance": decision.resistance,
+        }
+
+    def _persist_state(
+        self,
+        snapshot: Dict[str, Any],
+        decision: StrategyDecision,
+        reference_price: float,
+        outcome: Dict[str, Any],
+    ) -> None:
+        if not self.config.auto_resume:
+            return
+        state = {
+            "pair": snapshot.get("pair"),
+            "price": reference_price,
+            "decision": self._decision_to_dict(decision),
+            "portfolio": self.tracker.to_state(),
+            "outcome": outcome.get("status"),
+            "reason": outcome.get("reason"),
+            "timestamp": time.time(),
+        }
+        self.persistence.save(state)
+
+    def _score_snapshot(self, snapshot: Dict[str, Any]) -> float:
+        decision: StrategyDecision = snapshot["decision"]
+        vol = snapshot.get("volatility")
+        orderbook = snapshot.get("orderbook")
+        score = decision.confidence
+        if vol:
+            score += min(vol.volatility * 5, 0.1)
+        if orderbook:
+            spread_bonus = max(0.0, 0.001 - orderbook.spread_pct) * 50
+            score += spread_bonus
+        return max(0.0, min(1.5, score))
+
     def analyze_market(self, pair: Optional[str] = None) -> Dict[str, Any]:
         pair = pair or self.config.pair
         ticker = self.client.get_ticker(pair)
@@ -58,8 +125,9 @@ class Trader:
         vol = analyze_volatility(candles)
         levels = support_resistance(candles)
         price = self._extract_price(ticker)
+        indicators: MomentumIndicators = derive_indicators(candles)
 
-        decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels)
+        decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels, indicators)
         return {
             "pair": pair,
             "price": price,
@@ -67,6 +135,7 @@ class Trader:
             "orderbook": orderbook,
             "volatility": vol,
             "levels": levels,
+            "indicators": indicators,
             "decision": decision,
             "candles": candles,
         }
@@ -78,11 +147,15 @@ class Trader:
         stop_reason = self.tracker.stop_reason(price)
         if stop_reason:
             logger.info("Stop triggered (%s) equity=%s", stop_reason, self.tracker.as_dict(price))
-            return {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
+            outcome = {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
+            self._persist_state(snapshot, decision, price, outcome)
+            return outcome
 
         if decision.action == "hold":
             logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, self.tracker.as_dict(price))
-            return {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
+            outcome = {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
+            self._persist_state(snapshot, decision, price, outcome)
+            return outcome
 
         if decision.confidence < self.config.min_confidence:
             logger.info(
@@ -91,11 +164,13 @@ class Trader:
                 decision.confidence,
                 self.config.min_confidence,
             )
-            return {
+            outcome = {
                 "status": "skipped",
                 "reason": f"confidence {decision.confidence} below threshold {self.config.min_confidence}",
                 "portfolio": self.tracker.as_dict(price),
             }
+            self._persist_state(snapshot, decision, price, outcome)
+            return outcome
 
         # simple slippage guard using top of book
         depth = self.client.get_depth(snapshot["pair"], count=5)
@@ -109,18 +184,22 @@ class Trader:
 
         if decision.action == "buy" and reference_price > allowed_max:
             logger.info("Skip buy due to slippage price=%s allowed_max=%s", reference_price, allowed_max)
-            return {
+            outcome = {
                 "status": "skipped",
                 "reason": "slippage too high for buy",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
+            self._persist_state(snapshot, decision, reference_price, outcome)
+            return outcome
         if decision.action == "sell" and reference_price < allowed_min:
             logger.info("Skip sell due to slippage price=%s allowed_min=%s", reference_price, allowed_min)
-            return {
+            outcome = {
                 "status": "skipped",
                 "reason": "slippage too high for sell",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
+            self._persist_state(snapshot, decision, reference_price, outcome)
+            return outcome
 
         # capital and position guards (risk management)
         effective_amount = decision.amount
@@ -133,16 +212,18 @@ class Trader:
 
         if effective_amount <= 0:
             logger.info("Skip due to insufficient balance/position | action=%s", decision.action)
-            return {
+            outcome = {
                 "status": "skipped",
                 "reason": "insufficient balance or position",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
+            self._persist_state(snapshot, decision, reference_price, outcome)
+            return outcome
 
         if self.config.dry_run:
             logger.info("DRY-RUN %s %s @ %s", decision.action, effective_amount, reference_price)
             self.tracker.record_trade(decision.action, reference_price, effective_amount)
-            return {
+            outcome = {
                 "status": "simulated",
                 "action": decision.action,
                 "price": reference_price,
@@ -154,6 +235,8 @@ class Trader:
                 "reason": decision.reason,
                 "portfolio": self.tracker.as_dict(reference_price),
             }
+            self._persist_state(snapshot, decision, reference_price, outcome)
+            return outcome
 
         # live trading path
         # Guard against programmatic use without running through CLI validation.
@@ -171,7 +254,7 @@ class Trader:
             reference_price,
             order_resp,
         )
-        return {
+        outcome = {
             "status": "placed",
             "order": order_resp,
             "action": decision.action,
@@ -180,6 +263,8 @@ class Trader:
             "mode": decision.mode,
             "portfolio": self.tracker.as_dict(reference_price),
         }
+        self._persist_state(snapshot, decision, reference_price, outcome)
+        return outcome
 
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
         pairs: List[str] = []
@@ -218,8 +303,9 @@ class Trader:
             decision: StrategyDecision = snapshot["decision"]
             if decision.action == "hold":
                 continue
-            if decision.confidence > best_score:
-                best_score = decision.confidence
+            score = self._score_snapshot(snapshot)
+            if score > best_score:
+                best_score = score
                 best_snapshot = snapshot
                 best_pair = pair
 

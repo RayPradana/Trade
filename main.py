@@ -36,6 +36,14 @@ def main() -> None:
         config.require_auth()
 
     trader = Trader(config)
+    if trader.restored_state:
+        restored_portfolio = trader.restored_state.get("portfolio", {})
+        logging.info(
+            "Auto-resume enabled: restored state pair=%s cash=%s base_position=%s",
+            trader.restored_state.get("pair", config.pair),
+            restored_portfolio.get("cash"),
+            restored_portfolio.get("base_position"),
+        )
     pair = config.pair
     while True:
         try:

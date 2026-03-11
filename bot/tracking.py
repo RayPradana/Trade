@@ -52,6 +52,14 @@ class PortfolioTracker:
             min_equity=self.min_equity,
         )
 
+    def load_state(self, state: Dict[str, float]) -> None:
+        """Restore tracker state from persisted portfolio dictionary."""
+        self.cash = float(state.get("cash", self.cash))
+        self.base_position = float(state.get("base_position", self.base_position))
+        self.realized_pnl = float(state.get("realized_pnl", self.realized_pnl))
+        self.avg_cost = float(state.get("avg_cost", self.avg_cost))
+        # target/min equity recomputed from initial_capital to keep guard consistent
+
     def stop_reason(self, mark_price: float) -> Optional[str]:
         snap = self.snapshot(mark_price)
         if snap.equity >= self.target_equity:
@@ -69,4 +77,14 @@ class PortfolioTracker:
             "realized_pnl": snap.realized_pnl,
             "target_equity": snap.target_equity,
             "min_equity": snap.min_equity,
+            "avg_cost": self.avg_cost,
+        }
+
+    def to_state(self) -> Dict[str, float]:
+        """Serialize state without requiring a mark price."""
+        return {
+            "cash": self.cash,
+            "base_position": self.base_position,
+            "realized_pnl": self.realized_pnl,
+            "avg_cost": self.avg_cost,
         }

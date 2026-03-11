@@ -8,6 +8,8 @@ Bot trading otomatis untuk Indodax menggunakan Python. Bot melakukan:
 - Eksekusi limit order beli/jual otomatis dengan batasan slippage, stop-loss, take-profit (stop-limit secara logis melalui stop-loss guard)
 - Risk management: target profit, batas rugi, pembatasan ukuran order berdasarkan modal/cash, dan proteksi over-sell posisi
 - Mode **dry-run** bawaan agar aman untuk simulasi tanpa mengeksekusi order sungguhan
+- **Auto-resume**: menyimpan state portofolio sehingga bot melanjutkan posisi terakhir jika restart
+- Analisis lanjutan: RSI, MACD, Bollinger Bands untuk konfirmasi tren dan momentum
 
 > Gunakan dokumentasi resmi Indodax: https://github.com/btcid/indodax-official-api-docs
 
@@ -36,12 +38,14 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `TARGET_PROFIT_PCT` | Target profit relatif (0.2 = 20%) | `0.2` |
 | `MAX_LOSS_PCT` | Batas kerugian relatif (0.1 = 10%) | `0.1` |
 | `TRADE_PAIRS` | Daftar pasangan dipisah koma untuk discan otomatis (jika kosong, bot tarik seluruh pairs dari API) | `btc_idr` |
+| `AUTO_RESUME` | `true/false` untuk mengaktifkan pemulihan state otomatis | `true` |
+| `STATE_FILE` | Lokasi file state JSON untuk auto-resume | `bot_state.json` |
 
 ## Menjalankan
 
 ### Konfigurasi via `.env`
 
-Buat file `.env` di root repo:
+Salin `.env.example` menjadi `.env` di root repo, lalu isi:
 
 ```
 INDODAX_KEY=your_api_key
@@ -74,6 +78,7 @@ Opsi penting:
    - Tren dihitung memakai MA cepat/lambat.
    - Order book dihitung spread, volume bid/ask, dan imbalance.
    - Volatilitas dihitung dari imbal hasil candle.
+   - Momentum & konfirmasi: **RSI**, **MACD**, **Bollinger Bands** untuk filter overbought/oversold dan kekuatan tren.
    - Support dan resistance dihitung dari harga penutupan terbaru untuk menghindari entry dekat level kritis.
    - Portfolio tracker menghitung ekuitas (cash + posisi mark-to-market) terhadap target profit / batas rugi.
 3. **Pemilihan strategi**:
@@ -86,6 +91,7 @@ Opsi penting:
    - **Dry-run**: hanya log simulasi.
    - **Live**: mengirim **limit order** `trade` ke `tapi` Indodax (butuh API key/secret). Stop-limit dijaga secara logis lewat stop-loss/take-profit dan pengecekan slippage.
    - Risk guard: ukuran order dibatasi modal/posisi yang tersedia, tidak akan oversell; portfolio guard berhenti otomatis bila target profit tercapai atau batas rugi terlampaui.
+   - **Auto-resume**: state portofolio dan keputusan terakhir disimpan di `STATE_FILE` agar bot melanjutkan sesi jika terhenti mendadak.
 
 ## Keamanan & Catatan
 

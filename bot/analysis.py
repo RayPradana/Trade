@@ -48,6 +48,17 @@ class SupportResistance:
     lookback: int
 
 
+@dataclass
+class MomentumIndicators:
+    rsi: float
+    macd: float
+    macd_signal: float
+    macd_hist: float
+    bb_upper: float
+    bb_mid: float
+    bb_lower: float
+
+
 def _safe_float(value: str) -> float:
     try:
         return float(value)
@@ -168,3 +179,77 @@ def support_resistance(candles: Sequence[Candle], lookback: int = 30) -> Support
         return SupportResistance(0.0, 0.0, lookback)
     closes = [c.close for c in candles[-lookback:]]
     return SupportResistance(support=min(closes), resistance=max(closes), lookback=lookback)
+
+
+def _ema_series(values: Sequence[float], span: int) -> List[float]:
+    if not values:
+        return []
+    k = 2 / (span + 1)
+    series: List[float] = []
+    ema = values[0]
+    for idx, value in enumerate(values):
+        if idx == 0:
+            ema = value
+        else:
+            ema = value * k + ema * (1 - k)
+        series.append(ema)
+    return series
+
+
+def compute_rsi(closes: Sequence[float], period: int = 14) -> float:
+    if len(closes) < 2:
+        return 50.0
+    deltas = [curr - prev for prev, curr in zip(closes, closes[1:])]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    if not any(gains) and not any(losses):
+        return 50.0
+    avg_gain = mean(gains[-period:]) if gains else 0.0
+    avg_loss = mean(losses[-period:]) if losses else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(closes: Sequence[float]) -> tuple[float, float, float]:
+    ema12_series = _ema_series(closes, 12)
+    ema26_series = _ema_series(closes, 26)
+    if not ema12_series or not ema26_series:
+        return (0.0, 0.0, 0.0)
+    macd_series = [a - b for a, b in zip(ema12_series[-len(ema26_series) :], ema26_series)]
+    macd_line = macd_series[-1]
+    signal_series = _ema_series(macd_series, 9)
+    signal_line = signal_series[-1] if signal_series else 0.0
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def bollinger_bands(closes: Sequence[float], period: int = 20, std_dev: float = 2) -> tuple[float, float, float]:
+    if len(closes) < period:
+        window = closes or [0.0]
+    else:
+        window = closes[-period:]
+    mid = mean(window)
+    dev = pstdev(window) if len(window) > 1 else 0.0
+    upper = mid + std_dev * dev
+    lower = mid - std_dev * dev
+    return upper, mid, lower
+
+
+def derive_indicators(candles: Sequence[Candle]) -> MomentumIndicators:
+    if not candles:
+        return MomentumIndicators(50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    closes = [c.close for c in candles]
+    rsi_val = compute_rsi(closes)
+    macd_line, macd_signal, macd_hist = compute_macd(closes)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(closes)
+    return MomentumIndicators(
+        rsi=rsi_val,
+        macd=macd_line,
+        macd_signal=macd_signal,
+        macd_hist=macd_hist,
+        bb_upper=bb_upper,
+        bb_mid=bb_mid,
+        bb_lower=bb_lower,
+    )

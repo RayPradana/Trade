@@ -49,7 +49,7 @@ class AutoPairsTrader(Trader):
 
 class TraderSelectionTests(unittest.TestCase):
     def test_scan_and_choose_picks_best_confidence(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="a_idr")
+        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="a_idr", auto_resume=False)
         snapshots = {
             "a_idr": {
                 "pair": "a_idr",
@@ -94,7 +94,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(snapshot["decision"].confidence, 0.8)
 
     def test_scan_and_choose_without_manual_input_uses_auto_pairs(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=None, pair="manual_idr")
+        config = BotConfig(api_key=None, scan_pairs=None, pair="manual_idr", auto_resume=False)
         snapshots = {
             "auto_a": {
                 "pair": "auto_a",
@@ -140,7 +140,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(trader.config.pair, "manual_idr")  # config stays as fallback
 
     def test_scan_and_choose_falls_back_when_all_hold(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="fallback_idr")
+        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="fallback_idr", auto_resume=False)
         snapshots = {
             "a_idr": {
                 "pair": "a_idr",
@@ -209,6 +209,7 @@ class TraderSelectionTests(unittest.TestCase):
             initial_capital=50.0,
             max_loss_pct=0.9,
             target_profit_pct=1.0,
+            auto_resume=False,
         )
         trader = GuardedTrader(config)
         trader.tracker.cash = 50.0  # very small cash
