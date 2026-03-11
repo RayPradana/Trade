@@ -38,6 +38,10 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `GRID_LEVELS_PER_SIDE` | Jumlah level grid di tiap sisi harga anchor | `3` |
 | `GRID_SPACING_PCT` | Jarak antar level grid (0.004 = 0.4%) | `0.004` |
 | `GRID_ORDER_SIZE` | (Opsional) Ukuran order per level; default memakai `BASE_ORDER_SIZE` | - |
+| `ORDER_QUEUE_ENABLED` | Aktifkan antrean permintaan order dengan rate limit | `true` |
+| `ORDER_MIN_INTERVAL` | Jeda minimal antar permintaan order (detik) | `0.25` |
+| `WEBSOCKET_ENABLED` | Coba gunakan WebSocket untuk data real-time (fallback ke REST) | `true` |
+| `WEBSOCKET_URL` | URL WebSocket jika ingin override | - |
 | `FAST_WINDOW` | Periode MA cepat | `12` |
 | `SLOW_WINDOW` | Periode MA lambat | `48` |
 | `MAX_SLIPPAGE_PCT` | Batas slippage relatif | `0.001` |
@@ -92,6 +96,16 @@ REALTIME_MODE=true DRY_RUN=true python main.py
 ```bash
 GRID_ENABLED=true GRID_LEVELS_PER_SIDE=4 GRID_SPACING_PCT=0.003 DRY_RUN=true python main.py
 ```
+
+### Streaming WebSocket & fallback REST
+
+- Dengan `WEBSOCKET_ENABLED=true`, bot akan mencoba memakai WebSocket (jika tersedia) untuk data real-time. Bila gagal, otomatis jatuh ke polling REST dengan interval `INTERVAL_SECONDS`.
+- Anda dapat mengatur endpoint dengan `WEBSOCKET_URL` bila diperlukan.
+
+### Antrean order dengan rate limit
+
+- `ORDER_QUEUE_ENABLED=true` mengaktifkan antrean order yang menegakkan jeda minimal antar request (default 0.25 detik lewat `ORDER_MIN_INTERVAL`).
+- Berlaku untuk `create_order` dan `cancel_order` agar tidak melampaui batas rate limit API.
 
 Opsi penting:
 

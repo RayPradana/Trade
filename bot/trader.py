@@ -17,6 +17,8 @@ from .analysis import (
     support_resistance,
 )
 from .config import BotConfig
+from .rate_limit import RateLimitedOrderQueue
+from .realtime import RealtimeFeed
 from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
 from .persistence import StatePersistence
@@ -29,7 +31,15 @@ logger = logging.getLogger(__name__)
 class Trader:
     def __init__(self, config: BotConfig, client: Optional[IndodaxClient] = None) -> None:
         self.config = config
-        self.client = client or IndodaxClient(config.api_key)
+        self.order_queue = (
+            RateLimitedOrderQueue(min_interval=config.order_min_interval) if config.order_queue_enabled else None
+        )
+        self.client = client or IndodaxClient(
+            config.api_key,
+            order_queue=self.order_queue,
+            order_min_interval=config.order_min_interval,
+            enable_queue=config.order_queue_enabled,
+        )
         self._all_pairs: Optional[List[str]] = None
         self.tracker = PortfolioTracker(
             initial_capital=config.initial_capital,
@@ -38,6 +48,7 @@ class Trader:
         )
         self.persistence = StatePersistence(Path(config.state_file))
         self._restored_state: Optional[Dict[str, Any]] = None
+        self.realtime: Optional[RealtimeFeed] = None
         if config.auto_resume:
             restored = self.persistence.load()
             if restored and isinstance(restored, dict):
@@ -48,6 +59,15 @@ class Trader:
                 if restored_pair:
                     self.config.pair = str(restored_pair)
                 self._restored_state = restored
+        if config.real_time:
+            self.realtime = RealtimeFeed(
+                pair=self.config.pair,
+                client=self.client,
+                websocket_url=config.websocket_url,
+                poll_interval=max(0.5, float(self.config.interval_seconds)),
+                websocket_enabled=config.websocket_enabled,
+            )
+            self.realtime.start()
 
     @property
     def restored_state(self) -> Optional[Dict[str, Any]]:
@@ -153,9 +173,18 @@ class Trader:
 
     def analyze_market(self, pair: Optional[str] = None) -> Dict[str, Any]:
         pair = pair or self.config.pair
-        ticker = self.client.get_ticker(pair)
-        depth = self.client.get_depth(pair, count=200)
-        trades = self.client.get_trades(pair, count=400)
+        ticker: Dict[str, Any]
+        depth: Dict[str, Any]
+        trades: List[Dict[str, Any]]
+        if self.realtime and self.realtime.has_snapshot and pair == self.config.pair:
+            snap = self.realtime.snapshot()
+            ticker = snap.get("ticker") or self.client.get_ticker(pair)
+            depth = snap.get("depth") or self.client.get_depth(pair, count=200)
+            trades = snap.get("trades") or self.client.get_trades(pair, count=400)
+        else:
+            ticker = self.client.get_ticker(pair)
+            depth = self.client.get_depth(pair, count=200)
+            trades = self.client.get_trades(pair, count=400)
 
         candles = build_candles(trades, interval_seconds=self.config.interval_seconds, limit=96)
         trend = analyze_trend(candles, self.config.fast_window, self.config.slow_window)

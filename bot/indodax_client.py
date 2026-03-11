@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from .rate_limit import RateLimitedOrderQueue
+
 
 class IndodaxClient:
     """Lightweight Indodax API wrapper supporting public and private endpoints."""
@@ -16,11 +18,21 @@ class IndodaxClient:
         session: Optional[requests.Session] = None,
         base_url: str = "https://indodax.com",
         timeout: int = 15,
+        order_queue: Optional[RateLimitedOrderQueue] = None,
+        order_min_interval: float = 0.25,
+        enable_queue: bool = True,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
+        self.order_queue = (
+            order_queue
+            if enable_queue
+            else None
+        )
+        if self.order_queue is None and enable_queue:
+            self.order_queue = RateLimitedOrderQueue(min_interval=order_min_interval)
 
     # -------------------- public API -------------------- #
     def get_pairs(self) -> List[Dict[str, Any]]:
@@ -58,10 +70,10 @@ class IndodaxClient:
                 payload["amount"] = f"{amount:.8f}"
         else:
             payload["amount"] = f"{amount:.8f}"
-        return self._post_private("trade", payload)
+        return self._enqueue_private("trade", payload)
 
     def cancel_order(self, pair: str, order_id: str) -> Dict[str, Any]:
-        return self._post_private("cancelOrder", {"pair": pair, "order_id": order_id})
+        return self._enqueue_private("cancelOrder", {"pair": pair, "order_id": order_id})
 
     # -------------------- helpers -------------------- #
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -83,6 +95,11 @@ class IndodaxClient:
             f"{self.base_url}/tapi", data=encoded, headers=headers, timeout=self.timeout
         )
         return self._handle_response(response)
+
+    def _enqueue_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not self.order_queue:
+            return self._post_private(method, params)
+        return self.order_queue.submit(self._post_private, method, params).result()
 
     @staticmethod
     def _handle_response(response: requests.Response) -> Any:
