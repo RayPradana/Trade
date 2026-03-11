@@ -75,7 +75,11 @@ def build_candles(
     if not trades:
         return []
 
-    sorted_trades = sorted(trades, key=lambda t: int(t.get("date", 0)))
+    valid_trades = [t for t in trades if isinstance(t, dict)]
+    if not valid_trades:
+        return []
+
+    sorted_trades = sorted(valid_trades, key=lambda t: int(t.get("date", 0)))
     first_ts = int(sorted_trades[0].get("date", 0))
     buckets: Dict[int, List[Dict[str, object]]] = {}
     for trade in sorted_trades:

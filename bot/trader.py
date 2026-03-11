@@ -462,5 +462,10 @@ class Trader:
         if best_snapshot:
             return best_pair, best_snapshot
 
-        # fallback to default pair if nothing tradable
+        if failed_pairs:
+            message = "No pairs could be analyzed successfully"
+            message = f"{message} (failed: {','.join(failed_pairs)})"
+            raise RuntimeError(message)
+
+        # fallback to default pair if nothing tradable but no analysis errors
         return best_pair, self.analyze_market(best_pair)

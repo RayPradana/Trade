@@ -69,7 +69,8 @@ def main() -> None:
         except (requests.RequestException, RuntimeError, ValueError):
             logging.exception("Recoverable error in bot loop (pair=%s)", pair)
             if config.run_once:
-                raise
+                logging.info("run_once enabled; exiting after recoverable error")
+                break
         except KeyboardInterrupt:
             logging.info("Stopping bot")
             break

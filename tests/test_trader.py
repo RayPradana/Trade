@@ -1,6 +1,8 @@
 import unittest
 from typing import Dict, Any
 
+import requests
+
 from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
@@ -50,6 +52,16 @@ class AutoPairsTrader(Trader):
     def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
         key = pair or self.config.pair
         return self._snapshots[key]
+
+
+class AllFailTrader(Trader):
+    """Trader that always fails to analyze markets to simulate network/API outages."""
+
+    def __init__(self, config: BotConfig) -> None:
+        super().__init__(config, client=None)
+
+    def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
+        raise requests.RequestException("network unavailable")
 
 
 class TraderSelectionTests(unittest.TestCase):
@@ -206,6 +218,13 @@ class TraderSelectionTests(unittest.TestCase):
         pair, snapshot = trader.scan_and_choose()
         self.assertEqual(pair, "fallback_idr")
         self.assertEqual(snapshot["decision"].action, "buy")
+
+    def test_scan_and_choose_raises_when_all_pairs_fail(self) -> None:
+        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="fallback_idr", auto_resume=False)
+        trader = AllFailTrader(config)
+        with self.assertRaises(RuntimeError) as ctx:
+            trader.scan_and_choose()
+        self.assertIn("a_idr", str(ctx.exception))
 
     def test_maybe_execute_limits_buy_amount_by_available_cash(self) -> None:
         config = BotConfig(

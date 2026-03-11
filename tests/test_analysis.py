@@ -28,6 +28,14 @@ class AnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(candles[1].high, 130.0)
         self.assertAlmostEqual(candles[1].volume, 2.0)
 
+    def test_build_candles_ignores_non_dict_entries(self) -> None:
+        trades = [
+            {"date": 0, "price": "100", "amount": "1"},
+            "bad",  # should be ignored
+        ]
+        candles = build_candles(trades, interval_seconds=60)
+        self.assertEqual(len(candles), 1)
+
     def test_moving_average_and_trend(self) -> None:
         candles = [Candle(i, i, i, i, i, 1.0) for i in range(1, 11)]
         trend = analyze_trend(candles, fast_window=3, slow_window=5)
