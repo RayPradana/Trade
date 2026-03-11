@@ -398,7 +398,12 @@ class TraderSelectionTests(unittest.TestCase):
         mock_sleep.assert_called_once_with(trader._SCAN_BACKOFF_BASE)
 
     def test_analyze_with_retry_raises_after_max_retries(self) -> None:
-        """After MAX_SCAN_RETRIES 429s, _analyze_with_retry must re-raise the last error."""
+        """After MAX_SCAN_RETRIES 429s, _analyze_with_retry must re-raise the last error.
+
+        Crucially, sleep() must NOT be called after the final attempt: the
+        backoff delay only makes sense when a subsequent retry will follow it.
+        Sleeping after the last failure would block the scan for no benefit.
+        """
         config = BotConfig(api_key=None, scan_request_delay=0.0)
         trader = GuardedTrader(config)
         sleep_calls: list[float] = []
@@ -413,8 +418,9 @@ class TraderSelectionTests(unittest.TestCase):
         with mock.patch("bot.trader.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
             with self.assertRaises(requests.HTTPError):
                 trader._analyze_with_retry("btc_idr")
-        # Should have slept exactly MAX_SCAN_RETRIES times with increasing delays
-        self.assertEqual(len(sleep_calls), trader._MAX_SCAN_RETRIES)
+        # Sleep happens only between retries (before each retry), not after the
+        # final failed attempt — so the number of sleeps is MAX_SCAN_RETRIES - 1.
+        self.assertEqual(len(sleep_calls), trader._MAX_SCAN_RETRIES - 1)
         for i, delay in enumerate(sleep_calls):
             expected = min(trader._SCAN_BACKOFF_BASE * (2 ** i), trader._SCAN_BACKOFF_MAX)
             self.assertAlmostEqual(delay, expected)

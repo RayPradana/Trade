@@ -1101,11 +1101,15 @@ class Trader:
                         "Rate-limited on %s (attempt %d/%d); backing off %.1fs",
                         pair, attempt + 1, self._MAX_SCAN_RETRIES, backoff,
                     )
-                    time.sleep(backoff)
                     last_exc = exc
                     # Don't rely on a stale prefetched ticker on retry; let the
                     # call fetch it fresh via REST.
                     prefetched_ticker = None
+                    # Only sleep when there is a subsequent retry; sleeping after
+                    # the final attempt would block the scan for no benefit since
+                    # the exception is raised immediately after the loop.
+                    if attempt < self._MAX_SCAN_RETRIES - 1:
+                        time.sleep(backoff)
                 else:
                     raise
         raise last_exc
