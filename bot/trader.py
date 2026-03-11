@@ -86,6 +86,40 @@ class Trader:
             score += spread_bonus
         return max(0.0, min(1.5, score))
 
+    def _pair_volume(self, pair: str) -> float:
+        """Return the cached 24-h IDR trading volume for *pair*, or 0.0.
+
+        Used for priority sorting so high-liquidity pairs are scanned first.
+        Key lookup order:
+        1. ``vol_idr``     – standard Indodax summaries field for all IDR pairs
+        2. ``idr_volume``  – alternative spelling used by some endpoints
+        3. ``volume``      – generic fallback
+        Pairs with no cached ticker (absent from summaries) return 0.0 so they
+        are placed at the end of the priority-sorted list.
+        """
+        if self._multi_feed is None:
+            return 0.0
+        ticker = self._multi_feed.get_ticker(pair)
+        if ticker is None:
+            return 0.0
+        for key in ("vol_idr", "idr_volume", "volume"):
+            val = ticker.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        return 0.0
+
+    def _sort_pairs_by_priority(self, pairs: List[str]) -> List[str]:
+        """Return *pairs* sorted by 24-h IDR volume, highest first (stable).
+
+        Pairs with no cached ticker are placed at the end so the most liquid
+        — and typically most volatile / profitable — coins are always analyzed
+        first in the serial scan loop.
+        """
+        return sorted(pairs, key=self._pair_volume, reverse=True)
+
     def _staged_amounts(self, decision: StrategyDecision, snapshot: Dict[str, Any]) -> List[float]:
         total = decision.amount
         if total <= 0:
@@ -525,6 +559,13 @@ class Trader:
         else:
             pairs = all_pairs
 
+        # ── Priority sort ────────────────────────────────────────────────────
+        # Re-order by 24-h IDR trading volume (highest first) so the serial
+        # loop reaches the most liquid — and most likely tradeable — pairs
+        # before touching low-volume tail coins.  Pairs absent from the cache
+        # stay at the end.
+        pairs = self._sort_pairs_by_priority(pairs)
+
         best_pair = pairs[0] if pairs else self.config.pair
         best_snapshot: Optional[Dict[str, Any]] = None
         best_score = -1.0
@@ -533,7 +574,7 @@ class Trader:
 
         feed_seeded = self._multi_feed.is_seeded
 
-        for pair in pairs:
+        for scan_idx, pair in enumerate(pairs):
             if self.config.scan_request_delay > 0:
                 time.sleep(self.config.scan_request_delay)
             # Use the multi-pair feed's cached ticker to skip the per-pair REST
@@ -560,6 +601,22 @@ class Trader:
                 best_score = score
                 best_snapshot = snapshot
                 best_pair = pair
+
+            # ── Serial early exit ─────────────────────────────────────────
+            # Stop scanning as soon as the first pair whose signal meets the
+            # confidence threshold is found.  Because pairs are sorted by
+            # liquidity (liquid-first), this exits on the highest-quality
+            # opportunity available without analysing all 500+ pairs.
+            # Lower-volume pairs are deferred to later cycle windows.
+            if decision.confidence >= self.config.min_confidence:
+                logger.debug(
+                    "Serial scan: early exit on %s (conf=%.3f, scanned %d/%d pairs)",
+                    pair,
+                    decision.confidence,
+                    scan_idx + 1,
+                    len(pairs),
+                )
+                break
 
         if skipped_pairs:
             logger.debug(

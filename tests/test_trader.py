@@ -155,8 +155,8 @@ class TraderSelectionTests(unittest.TestCase):
                 "decision": StrategyDecision(
                     mode="swing_trading",
                     action="buy",
-                    confidence=0.6,
-                    reason="ok",
+                    confidence=0.3,  # below min_confidence=0.52 → no early exit here
+                    reason="weak",
                     target_price=100,
                     amount=0.1,
                     stop_loss=95,
@@ -173,7 +173,7 @@ class TraderSelectionTests(unittest.TestCase):
                 "decision": StrategyDecision(
                     mode="day_trading",
                     action="buy",
-                    confidence=0.9,
+                    confidence=0.9,  # above threshold → serial early exit
                     reason="better",
                     target_price=100,
                     amount=0.1,
@@ -420,15 +420,16 @@ class TraderSelectionTests(unittest.TestCase):
             self.assertAlmostEqual(delay, expected)
 
     def test_scan_request_delay_is_honoured(self) -> None:
-        """scan_and_choose must call time.sleep(scan_request_delay) before each pair."""
+        """scan_and_choose must call time.sleep(scan_request_delay) before each pair it analyzes."""
         config = BotConfig(api_key=None, scan_request_delay=0.5)
         snapshots = {
             "a_idr": {
                 "pair": "a_idr", "price": 1.0, "trend": None, "orderbook": None,
                 "volatility": None, "levels": None,
                 "decision": StrategyDecision(
-                    mode="scalping", action="buy", confidence=0.7, reason="ok",
-                    target_price=1, amount=10, stop_loss=0.99, take_profit=1.01,
+                    # hold → no early exit; delay is still applied before analysing this pair
+                    mode="scalping", action="hold", confidence=0.1, reason="quiet",
+                    target_price=1, amount=0, stop_loss=None, take_profit=None,
                 ),
             },
             "b_idr": {
@@ -444,13 +445,20 @@ class TraderSelectionTests(unittest.TestCase):
         import unittest.mock as mock
         with mock.patch("bot.trader.time.sleep") as mock_sleep:
             trader.scan_and_choose()
-        # sleep should be called once per pair (2 pairs)
+        # sleep must fire once per pair analyzed:
+        # a_idr (hold, delay fires) → b_idr (buy ≥ min_confidence → early exit, delay fires)
         self.assertEqual(mock_sleep.call_count, 2)
         for call_args in mock_sleep.call_args_list:
             self.assertEqual(call_args, mock.call(0.5))
 
     def test_scan_and_choose_uses_summaries_to_prefetch_tickers(self) -> None:
-        """scan_and_choose should call get_summaries() once and pass ticker data to analyze_market."""
+        """scan_and_choose must pass the feed-cached ticker as prefetched_ticker to analyze_market.
+
+        In serial mode the loop exits on the first pair whose signal meets the
+        confidence threshold, so only one pair is analyzed before early-exit.
+        The important invariant is that the returned pair received a non-None
+        prefetched ticker sourced from the multi-pair feed.
+        """
         import unittest.mock as mock
 
         config = BotConfig(api_key=None, scan_request_delay=0.0)
@@ -486,16 +494,17 @@ class TraderSelectionTests(unittest.TestCase):
 
         trader = SummaryTrader(config, client=SummaryClient())
         with mock.patch("bot.trader.time.sleep"):
-            trader.scan_and_choose()
+            returned_pair, _ = trader.scan_and_choose()
 
-        # Both pairs must have been analyzed with a non-None prefetched ticker
-        self.assertEqual(len(received_prefetched), 2)
-        pairs_seen = {r[0] for r in received_prefetched}
-        self.assertIn("btc_idr", pairs_seen)
-        self.assertIn("eth_idr", pairs_seen)
-        for pair_name, ticker in received_prefetched:
-            self.assertIsNotNone(ticker, f"Expected prefetched_ticker for {pair_name}")
-            self.assertIn("last", ticker)
+        # Serial early exit: at least 1 pair must have been analyzed
+        self.assertGreaterEqual(len(received_prefetched), 1)
+        # The returned pair must have received a non-None prefetched ticker from the feed
+        returned_entry = next((r for r in received_prefetched if r[0] == returned_pair), None)
+        self.assertIsNotNone(returned_entry, f"Returned pair {returned_pair} not in analyzed list")
+        assert returned_entry is not None  # narrowing for type checker
+        pair_name, ticker = returned_entry
+        self.assertIsNotNone(ticker, f"Expected prefetched_ticker for {pair_name}")
+        self.assertIn("last", ticker)
 
     def test_analyze_with_retry_handles_runtimeerror_429(self) -> None:
         """_analyze_with_retry must retry when the client raises RuntimeError wrapping a 429.
@@ -764,6 +773,108 @@ class TraderSelectionTests(unittest.TestCase):
         # btc_idr must still be analyzed even with no cache (REST fallback)
         self.assertIn("btc_idr", analyzed)
 
+    def test_serial_scan_exits_early_on_first_valid_signal(self) -> None:
+        """scan_and_choose must stop after the first pair that meets min_confidence.
 
-if __name__ == "__main__":
-    unittest.main()
+        Three pairs: first two are below threshold (no exit), third meets it
+        (exit).  The fourth pair must NEVER be analyzed.
+        """
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        all_pairs = ["p1_idr", "p2_idr", "p3_idr", "p4_idr"]
+
+        def make_snap(pair: str, action: str, conf: float) -> Dict[str, Any]:
+            return {
+                "pair": pair, "price": 100.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action=action, confidence=conf, reason="test",
+                    target_price=100, amount=1, stop_loss=99, take_profit=101,
+                ),
+            }
+
+        snapshots = {
+            "p1_idr": make_snap("p1_idr", "buy", 0.3),   # below threshold → no exit
+            "p2_idr": make_snap("p2_idr", "buy", 0.4),   # below threshold → no exit
+            "p3_idr": make_snap("p3_idr", "buy", 0.8),   # above threshold → EXIT HERE
+            "p4_idr": make_snap("p4_idr", "buy", 0.9),   # must not be reached
+        }
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+        trader = StubTrader(config, snapshots)
+        trader._all_pairs = all_pairs
+
+        # Seeded feed so all pairs have cached tickers (no skip)
+        feed = MultiPairFeed(all_pairs, mock.MagicMock(), websocket_enabled=False, summaries_interval=9999)
+        for p in all_pairs:
+            feed._apply_ws_message_for_pair(p, {"last": "100"})
+        self.assertTrue(feed.is_seeded)
+        trader._multi_feed = feed
+
+        analyzed: list[str] = []
+        original_analyze = trader.analyze_market
+
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if pair and pair != config.pair:
+                analyzed.append(pair)
+            return original_analyze(pair, prefetched_ticker)
+
+        trader.analyze_market = recording_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            returned_pair, snapshot = trader.scan_and_choose()
+
+        # p3_idr triggers the early exit
+        self.assertEqual(returned_pair, "p3_idr")
+        self.assertEqual(snapshot["decision"].confidence, 0.8)
+        # p4_idr must not have been analyzed
+        self.assertNotIn("p4_idr", analyzed)
+        # p1, p2, p3 must have been analyzed in order
+        self.assertIn("p1_idr", analyzed)
+        self.assertIn("p2_idr", analyzed)
+        self.assertIn("p3_idr", analyzed)
+
+    def test_scan_sorts_liquid_pairs_first(self) -> None:
+        """Pairs must be sorted by descending IDR volume before the scan loop."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        # eth_idr has 10× more IDR volume than btc_idr → must be scanned first
+        all_pairs = ["btc_idr", "eth_idr", "xrp_idr"]
+        snapshots = {
+            p: {
+                "pair": p, "price": 100.0, "trend": None, "orderbook": None,
+                "volatility": None, "levels": None, "indicators": None,
+                "decision": StrategyDecision(
+                    mode="scalping", action="buy", confidence=0.8, reason="ok",
+                    target_price=100, amount=1, stop_loss=99, take_profit=101,
+                ),
+            }
+            for p in all_pairs
+        }
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+        trader = StubTrader(config, snapshots)
+        trader._all_pairs = all_pairs
+
+        # Seed the feed with explicit volumes: eth highest, btc mid, xrp lowest
+        feed = MultiPairFeed(all_pairs, mock.MagicMock(), websocket_enabled=False, summaries_interval=9999)
+        feed._apply_ws_message_for_pair("btc_idr", {"last": "1000000", "vol_idr": "500000000"})
+        feed._apply_ws_message_for_pair("eth_idr", {"last": "50000", "vol_idr": "5000000000"})
+        feed._apply_ws_message_for_pair("xrp_idr", {"last": "1000", "vol_idr": "100000000"})
+        trader._multi_feed = feed
+
+        analysis_order: list[str] = []
+        original_analyze = trader.analyze_market
+
+        def recording_analyze(pair: str | None = None, prefetched_ticker: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if pair and pair in all_pairs:
+                analysis_order.append(pair)
+            return original_analyze(pair, prefetched_ticker)
+
+        trader.analyze_market = recording_analyze  # type: ignore[method-assign]
+        with mock.patch("bot.trader.time.sleep"):
+            # Serial early exit fires on the first pair analyzed (eth_idr, highest vol)
+            returned_pair, _ = trader.scan_and_choose()
+
+        # eth_idr (highest volume) must be analyzed first and returned via early exit
+        self.assertEqual(returned_pair, "eth_idr")
+        self.assertEqual(analysis_order[0], "eth_idr")
