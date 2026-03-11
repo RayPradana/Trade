@@ -36,6 +36,7 @@ class Trader:
         )
         self.client = client or IndodaxClient(
             config.api_key,
+            api_secret=config.api_secret,
             order_queue=self.order_queue,
             order_min_interval=config.order_min_interval,
             enable_queue=config.order_queue_enabled,
@@ -227,6 +228,10 @@ class Trader:
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         decision: StrategyDecision = snapshot["decision"]
         price = snapshot["price"]
+
+        # Update trailing stop before checking stop conditions
+        if self.config.trailing_stop_pct > 0:
+            self.tracker.update_trailing_stop(price, self.config.trailing_stop_pct)
 
         stop_reason = self.tracker.stop_reason(price)
         if stop_reason:

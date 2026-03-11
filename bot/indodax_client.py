@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import time
 from urllib.parse import urlencode
 from typing import Any, Dict, List, Optional
@@ -15,6 +17,7 @@ class IndodaxClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
         session: Optional[requests.Session] = None,
         base_url: str = "https://indodax.com",
         timeout: int = 15,
@@ -23,6 +26,7 @@ class IndodaxClient:
         enable_queue: bool = True,
     ) -> None:
         self.api_key = api_key
+        self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
@@ -84,13 +88,24 @@ class IndodaxClient:
     def _post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not self.api_key:
             raise ValueError("API key is required for private endpoints")
+        if not self.api_secret:
+            raise ValueError("API secret is required for private endpoints")
 
         payload: Dict[str, Any] = {"method": method, "nonce": int(time.time() * 1000)}
         if params:
             payload.update({k: v for k, v in params.items() if v is not None})
 
         encoded = urlencode(payload)
-        headers = {"Key": self.api_key, "Content-Type": "application/x-www-form-urlencoded"}
+        sign = hmac.new(
+            self.api_secret.encode("utf-8"),
+            encoded.encode("utf-8"),
+            hashlib.sha512,
+        ).hexdigest()
+        headers = {
+            "Key": self.api_key,
+            "Sign": sign,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
         response = self.session.post(
             f"{self.base_url}/tapi", data=encoded, headers=headers, timeout=self.timeout
         )

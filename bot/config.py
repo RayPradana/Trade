@@ -33,6 +33,7 @@ def _load_dotenv(path: Optional[Path] = None) -> None:
 @dataclass
 class BotConfig:
     api_key: Optional[str]
+    api_secret: Optional[str] = None
     pair: str = "btc_idr"  # Default/fallback pair when automatic scanning yields no candidates
     scan_pairs: Optional[List[str]] = None
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
@@ -56,6 +57,7 @@ class BotConfig:
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
+    trailing_stop_pct: float = 0.0  # 0 = disabled; e.g. 0.02 = 2% trailing stop
     auto_resume: bool = True
     state_file: str = "bot_state.json"
     staged_entry_steps: int = 3
@@ -78,6 +80,7 @@ class BotConfig:
             interval_seconds = int(interval_env) if interval_env is not None else int(interval_default)
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
+            api_secret=os.getenv("INDODAX_SECRET"),
             pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
             scan_pairs=scan_pairs,
             base_order_size=float(os.getenv("BASE_ORDER_SIZE", "0.0001")),
@@ -101,6 +104,7 @@ class BotConfig:
             initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000000")),
             target_profit_pct=float(os.getenv("TARGET_PROFIT_PCT", "0.2")),
             max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
+            trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.0")),
             auto_resume=os.getenv("AUTO_RESUME", "true").lower() in {"1", "true", "yes"},
             state_file=os.getenv("STATE_FILE", "bot_state.json"),
             staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
@@ -111,6 +115,8 @@ class BotConfig:
     def require_auth(self) -> None:
         if not self.api_key:
             raise ValueError("INDODAX_KEY is required for live trading")
+        if not self.api_secret:
+            raise ValueError("INDODAX_SECRET is required for live trading")
 
     def _validate(self) -> None:
         if not (0 < self.risk_per_trade <= 0.5):
@@ -131,5 +137,7 @@ class BotConfig:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
         if self.staged_entry_steps <= 0:
             raise ValueError("STAGED_ENTRY_STEPS must be positive")
+        if self.trailing_stop_pct < 0:
+            raise ValueError("TRAILING_STOP_PCT must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()
