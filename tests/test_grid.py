@@ -13,7 +13,6 @@ class GridPlanTests(unittest.TestCase):
             grid_enabled=True,
             grid_levels_per_side=2,
             grid_spacing_pct=0.01,
-            auto_resume=False,
         )
         plan = build_grid_plan(100.0, config)
         self.assertEqual(len(plan.buy_orders), 2)
@@ -31,7 +30,6 @@ class GridPlanTests(unittest.TestCase):
             grid_enabled=True,
             grid_levels_per_side=1,
             grid_spacing_pct=0.005,
-            auto_resume=False,
         )
         trader = Trader(config)
         plan = build_grid_plan(200.0, config)

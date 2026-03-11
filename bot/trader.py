@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -21,7 +19,6 @@ from .rate_limit import RateLimitedOrderQueue
 from .realtime import RealtimeFeed
 from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
-from .persistence import StatePersistence
 from .strategies import StrategyDecision, make_trade_decision
 from .tracking import PortfolioTracker
 
@@ -47,19 +44,7 @@ class Trader:
             target_profit_pct=config.target_profit_pct,
             max_loss_pct=config.max_loss_pct,
         )
-        self.persistence = StatePersistence(Path(config.state_file))
-        self._restored_state: Optional[Dict[str, Any]] = None
         self.realtime: Optional[RealtimeFeed] = None
-        if config.auto_resume:
-            restored = self.persistence.load()
-            if restored and isinstance(restored, dict):
-                portfolio_state = restored.get("portfolio")
-                if isinstance(portfolio_state, dict):
-                    self.tracker.load_state(portfolio_state)
-                restored_pair = restored.get("pair")
-                if restored_pair:
-                    self.config.pair = str(restored_pair)
-                self._restored_state = restored
         if config.real_time:
             self.realtime = RealtimeFeed(
                 pair=self.config.pair,
@@ -70,10 +55,6 @@ class Trader:
                 subscribe_message=config.websocket_subscribe_message,
             )
             self.realtime.start()
-
-    @property
-    def restored_state(self) -> Optional[Dict[str, Any]]:
-        return self._restored_state
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
@@ -89,40 +70,6 @@ class Trader:
         if last_value is None:
             raise ValueError("Ticker missing price fields")
         return float(last_value)
-
-    def _decision_to_dict(self, decision: StrategyDecision) -> Dict[str, Any]:
-        return {
-            "mode": decision.mode,
-            "action": decision.action,
-            "confidence": decision.confidence,
-            "reason": decision.reason,
-            "target_price": decision.target_price,
-            "amount": decision.amount,
-            "stop_loss": decision.stop_loss,
-            "take_profit": decision.take_profit,
-            "support": decision.support,
-            "resistance": decision.resistance,
-        }
-
-    def _persist_state(
-        self,
-        snapshot: Dict[str, Any],
-        decision: StrategyDecision,
-        reference_price: float,
-        outcome: Dict[str, Any],
-    ) -> None:
-        if not self.config.auto_resume:
-            return
-        state = {
-            "pair": snapshot.get("pair"),
-            "price": reference_price,
-            "decision": self._decision_to_dict(decision),
-            "portfolio": self.tracker.to_state(),
-            "outcome": outcome.get("status"),
-            "reason": outcome.get("reason"),
-            "timestamp": time.time(),
-        }
-        self.persistence.save(state)
 
     def _score_snapshot(self, snapshot: Dict[str, Any]) -> float:
         decision: StrategyDecision = snapshot["decision"]
@@ -238,7 +185,6 @@ class Trader:
         if stop_reason:
             logger.info("Stop triggered (%s) equity=%s", stop_reason, self.tracker.as_dict(price))
             outcome = {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
-            self._persist_state(snapshot, decision, price, outcome)
             return outcome
 
         if self.config.grid_enabled and snapshot.get("grid_plan"):
@@ -247,7 +193,6 @@ class Trader:
         if decision.action == "hold":
             logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, self.tracker.as_dict(price))
             outcome = {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
-            self._persist_state(snapshot, decision, price, outcome)
             return outcome
 
         if decision.confidence < self.config.min_confidence:
@@ -262,7 +207,6 @@ class Trader:
                 "reason": f"confidence {decision.confidence} below threshold {self.config.min_confidence}",
                 "portfolio": self.tracker.as_dict(price),
             }
-            self._persist_state(snapshot, decision, price, outcome)
             return outcome
 
         # simple slippage guard using top of book
@@ -282,7 +226,6 @@ class Trader:
                 "reason": "slippage too high for buy",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
-            self._persist_state(snapshot, decision, reference_price, outcome)
             return outcome
         if decision.action == "sell" and reference_price < allowed_min:
             logger.info("Skip sell due to slippage price=%s allowed_min=%s", reference_price, allowed_min)
@@ -291,7 +234,6 @@ class Trader:
                 "reason": "slippage too high for sell",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
-            self._persist_state(snapshot, decision, reference_price, outcome)
             return outcome
 
         # capital and position guards (risk management)
@@ -310,7 +252,6 @@ class Trader:
                 "reason": "insufficient balance or position",
                 "portfolio": self.tracker.as_dict(reference_price),
             }
-            self._persist_state(snapshot, decision, reference_price, outcome)
             return outcome
 
         staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
@@ -339,7 +280,6 @@ class Trader:
                 "reason": decision.reason,
                 "portfolio": self.tracker.as_dict(reference_price),
             }
-            self._persist_state(snapshot, decision, reference_price, outcome)
             return outcome
 
         # live trading path
@@ -371,7 +311,6 @@ class Trader:
             "mode": decision.mode,
             "portfolio": self.tracker.as_dict(reference_price),
         }
-        self._persist_state(snapshot, decision, reference_price, outcome)
         return outcome
 
     def _execute_grid(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -386,7 +325,6 @@ class Trader:
                 "reason": "no grid orders generated",
                 "portfolio": self.tracker.as_dict(price),
             }
-            self._persist_state(snapshot, decision, price, outcome)
             return outcome
 
         pair = snapshot["pair"]
@@ -398,7 +336,6 @@ class Trader:
                 "orders": orders_payload,
                 "portfolio": self.tracker.as_dict(price),
             }
-            self._persist_state(snapshot, decision, price, outcome)
             return outcome
 
         if self.config.api_key is None:
@@ -416,7 +353,6 @@ class Trader:
             "orders": executed,
             "portfolio": self.tracker.as_dict(price),
         }
-        self._persist_state(snapshot, decision, price, outcome)
         return outcome
 
     def force_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -456,7 +392,6 @@ class Trader:
                 "amount": amount,
                 "portfolio": self.tracker.as_dict(reference_price),
             }
-            self._persist_state(snapshot, snapshot["decision"], reference_price, outcome)
             return outcome
 
         if self.config.api_key is None:
@@ -473,29 +408,24 @@ class Trader:
             "order": order_resp,
             "portfolio": self.tracker.as_dict(reference_price),
         }
-        self._persist_state(snapshot, snapshot["decision"], reference_price, outcome)
         return outcome
 
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
-        pairs: List[str] = []
-        if self.config.scan_pairs:
-            pairs = list(self.config.scan_pairs)
-        else:
-            if self._all_pairs is None:
-                try:
-                    pairs_data = self.client.get_pairs()
-                    names = []
-                    for p in pairs_data:
-                        if "name" in p:
-                            names.append(p["name"])
-                        elif "ticker_id" in p:
-                            names.append(p["ticker_id"])
-                    self._all_pairs = [n.lower() for n in names if n]
-                # pragma: no cover - guard for pair listing/parsing failures
-                except (requests.RequestException, RuntimeError, ValueError) as exc:
-                    logger.warning("Failed to load pairs; fallback to default %s", exc)
-                    self._all_pairs = [self.config.pair]
-            pairs = self._all_pairs or [self.config.pair]
+        if self._all_pairs is None:
+            try:
+                pairs_data = self.client.get_pairs()
+                names = []
+                for p in pairs_data:
+                    if "name" in p:
+                        names.append(p["name"])
+                    elif "ticker_id" in p:
+                        names.append(p["ticker_id"])
+                self._all_pairs = [n.lower() for n in names if n]
+            # pragma: no cover - guard for pair listing/parsing failures
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                logger.warning("Failed to load pairs; fallback to default %s", exc)
+                self._all_pairs = [self.config.pair]
+        pairs = self._all_pairs or [self.config.pair]
 
         best_pair = self.config.pair
         best_snapshot: Optional[Dict[str, Any]] = None

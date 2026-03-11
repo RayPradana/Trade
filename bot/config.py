@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 
 def _load_dotenv(path: Optional[Path] = None) -> None:
@@ -34,8 +34,7 @@ def _load_dotenv(path: Optional[Path] = None) -> None:
 class BotConfig:
     api_key: Optional[str]
     api_secret: Optional[str] = None
-    pair: str = "btc_idr"  # Default/fallback pair when automatic scanning yields no candidates
-    scan_pairs: Optional[List[str]] = None
+    pair: str = "btc_idr"  # Last-resort fallback used when pair discovery via get_pairs() fails entirely
     base_order_size: float = 0.0001  # size in base asset (e.g., BTC for btc_idr)
     risk_per_trade: float = 0.01  # 1% default
     dry_run: bool = True
@@ -59,8 +58,6 @@ class BotConfig:
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
     trailing_stop_pct: float = 0.0  # 0 = disabled; e.g. 0.02 = 2% trailing stop
-    auto_resume: bool = True
-    state_file: str = "bot_state.json"
     staged_entry_steps: int = 3
     position_check_interval_seconds: int = 60  # faster poll when monitoring an open position
     cycle_summary_interval: int = 10  # print a performance summary every N full scan cycles
@@ -70,8 +67,6 @@ class BotConfig:
     def from_env(cls) -> "BotConfig":
         existing_keys = set(os.environ.keys())
         _load_dotenv()
-        pairs_env = os.getenv("TRADE_PAIRS")
-        scan_pairs = [p.strip().lower() for p in pairs_env.split(",")] if pairs_env else None
         real_time = os.getenv("REALTIME_MODE", os.getenv("REAL_TIME", "false")).lower() in {"1", "true", "yes"}
         interval_default = "1" if real_time else "300"
         user_set_interval = "INTERVAL_SECONDS" in existing_keys
@@ -85,8 +80,6 @@ class BotConfig:
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             api_secret=os.getenv("INDODAX_SECRET"),
-            pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
-            scan_pairs=scan_pairs,
             base_order_size=float(os.getenv("BASE_ORDER_SIZE", "0.0001")),
             risk_per_trade=float(os.getenv("RISK_PER_TRADE", "0.01")),
             dry_run=os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"},
@@ -110,8 +103,6 @@ class BotConfig:
             target_profit_pct=float(os.getenv("TARGET_PROFIT_PCT", "0.2")),
             max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
             trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.0")),
-            auto_resume=os.getenv("AUTO_RESUME", "true").lower() in {"1", "true", "yes"},
-            state_file=os.getenv("STATE_FILE", "bot_state.json"),
             staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
             position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
             cycle_summary_interval=int(os.getenv("CYCLE_SUMMARY_INTERVAL", "10")),

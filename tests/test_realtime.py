@@ -46,7 +46,7 @@ class RealtimeTests(unittest.TestCase):
         self.assertTrue(feed.has_snapshot)
 
     def test_trader_prefers_realtime_snapshot(self) -> None:
-        config = BotConfig(api_key=None, real_time=False, auto_resume=False)
+        config = BotConfig(api_key=None, real_time=False)
         client = _ClientStub()
         trader = Trader(config, client=client)
         trader.realtime = _RealtimeStub(

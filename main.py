@@ -103,19 +103,9 @@ def main() -> None:
         config.require_auth()
 
     trader = Trader(config)
-    if trader.restored_state:
-        restored_portfolio = trader.restored_state.get("portfolio", {})
-        logging.info(
-            "🔄 Auto-resume: pair=%s  cash=%s  position=%s",
-            trader.restored_state.get("pair", config.pair),
-            restored_portfolio.get("cash"),
-            restored_portfolio.get("base_position"),
-        )
-
     logging.info(
-        "🤖 Starting bot | mode=%s  pair=%s  dry_run=%s",
+        "🤖 Starting bot | mode=%s  dry_run=%s",
         config.trade_mode.upper(),
-        config.pair,
         config.dry_run,
     )
 

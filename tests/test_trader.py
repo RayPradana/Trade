@@ -16,8 +16,17 @@ class VolStub:
 
 
 class StubTrader(Trader):
+    """Trader that returns pre-built snapshots without making real API calls."""
+
+    class _Client:
+        def __init__(self, pairs: list[str]) -> None:
+            self._pairs = pairs
+
+        def get_pairs(self) -> list[dict]:
+            return [{"name": p} for p in self._pairs]
+
     def __init__(self, config: BotConfig, snapshots: Dict[str, Dict[str, Any]]) -> None:
-        super().__init__(config, client=None)  # client not used due to override
+        super().__init__(config, client=self._Client(list(snapshots.keys())))
         self._snapshots = snapshots
 
     def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
@@ -58,8 +67,12 @@ class AutoPairsTrader(Trader):
 class AllFailTrader(Trader):
     """Trader that always fails to analyze markets to simulate network/API outages."""
 
+    class _Client:
+        def get_pairs(self) -> list[dict]:
+            return [{"name": "a_idr"}, {"name": "b_idr"}]
+
     def __init__(self, config: BotConfig) -> None:
-        super().__init__(config, client=None)
+        super().__init__(config, client=self._Client())
 
     def analyze_market(self, pair: str | None = None) -> Dict[str, Any]:
         raise requests.RequestException("network unavailable")
@@ -73,7 +86,7 @@ class TraderSelectionTests(unittest.TestCase):
         logging.disable(logging.NOTSET)
 
     def test_scan_and_choose_picks_best_confidence(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="a_idr", auto_resume=False)
+        config = BotConfig(api_key=None)
         snapshots = {
             "a_idr": {
                 "pair": "a_idr",
@@ -118,7 +131,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(snapshot["decision"].confidence, 0.8)
 
     def test_scan_and_choose_without_manual_input_uses_auto_pairs(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=None, pair="manual_idr", auto_resume=False)
+        config = BotConfig(api_key=None, pair="manual_idr")
         snapshots = {
             "auto_a": {
                 "pair": "auto_a",
@@ -164,7 +177,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(trader.config.pair, "manual_idr")  # config stays as fallback
 
     def test_scan_and_choose_falls_back_when_all_hold(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="fallback_idr", auto_resume=False)
+        config = BotConfig(api_key=None, pair="fallback_idr")
         snapshots = {
             "a_idr": {
                 "pair": "a_idr",
@@ -227,7 +240,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(snapshot["decision"].action, "buy")
 
     def test_scan_and_choose_raises_when_all_pairs_fail(self) -> None:
-        config = BotConfig(api_key=None, scan_pairs=["a_idr", "b_idr"], pair="fallback_idr", auto_resume=False)
+        config = BotConfig(api_key=None)
         trader = AllFailTrader(config)
         with self.assertRaises(RuntimeError) as ctx:
             trader.scan_and_choose()
@@ -240,7 +253,6 @@ class TraderSelectionTests(unittest.TestCase):
             initial_capital=50.0,
             max_loss_pct=0.9,
             target_profit_pct=1.0,
-            auto_resume=False,
         )
         trader = GuardedTrader(config)
         trader.tracker.cash = 50.0  # very small cash
@@ -270,7 +282,6 @@ class TraderSelectionTests(unittest.TestCase):
             initial_capital=1000.0,
             max_loss_pct=0.9,
             target_profit_pct=1.0,
-            auto_resume=False,
             staged_entry_steps=3,
         )
         trader = GuardedTrader(config)
@@ -304,7 +315,6 @@ class TraderSelectionTests(unittest.TestCase):
             initial_capital=1000.0,
             max_loss_pct=0.9,
             target_profit_pct=2.0,
-            auto_resume=False,
         )
         trader = GuardedTrader(config)
         # Simulate an open position: bought 5 units at 90
@@ -328,7 +338,7 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(trader.tracker.base_position, 0.0)
 
     def test_force_sell_returns_no_position_when_not_holding(self) -> None:
-        config = BotConfig(api_key=None, dry_run=True, auto_resume=False)
+        config = BotConfig(api_key=None, dry_run=True)
         trader = GuardedTrader(config)
         decision = StrategyDecision(
             mode="day_trading",

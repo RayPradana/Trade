@@ -48,9 +48,6 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `INITIAL_CAPITAL` | Modal awal (quote currency, mis. IDR) | `1000000` |
 | `TARGET_PROFIT_PCT` | Target profit relatif (0.2 = 20%) | `0.2` |
 | `MAX_LOSS_PCT` | Batas kerugian relatif (0.1 = 10%) | `0.1` |
-| `TRADE_PAIRS` | Daftar pasangan dipisah koma untuk discan otomatis (jika kosong, bot tarik seluruh pairs dari API) | `btc_idr` |
-| `AUTO_RESUME` | `true/false` untuk mengaktifkan pemulihan state otomatis | `true` |
-| `STATE_FILE` | Lokasi file state JSON untuk auto-resume | `bot_state.json` |
 | `STAGED_ENTRY_STEPS` | Jumlah maksimum langkah entry bertahap (mis. 3 langkah 50/30/20%) | `3` |
 | `POSITION_CHECK_INTERVAL` | Interval (detik) polling saat sedang memegang posisi | `60` |
 | `CYCLE_SUMMARY_INTERVAL` | Cetak ringkasan performa setiap N siklus scan penuh | `10` |
@@ -65,7 +62,6 @@ Salin `.env.example` menjadi `.env` di root repo, lalu isi:
 
 ```
 INDODAX_KEY=your_api_key
-TRADE_PAIRS=btc_idr,eth_idr
 DRY_RUN=true
 ```
 
@@ -152,7 +148,6 @@ Opsi penting:
    - **Dry-run**: hanya log simulasi.
    - **Live**: mengirim **limit order** `trade` ke `tapi` Indodax (butuh API key/secret). Stop-limit dijaga secara logis lewat stop-loss/take-profit dan pengecekan slippage.
    - Risk guard: ukuran order dibatasi modal/posisi yang tersedia, tidak akan oversell; portfolio guard berhenti otomatis bila target profit tercapai atau batas rugi terlampaui.
-   - **Auto-resume**: state portofolio dan keputusan terakhir disimpan di `STATE_FILE` agar bot melanjutkan sesi jika terhenti mendadak.
 
 ## Operasi Mandiri 24/7
 
