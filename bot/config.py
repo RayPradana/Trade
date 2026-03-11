@@ -62,13 +62,20 @@ class BotConfig:
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        existing_keys = set(os.environ.keys())
         _load_dotenv()
         pairs_env = os.getenv("TRADE_PAIRS")
         scan_pairs = [p.strip().lower() for p in pairs_env.split(",")] if pairs_env else None
         real_time = os.getenv("REALTIME_MODE", os.getenv("REAL_TIME", "false")).lower() in {"1", "true", "yes"}
         interval_default = "1" if real_time else "300"
+        user_set_interval = "INTERVAL_SECONDS" in existing_keys
         grid_enabled = os.getenv("GRID_ENABLED", "false").lower() in {"1", "true", "yes"}
         websocket_enabled = os.getenv("WEBSOCKET_ENABLED", "true").lower() in {"1", "true", "yes"}
+        interval_env = os.getenv("INTERVAL_SECONDS")
+        if real_time:
+            interval_seconds = int(interval_env) if user_set_interval and interval_env is not None else 1
+        else:
+            interval_seconds = int(interval_env) if interval_env is not None else int(interval_default)
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
@@ -87,7 +94,7 @@ class BotConfig:
             websocket_enabled=websocket_enabled,
             websocket_url=os.getenv("WEBSOCKET_URL"),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
-            interval_seconds=int(os.getenv("INTERVAL_SECONDS", interval_default)),
+            interval_seconds=interval_seconds,
             fast_window=int(os.getenv("FAST_WINDOW", "12")),
             slow_window=int(os.getenv("SLOW_WINDOW", "48")),
             max_slippage_pct=float(os.getenv("MAX_SLIPPAGE_PCT", "0.001")),
