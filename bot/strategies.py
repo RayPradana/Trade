@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Optional
+
+from .analysis import OrderbookInsight, TrendResult, VolatilityStats
+from .config import BotConfig
+
+
+@dataclass
+class StrategyDecision:
+    mode: str
+    action: str
+    confidence: float
+    reason: str
+    target_price: float
+    amount: float
+    stop_loss: Optional[float]
+    take_profit: Optional[float]
+
+
+def select_strategy(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> str:
+    if orderbook.spread_pct < 0.0015 and abs(orderbook.imbalance) > 0.25 and vol.volatility < 0.01:
+        return "scalping"
+    if trend.direction != "flat" and vol.volatility >= 0.01 and vol.volatility <= 0.03:
+        return "day_trading"
+    if trend.direction != "flat" and trend.strength > 0.01 and vol.volatility > 0.015:
+        return "swing_trading"
+    return "position_trading"
+
+
+def _confidence(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> float:
+    trend_score = min(trend.strength * 10, 1.0)
+    orderbook_score = min(abs(orderbook.imbalance) + max(0, 0.002 - orderbook.spread_pct) * 50, 1.0)
+    vol_score = 1 - min(vol.volatility * 10, 0.8)
+    return round(max(0.0, min(1.0, (trend_score * 0.45 + orderbook_score * 0.35 + vol_score * 0.2))), 3)
+
+
+def make_trade_decision(
+    trend: TrendResult,
+    orderbook: OrderbookInsight,
+    vol: VolatilityStats,
+    current_price: float,
+    config: BotConfig,
+) -> StrategyDecision:
+    mode = select_strategy(trend, orderbook, vol)
+    conf = _confidence(trend, orderbook, vol)
+
+    if trend.direction == "up":
+        action = "buy"
+        stop_loss = current_price * (1 - max(0.0025, vol.volatility * 2))
+        take_profit = current_price * (1 + max(0.005, vol.volatility * 3))
+    elif trend.direction == "down":
+        action = "sell"
+        stop_loss = current_price * (1 + max(0.0025, vol.volatility * 2))
+        take_profit = current_price * (1 - max(0.005, vol.volatility * 3))
+    else:
+        action = "hold"
+        stop_loss = None
+        take_profit = None
+
+    reason = f"{mode} | trend={trend.direction} strength={trend.strength:.4f} vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f}"
+
+    # size based on risk per trade relative to stop distance
+    if action == "hold" or not stop_loss:
+        amount = 0.0
+    else:
+        risk_per_unit = abs(current_price - stop_loss)
+        if risk_per_unit == 0:
+            amount = 0.0
+        else:
+            desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
+            unit_risk_value = risk_per_unit * config.base_order_size
+            scale = min(2.0, desired_risk_value / max(1e-8, unit_risk_value))
+            amount = max(config.base_order_size * scale, config.base_order_size * 0.25)
+
+    return StrategyDecision(
+        mode=mode,
+        action=action,
+        confidence=conf,
+        reason=reason,
+        target_price=current_price,
+        amount=amount,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
