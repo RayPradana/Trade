@@ -11,6 +11,7 @@ SCALP_SPREAD_THRESHOLD = 0.0015
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
+MIN_DIVISOR = 1e-8  # prevent division by zero when risk window is extremely small
 
 
 @dataclass
@@ -81,8 +82,8 @@ def make_trade_decision(
             amount = 0.0
         else:
             desired_risk_value = current_price * config.base_order_size * config.risk_per_trade
-            unit_risk_value = risk_per_unit * config.base_order_size
-            scale = min(2.0, desired_risk_value / max(1e-8, unit_risk_value))
+            base_order_risk = risk_per_unit * config.base_order_size
+            scale = min(2.0, desired_risk_value / max(MIN_DIVISOR, base_order_risk))
             amount = max(config.base_order_size * scale, config.base_order_size * 0.25)
 
     return StrategyDecision(

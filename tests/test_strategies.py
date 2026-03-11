@@ -11,7 +11,12 @@ class StrategyTests(unittest.TestCase):
 
     def test_select_strategy_scalping(self) -> None:
         trend = TrendResult("up", 101, 100, 0.01)
-        orderbook = OrderbookInsight(spread_pct=0.0005, bid_volume=10, ask_volume=5, imbalance=0.33)
+        orderbook = OrderbookInsight(
+            spread_pct=0.0005,
+            bid_volume=10,
+            ask_volume=5,
+            imbalance=(10 - 5) / (10 + 5),
+        )
         vol = VolatilityStats(volatility=0.005, avg_volume=1)
         mode = select_strategy(trend, orderbook, vol)
         self.assertEqual(mode, "scalping")

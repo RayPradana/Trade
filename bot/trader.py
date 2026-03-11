@@ -18,8 +18,14 @@ class Trader:
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
-            return float(ticker["ticker"].get("last") or ticker["ticker"].get("last_price", 0))
-        return float(ticker.get("last") or ticker.get("last_price") or 0)
+            last = ticker["ticker"].get("last")
+            if last is None:
+                last = ticker["ticker"].get("last_price", 0)
+            return float(last)
+        last_value = ticker.get("last")
+        if last_value is None:
+            last_value = ticker.get("last_price", 0)
+        return float(last_value)
 
     def analyze_market(self) -> Dict[str, Any]:
         ticker = self.client.get_ticker(self.config.pair)
@@ -57,8 +63,10 @@ class Trader:
 
         # simple slippage guard using top of book
         depth = self.client.get_depth(self.config.pair, count=5)
-        top_bid = float(depth.get("buy", [[0]])[0][0]) if depth.get("buy") else price
-        top_ask = float(depth.get("sell", [[0]])[0][0]) if depth.get("sell") else price
+        bids = depth.get("buy") or []
+        asks = depth.get("sell") or []
+        top_bid = float(bids[0][0]) if bids else price
+        top_ask = float(asks[0][0]) if asks else price
         reference_price = top_ask if decision.action == "buy" else top_bid
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
