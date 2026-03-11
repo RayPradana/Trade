@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+from .config import BotConfig
+
+
+@dataclass
+class GridOrder:
+    side: str  # "buy" or "sell"
+    price: float
+    amount: float
+
+
+@dataclass
+class GridPlan:
+    anchor_price: float
+    buy_orders: List[GridOrder]
+    sell_orders: List[GridOrder]
+
+    @property
+    def orders(self) -> List[GridOrder]:
+        return self.buy_orders + self.sell_orders
+
+
+def build_grid_plan(current_price: float, config: BotConfig) -> GridPlan:
+    """Build symmetric grid orders above and below the anchor price."""
+    levels = max(1, config.grid_levels_per_side)
+    spacing = max(1e-6, config.grid_spacing_pct)
+    amount = config.grid_order_size or config.base_order_size
+
+    buy_orders: List[GridOrder] = []
+    sell_orders: List[GridOrder] = []
+
+    for level in range(1, levels + 1):
+        offset = spacing * level
+        buy_price = round(current_price * (1 - offset), 8)
+        sell_price = round(current_price * (1 + offset), 8)
+        buy_orders.append(GridOrder("buy", buy_price, amount))
+        sell_orders.append(GridOrder("sell", sell_price, amount))
+
+    return GridPlan(anchor_price=current_price, buy_orders=buy_orders, sell_orders=sell_orders)

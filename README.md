@@ -34,6 +34,10 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `REALTIME_MODE` | Aktifkan polling cepat untuk data hampir real-time (default 1s jika aktif) | `false` |
 | `MIN_CONFIDENCE` | Ambang kepercayaan minimum untuk eksekusi | `0.52` |
 | `INTERVAL_SECONDS` | Interval candlestick hasil agregasi trades (default 1 detik bila `REALTIME_MODE=true`) | `300` |
+| `GRID_ENABLED` | Aktifkan mode grid trading (menempatkan buy/sell bertingkat) | `false` |
+| `GRID_LEVELS_PER_SIDE` | Jumlah level grid di tiap sisi harga anchor | `3` |
+| `GRID_SPACING_PCT` | Jarak antar level grid (0.004 = 0.4%) | `0.004` |
+| `GRID_ORDER_SIZE` | (Opsional) Ukuran order per level; default memakai `BASE_ORDER_SIZE` | - |
 | `FAST_WINDOW` | Periode MA cepat | `12` |
 | `SLOW_WINDOW` | Periode MA lambat | `48` |
 | `MAX_SLIPPAGE_PCT` | Batas slippage relatif | `0.001` |
@@ -76,6 +80,17 @@ DRY_RUN=false INDODAX_KEY=your_api_key python main.py
 
 ```bash
 REALTIME_MODE=true DRY_RUN=true python main.py
+```
+
+### Mode Grid Trading
+
+- Set `GRID_ENABLED=true` untuk menyalakan penempatan order beli/jual bertingkat simetris di sekitar harga saat ini.
+- Atur kepadatan grid dengan `GRID_LEVELS_PER_SIDE` (jumlah level per sisi) dan `GRID_SPACING_PCT` (jarak persen antar level).
+- (Opsional) Set `GRID_ORDER_SIZE` jika ingin ukuran order per level berbeda dari `BASE_ORDER_SIZE`.
+- Contoh:
+
+```bash
+GRID_ENABLED=true GRID_LEVELS_PER_SIDE=4 GRID_SPACING_PCT=0.003 DRY_RUN=true python main.py
 ```
 
 Opsi penting:

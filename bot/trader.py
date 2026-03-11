@@ -17,6 +17,7 @@ from .analysis import (
     support_resistance,
 )
 from .config import BotConfig
+from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
 from .persistence import StatePersistence
 from .strategies import StrategyDecision, make_trade_decision
@@ -164,7 +165,23 @@ class Trader:
         price = self._extract_price(ticker)
         indicators: MomentumIndicators = derive_indicators(candles)
 
-        decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels, indicators)
+        grid_plan: Optional[GridPlan] = None
+        decision: StrategyDecision
+        if self.config.grid_enabled:
+            grid_plan = build_grid_plan(price, self.config)
+            total_amount = sum(order.amount for order in grid_plan.orders)
+            decision = StrategyDecision(
+                mode="grid_trading",
+                action="grid",
+                confidence=1.0,
+                reason=f"grid levels={len(grid_plan.orders)} spacing={self.config.grid_spacing_pct}",
+                target_price=price,
+                amount=total_amount,
+                stop_loss=None,
+                take_profit=None,
+            )
+        else:
+            decision = make_trade_decision(trend, orderbook, vol, price, self.config, levels, indicators)
         return {
             "pair": pair,
             "price": price,
@@ -175,6 +192,7 @@ class Trader:
             "indicators": indicators,
             "decision": decision,
             "candles": candles,
+            "grid_plan": grid_plan,
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,6 +205,9 @@ class Trader:
             outcome = {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
             self._persist_state(snapshot, decision, price, outcome)
             return outcome
+
+        if self.config.grid_enabled and snapshot.get("grid_plan"):
+            return self._execute_grid(snapshot)
 
         if decision.action == "hold":
             logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, self.tracker.as_dict(price))
@@ -316,6 +337,51 @@ class Trader:
             "portfolio": self.tracker.as_dict(reference_price),
         }
         self._persist_state(snapshot, decision, reference_price, outcome)
+        return outcome
+
+    def _execute_grid(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        price = snapshot["price"]
+        decision: StrategyDecision = snapshot["decision"]
+        plan: GridPlan = snapshot["grid_plan"]
+        orders = plan.orders
+
+        if not orders:
+            outcome = {
+                "status": "skipped",
+                "reason": "no grid orders generated",
+                "portfolio": self.tracker.as_dict(price),
+            }
+            self._persist_state(snapshot, decision, price, outcome)
+            return outcome
+
+        pair = snapshot["pair"]
+        if self.config.dry_run:
+            orders_payload = [{"side": o.side, "price": o.price, "amount": o.amount} for o in orders]
+            outcome = {
+                "status": "grid_simulated",
+                "anchor_price": plan.anchor_price,
+                "orders": orders_payload,
+                "portfolio": self.tracker.as_dict(price),
+            }
+            self._persist_state(snapshot, decision, price, outcome)
+            return outcome
+
+        if self.config.api_key is None:
+            raise ValueError("API credentials required for live trading")
+
+        executed: List[Dict[str, Any]] = []
+        for order in orders:
+            resp = self.client.create_order(pair, order.side, order.price, order.amount)
+            executed.append({"side": order.side, "price": order.price, "amount": order.amount, "response": resp})
+            logger.info("Placed grid order %s %s @ %s resp=%s", order.side, order.amount, order.price, resp)
+
+        outcome = {
+            "status": "grid_placed",
+            "anchor_price": plan.anchor_price,
+            "orders": executed,
+            "portfolio": self.tracker.as_dict(price),
+        }
+        self._persist_state(snapshot, decision, price, outcome)
         return outcome
 
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:

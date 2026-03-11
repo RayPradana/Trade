@@ -40,6 +40,10 @@ class BotConfig:
     dry_run: bool = True
     run_once: bool = False
     real_time: bool = False
+    grid_enabled: bool = False
+    grid_levels_per_side: int = 3
+    grid_spacing_pct: float = 0.004  # 0.4% spacing
+    grid_order_size: Optional[float] = None
     min_confidence: float = 0.52
     interval_seconds: int = 300
     fast_window: int = 12
@@ -59,6 +63,7 @@ class BotConfig:
         scan_pairs = [p.strip().lower() for p in pairs_env.split(",")] if pairs_env else None
         real_time = os.getenv("REALTIME_MODE", os.getenv("REAL_TIME", "false")).lower() in {"1", "true", "yes"}
         interval_default = "1" if real_time else "300"
+        grid_enabled = os.getenv("GRID_ENABLED", "false").lower() in {"1", "true", "yes"}
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             pair=os.getenv("TRADE_PAIR", "btc_idr").lower(),
@@ -68,6 +73,10 @@ class BotConfig:
             dry_run=os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"},
             run_once=os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"},
             real_time=real_time,
+            grid_enabled=grid_enabled,
+            grid_levels_per_side=int(os.getenv("GRID_LEVELS_PER_SIDE", "3")),
+            grid_spacing_pct=float(os.getenv("GRID_SPACING_PCT", "0.004")),
+            grid_order_size=float(os.getenv("GRID_ORDER_SIZE")) if os.getenv("GRID_ORDER_SIZE") else None,
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
             interval_seconds=int(os.getenv("INTERVAL_SECONDS", interval_default)),
             fast_window=int(os.getenv("FAST_WINDOW", "12")),
@@ -92,6 +101,12 @@ class BotConfig:
             raise ValueError("RISK_PER_TRADE must be between 0 and 0.5")
         if self.base_order_size <= 0:
             raise ValueError("BASE_ORDER_SIZE must be positive")
+        if self.grid_levels_per_side <= 0:
+            raise ValueError("GRID_LEVELS_PER_SIDE must be positive")
+        if self.grid_spacing_pct <= 0:
+            raise ValueError("GRID_SPACING_PCT must be positive")
+        if self.grid_order_size is not None and self.grid_order_size <= 0:
+            raise ValueError("GRID_ORDER_SIZE must be positive when set")
         if self.interval_seconds <= 0:
             raise ValueError("INTERVAL_SECONDS must be positive")
         if self.max_slippage_pct < 0:
