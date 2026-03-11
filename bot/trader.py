@@ -113,6 +113,33 @@ class Trader:
             score += spread_bonus
         return max(0.0, min(1.5, score))
 
+    def _staged_amounts(self, decision: StrategyDecision, snapshot: Dict[str, Any]) -> List[float]:
+        total = decision.amount
+        if total <= 0:
+            return []
+        vol = snapshot.get("volatility")
+        volatility = getattr(vol, "volatility", 0.0) if vol else 0.0
+        confidence = decision.confidence
+        max_steps = max(1, self.config.staged_entry_steps)
+
+        if volatility < 0.01 and confidence >= 0.75:
+            fractions = [1.0]
+        elif volatility < 0.02:
+            fractions = [0.6, 0.4]
+        else:
+            fractions = [0.5, 0.3, 0.2]
+        fractions = fractions[:max_steps]
+
+        # Normalize to ensure full allocation within total
+        total_frac = sum(fractions)
+        fractions = [f / total_frac for f in fractions] if total_frac else [1.0]
+
+        staged = [round(total * frac, 12) for frac in fractions]
+        # Ensure rounding does not exceed total
+        if staged:
+            staged[-1] = max(0.0, min(total - sum(staged[:-1]), staged[-1]))
+        return [s for s in staged if s > 0]
+
     def analyze_market(self, pair: Optional[str] = None) -> Dict[str, Any]:
         pair = pair or self.config.pair
         ticker = self.client.get_ticker(pair)
@@ -220,14 +247,30 @@ class Trader:
             self._persist_state(snapshot, decision, reference_price, outcome)
             return outcome
 
+        staged = self._staged_amounts(decision, snapshot)
+        if staged and decision.amount > 0:
+            scale = effective_amount / decision.amount
+            staged = [max(0.0, amt * scale) for amt in staged]
+        else:
+            staged = [effective_amount]
+
+        executed_steps: List[Dict[str, Any]] = []
+        remaining_amount = effective_amount
         if self.config.dry_run:
-            logger.info("DRY-RUN %s %s @ %s", decision.action, effective_amount, reference_price)
-            self.tracker.record_trade(decision.action, reference_price, effective_amount)
+            for amt in staged:
+                step_amount = min(amt, remaining_amount)
+                if step_amount <= 0:
+                    continue
+                logger.info("DRY-RUN %s %s @ %s (staged)", decision.action, step_amount, reference_price)
+                self.tracker.record_trade(decision.action, reference_price, step_amount)
+                remaining_amount -= step_amount
+                executed_steps.append({"amount": step_amount, "price": reference_price})
             outcome = {
                 "status": "simulated",
                 "action": decision.action,
                 "price": reference_price,
-                "amount": effective_amount,
+                "amount": sum(step["amount"] for step in executed_steps),
+                "executed_steps": executed_steps,
                 "mode": decision.mode,
                 "stop_loss": decision.stop_loss,
                 "take_profit": decision.take_profit,
@@ -243,23 +286,27 @@ class Trader:
         if self.config.api_key is None:
             raise ValueError("API credentials required for live trading")
 
-        order_resp = self.client.create_order(
-            snapshot["pair"], decision.action, reference_price, effective_amount
-        )
-        self.tracker.record_trade(decision.action, reference_price, effective_amount)
-        logger.info(
-            "Placed order action=%s amount=%s price=%s response=%s",
-            decision.action,
-            effective_amount,
-            reference_price,
-            order_resp,
-        )
+        for amt in staged:
+            step_amount = min(amt, remaining_amount)
+            if step_amount <= 0:
+                continue
+            order_resp = self.client.create_order(snapshot["pair"], decision.action, reference_price, step_amount)
+            self.tracker.record_trade(decision.action, reference_price, step_amount)
+            remaining_amount -= step_amount
+            executed_steps.append({"amount": step_amount, "price": reference_price, "order": order_resp})
+            logger.info(
+                "Placed order action=%s amount=%s price=%s response=%s",
+                decision.action,
+                step_amount,
+                reference_price,
+                order_resp,
+            )
         outcome = {
             "status": "placed",
-            "order": order_resp,
             "action": decision.action,
             "price": reference_price,
-            "amount": effective_amount,
+            "amount": sum(step["amount"] for step in executed_steps),
+            "executed_steps": executed_steps,
             "mode": decision.mode,
             "portfolio": self.tracker.as_dict(reference_price),
         }

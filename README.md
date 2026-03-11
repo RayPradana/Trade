@@ -10,6 +10,7 @@ Bot trading otomatis untuk Indodax menggunakan Python. Bot melakukan:
 - Mode **dry-run** bawaan agar aman untuk simulasi tanpa mengeksekusi order sungguhan
 - **Auto-resume**: menyimpan state portofolio sehingga bot melanjutkan posisi terakhir jika restart
 - Analisis lanjutan: RSI, MACD, Bollinger Bands untuk konfirmasi tren dan momentum
+- **Staged entry**: alokasikan modal bertahap (bukan all-in) sesuai volatilitas & kepercayaan sinyal
 
 > Gunakan dokumentasi resmi Indodax: https://github.com/btcid/indodax-official-api-docs
 
@@ -40,6 +41,7 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `TRADE_PAIRS` | Daftar pasangan dipisah koma untuk discan otomatis (jika kosong, bot tarik seluruh pairs dari API) | `btc_idr` |
 | `AUTO_RESUME` | `true/false` untuk mengaktifkan pemulihan state otomatis | `true` |
 | `STATE_FILE` | Lokasi file state JSON untuk auto-resume | `bot_state.json` |
+| `STAGED_ENTRY_STEPS` | Jumlah maksimum langkah entry bertahap (mis. 3 langkah 50/30/20%) | `3` |
 
 ## Menjalankan
 

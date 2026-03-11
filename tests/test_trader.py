@@ -232,6 +232,40 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "simulated")
         self.assertLessEqual(outcome["amount"], 0.5)  # 50 cash / 100 price
 
+    def test_staged_entries_reduce_full_allocation_on_high_vol(self) -> None:
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1000.0,
+            max_loss_pct=0.9,
+            target_profit_pct=1.0,
+            auto_resume=False,
+            staged_entry_steps=3,
+        )
+        trader = GuardedTrader(config)
+        trader.tracker.cash = 1000.0
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="buy",
+            confidence=0.7,
+            reason="test-staged",
+            target_price=100,
+            amount=3.0,
+            stop_loss=95.0,
+            take_profit=110.0,
+        )
+        snapshot = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "decision": decision,
+            "volatility": type("Vol", (), {"volatility": 0.03})(),  # high vol triggers staging
+        }
+        outcome = trader.maybe_execute(snapshot)
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertIn("executed_steps", outcome)
+        self.assertGreater(len(outcome["executed_steps"]), 1)
+        self.assertLessEqual(outcome["amount"], decision.amount)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,6 +48,7 @@ class BotConfig:
     max_loss_pct: float = 0.1  # 10%
     auto_resume: bool = True
     state_file: str = "bot_state.json"
+    staged_entry_steps: int = 3
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -71,6 +72,7 @@ class BotConfig:
             max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
             auto_resume=os.getenv("AUTO_RESUME", "true").lower() in {"1", "true", "yes"},
             state_file=os.getenv("STATE_FILE", "bot_state.json"),
+            staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
         )
         cfg._validate()
         return cfg
@@ -88,5 +90,7 @@ class BotConfig:
             raise ValueError("INTERVAL_SECONDS must be positive")
         if self.max_slippage_pct < 0:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
+        if self.staged_entry_steps <= 0:
+            raise ValueError("STAGED_ENTRY_STEPS must be positive")
         if not self.dry_run and not self.api_key:
             self.require_auth()
