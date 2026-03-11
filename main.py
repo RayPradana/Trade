@@ -81,17 +81,17 @@ def _separator(label: str = "") -> str:
 
 
 def _log_portfolio(portfolio: dict, prefix: str = "   portf  ") -> None:
+    trailing = f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—"
     logging.info(
-        "%s: equity=%,.2f  cash=%,.2f  pos=%.8f  pnl=%+,.2f  "
-        "trades=%d  win=%.0f%%  trail=%s",
+        "%s: equity=%s  cash=%s  pos=%.8f  pnl=%s  trades=%d  win=%.0f%%  trail=%s",
         prefix,
-        portfolio["equity"],
-        portfolio["cash"],
+        f"{portfolio['equity']:,.2f}",
+        f"{portfolio['cash']:,.2f}",
         portfolio["base_position"],
-        portfolio["realized_pnl"],
+        f"{portfolio['realized_pnl']:+,.2f}",
         portfolio["trade_count"],
         portfolio["win_rate"] * 100,
-        f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—",
+        trailing,
     )
 
 
@@ -165,9 +165,9 @@ def main() -> None:
                     force_outcome = trader.force_sell(held_snapshot)
                     portfolio = trader.tracker.as_dict(held_price)
                     logging.info(
-                        "📊 Position closed: amount=%.8f  price=%,.2f",
+                        "📊 Position closed: amount=%.8f  price=%s",
                         force_outcome.get("amount", 0),
-                        held_price,
+                        f"{held_price:,.2f}",
                     )
                     _log_portfolio(portfolio)
                     consecutive_errors = 0
@@ -184,11 +184,11 @@ def main() -> None:
                 # Still holding – use faster polling interval
                 portfolio = trader.tracker.as_dict(held_price)
                 logging.info(
-                    "⏸️  Holding %s | price=%,.2f | pos=%.8f | equity=%,.2f | trail=%s",
+                    "⏸️  Holding %s | price=%s | pos=%.8f | equity=%s | trail=%s",
                     pair,
-                    held_price,
+                    f"{held_price:,.2f}",
                     trader.tracker.base_position,
-                    portfolio["equity"],
+                    f"{portfolio['equity']:,.2f}",
                     f"{portfolio['trailing_stop']:,.2f}" if portfolio.get("trailing_stop") else "—",
                 )
                 consecutive_errors = 0
@@ -202,12 +202,12 @@ def main() -> None:
             summary = snapshot["decision"]
             icon = _ACTION_ICONS.get(summary.action, "❓")
             logging.info(
-                "%s %s  pair=%-12s  mode=%-16s  price=%,.2f  conf=%.3f",
+                "%s %s  pair=%-12s  mode=%-16s  price=%s  conf=%.3f",
                 icon,
                 summary.action.upper(),
                 pair,
                 summary.mode,
-                snapshot["price"],
+                f"{snapshot['price']:,.2f}",
                 summary.confidence,
             )
             logging.info(
@@ -272,9 +272,9 @@ def main() -> None:
                 # Re-compute portfolio after any liquidation
                 portfolio = trader.tracker.as_dict(snapshot["price"])
                 logging.info(
-                    "📊 Rotation summary: pnl=%+,.2f  equity=%,.2f  trades=%d  win=%.0f%%",
-                    portfolio["realized_pnl"],
-                    portfolio["equity"],
+                    "📊 Rotation summary: pnl=%s  equity=%s  trades=%d  win=%.0f%%",
+                    f"{portfolio['realized_pnl']:+,.2f}",
+                    f"{portfolio['equity']:,.2f}",
                     portfolio["trade_count"],
                     portfolio["win_rate"] * 100,
                 )
@@ -314,11 +314,10 @@ def main() -> None:
         # Periodic performance summary every N full-scan cycles
         if scan_cycles > 0 and scan_cycles % config.cycle_summary_interval == 0:
             logging.info(
-                "📊 Periodic summary (scan #%d): pnl=%+,.2f  equity=%,.2f  "
-                "trades=%d  win=%.0f%%",
+                "📊 Periodic summary (scan #%d): pnl=%s  equity=%s  trades=%d  win=%.0f%%",
                 scan_cycles,
-                portfolio["realized_pnl"],
-                portfolio["equity"],
+                f"{portfolio['realized_pnl']:+,.2f}",
+                f"{portfolio['equity']:,.2f}",
                 portfolio["trade_count"],
                 portfolio["win_rate"] * 100,
             )
