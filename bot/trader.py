@@ -206,6 +206,11 @@ class Trader:
             )
             win_rate = winning / total_trades if total_trades > 0 else 0.0
             initial = self.multi_manager.initial_capital
+            target_profit_pct = getattr(self.multi_manager, "_target_profit_pct", 0.0)
+            max_loss_pct = getattr(self.multi_manager, "_max_loss_pct", 0.0)
+            pb = max(0.0, equity - initial)
+            peak_pb = max(pb, getattr(self.multi_manager, "_peak_profit_buffer", pb))
+            pb_dd = max(0.0, (peak_pb - pb) / peak_pb) if peak_pb > 0 else 0.0
             return {
                 "equity": equity,
                 "cash": cash,
@@ -214,14 +219,14 @@ class Trader:
                 "trade_count": total_trades,
                 "win_rate": win_rate,
                 "trailing_stop": None,
-                "target_equity": 0.0,
-                "min_equity": 0.0,
+                "target_equity": initial * (1 + target_profit_pct),
+                "min_equity": initial * (1 - max_loss_pct),
                 "avg_cost": 0.0,
                 "principal": initial,
-                "profit_buffer": max(0.0, equity - initial),
+                "profit_buffer": pb,
                 "effective_capital": equity,
-                "peak_profit_buffer": 0.0,
-                "profit_buffer_drawdown": 0.0,
+                "peak_profit_buffer": peak_pb,
+                "profit_buffer_drawdown": round(pb_dd, 4),
                 "tp_activated": False,
                 "trailing_tp_stop": None,
             }
@@ -237,7 +242,8 @@ class Trader:
         Called once at the start of each scan cycle.  The first call always
         triggers a ``/api/pairs`` fetch.  Subsequent calls only refresh when
         ``pair_min_order_refresh_cycles > 0`` and the configured number of
-        cycles has elapsed.
+        cycles has elapsed, OR when the TTL-based stale flag is set on the
+        client (i.e. the cache is older than ``_pair_min_order_cache_ttl``).
         """
         if not self.config.pair_min_order_cache_enabled:
             return
@@ -247,7 +253,8 @@ class Trader:
         cached: dict = getattr(self.client, "_pair_min_order", {})
         already_loaded = bool(cached)
         cycle_due = refresh > 0 and self._pair_min_order_cache_cycles >= refresh
-        if not already_loaded or cycle_due:
+        ttl_stale = hasattr(self.client, "is_pair_min_order_cache_stale") and self.client.is_pair_min_order_cache_stale()
+        if not already_loaded or cycle_due or ttl_stale:
             self.client.load_pair_min_orders()
             self._pair_min_order_cache_cycles = 0
         else:
@@ -505,7 +512,14 @@ class Trader:
     def _persist_after_trade(self, pair: str) -> None:
         """Save state if still in a position, or clear it if the position is closed."""
         if self.config.pair_cooldown_seconds > 0:
-            self._pair_last_trade[pair] = time.time()
+            now = time.time()
+            self._pair_last_trade[pair] = now
+            # Prune entries that are already past their cooldown window to prevent
+            # the dict from growing without bound over long bot runs.
+            cutoff = now - self.config.pair_cooldown_seconds
+            expired = [p for p, ts in self._pair_last_trade.items() if ts < cutoff]
+            for p in expired:
+                del self._pair_last_trade[p]
         if self.multi_manager is not None:
             # Multi-position: save while any position remains; clear when all closed.
             if self.multi_manager.position_count() > 0:

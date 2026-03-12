@@ -79,16 +79,19 @@ class RealtimeFeed:
             return dict(self._latest)
 
     def start(self) -> None:
-        if self._ws_thread and self._ws_thread.is_alive():
-            return
-        self._stop.clear()
-        self._ws_thread = threading.Thread(target=self._run, daemon=True)
-        self._ws_thread.start()
+        with self._lock:
+            if self._ws_thread and self._ws_thread.is_alive():
+                return
+            self._stop.clear()
+            self._ws_thread = threading.Thread(target=self._run, daemon=True)
+            self._ws_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=1.0)
+        with self._lock:
+            thread = self._ws_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
 
     def refresh_once(self) -> Dict[str, Any]:
         """Trigger a single REST refresh (useful for tests)."""

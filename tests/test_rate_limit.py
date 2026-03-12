@@ -222,6 +222,28 @@ class LoadPairMinOrdersFromDataTests(unittest.TestCase):
         self.assertEqual(len(rest_calls), 1)
         self.assertIn("btcidr", client._pair_min_order)
 
+    def test_is_pair_min_order_cache_stale_fresh_after_load(self):
+        """Cache must not be stale immediately after a successful load."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient(api_key="k", api_secret="s", enable_queue=False)
+        # Inject data without a real REST call
+        client.load_pair_min_orders(self._make_pairs_data())
+        self.assertFalse(
+            client.is_pair_min_order_cache_stale(),
+            "Cache should be fresh right after loading",
+        )
+
+    def test_is_pair_min_order_cache_stale_before_first_load(self):
+        """Cache must be stale before any load (expiry timestamp=0)."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient(api_key="k", api_secret="s", enable_queue=False)
+        self.assertTrue(
+            client.is_pair_min_order_cache_stale(),
+            "Cache should be stale before any load",
+        )
+
 
 class NoDuplicatePairsCallTest(unittest.TestCase):
     """scan_and_choose() must not call /api/pairs twice on the first cycle."""

@@ -1800,7 +1800,7 @@ class TickMoveFilterTest(unittest.TestCase):
         logging.disable(logging.NOTSET)
 
     def _trader(self, max_tick: float, bids: list, asks: list, price: float) -> Trader:
-        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, dry_run=True)
+        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, min_buy_price_idr=0, dry_run=True)
         trader = Trader(config)
         trader.client = type("_C", (), {
             "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
@@ -1945,7 +1945,7 @@ class TopVolumeAutoSelectorTest(unittest.TestCase):
         self.assertLessEqual(len(trader._all_pairs), 10)
 
     def test_filters_disabled_when_zero(self):
-        """When both filter thresholds are 0, all pairs must pass to the ranking step."""
+        """When all filter thresholds are 0, all pairs must pass to the ranking step."""
         tickers = {
             "btc_idr": {"vol_idr": "5000000000", "last": "1000000", "high": "1100000", "low": "900000"},
             "skya_idr": {"vol_idr": "500", "last": "17", "open": "17", "high": "17", "low": "17"},
@@ -1956,6 +1956,7 @@ class TopVolumeAutoSelectorTest(unittest.TestCase):
             dynamic_pairs_top_n=20,
             top_volume_min_volume_idr=0,
             top_volume_min_price_change_24h_pct=0,
+            min_buy_price_idr=0,
         )
         trader._refresh_dynamic_pairs()
         self.assertIn("btc_idr", trader._all_pairs)
@@ -2776,6 +2777,19 @@ class PairCooldownTraderTest(unittest.TestCase):
         trader = Trader(config)
         trader._persist_after_trade("sol_idr")
         self.assertNotIn("sol_idr", trader._pair_last_trade)
+
+    def test_pair_last_trade_pruned_after_cooldown_expires(self):
+        """_persist_after_trade must remove entries older than pair_cooldown_seconds."""
+        import time
+        config = BotConfig(api_key=None, pair_cooldown_seconds=60, dry_run=True)
+        trader = Trader(config)
+        # Pre-populate with an expired entry (well past the cooldown window)
+        trader._pair_last_trade["expired_idr"] = time.time() - 120
+        trader._persist_after_trade("new_idr")
+        # The expired entry must have been pruned
+        self.assertNotIn("expired_idr", trader._pair_last_trade)
+        # The new entry must still be present
+        self.assertIn("new_idr", trader._pair_last_trade)
 
 
 class ZeroAmountBuySkipTest(unittest.TestCase):
@@ -3715,3 +3729,14 @@ class MultiPositionTraderTest(unittest.TestCase):
         expected = trader.tracker.as_dict(1_000_000.0)
         self.assertEqual(snap["equity"], expected["equity"])
         self.assertEqual(snap["cash"], expected["cash"])
+
+    def test_portfolio_snapshot_multi_target_and_floor_not_zero(self):
+        """In multi-position mode target_equity and min_equity must reflect config, not 0."""
+        trader = self._make_trader(max_pos=3)
+        snap = trader.portfolio_snapshot("btc_idr", 1_000_000.0)
+        initial = 3_000_000.0
+        # Default target_profit_pct=20% → target = 3_600_000
+        self.assertGreater(snap["target_equity"], initial)
+        # Default max_loss_pct=10% → floor = 2_700_000
+        self.assertLess(snap["min_equity"], initial)
+        self.assertGreater(snap["min_equity"], 0.0)

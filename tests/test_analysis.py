@@ -77,9 +77,24 @@ class AnalysisTests(unittest.TestCase):
             Candle(2, 90, 91, 89, 90, 1),
         ]
         levels = support_resistance(candles, lookback=3)
-        # Support uses candle lows (min low = 89), resistance uses highs (max high = 111)
+        # With only 3 candles the 10th/90th-percentile indices collapse to
+        # the minimum and maximum, so values equal the raw extremes.
         self.assertEqual(levels.support, 89)
         self.assertEqual(levels.resistance, 111)
+
+    def test_support_resistance_percentile_avoids_outlier_wicks(self) -> None:
+        """Outlier wick candles must not dominate support/resistance levels."""
+        # 28 "normal" candles clustered near 100 IDR + 2 spike/wick outliers
+        normal = [Candle(i, 100, 105, 95, 100, 1) for i in range(28)]
+        # Single wick low (crash candle) and single wick high (pump candle)
+        spike_low = Candle(28, 100, 105, 10, 100, 1)   # low=10 (outlier)
+        spike_high = Candle(29, 100, 200, 95, 100, 1)  # high=200 (outlier)
+        candles = normal + [spike_low, spike_high]
+        levels = support_resistance(candles, lookback=30)
+        # The percentile algorithm should ignore the extreme outliers:
+        # support must be well above 10 and resistance well below 200.
+        self.assertGreater(levels.support, 50)
+        self.assertLess(levels.resistance, 150)
 
     def test_indicators_include_rsi_and_macd(self) -> None:
         candles = [
@@ -607,3 +622,21 @@ class TradeFlowAnalysisTest(unittest.TestCase):
         result = analyze_trade_flow(trades)
         self.assertAlmostEqual(result.buy_ratio, 1.0)
         self.assertAlmostEqual(result.buy_volume, 300.0)  # 3 * 100
+
+    def test_aggressive_buyers_consistent_with_buy_ratio(self) -> None:
+        """aggressive_buyers flag must be computed from the rounded buy_ratio,
+        not from the raw pre-round ratio, so the two fields are consistent.
+        """
+        from bot.analysis import analyze_trade_flow
+        # buy_vol = 0.65 * total but the raw float will be something like
+        # 0.6500000000... which rounds to exactly 0.65.  The flag uses the
+        # rounded value, so at the threshold boundary it should be True.
+        trades = [
+            {"type": "buy",  "price": "1", "amount": "65"},
+            {"type": "sell", "price": "1", "amount": "35"},
+        ]
+        result = analyze_trade_flow(trades, aggressive_buyer_threshold=0.65)
+        # buy_ratio = 65/100 = 0.65 exactly
+        self.assertAlmostEqual(result.buy_ratio, 0.65)
+        # The flag must agree with the rounded ratio (>= 0.65)
+        self.assertEqual(result.aggressive_buyers, result.buy_ratio >= 0.65)

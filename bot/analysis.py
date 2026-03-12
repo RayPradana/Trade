@@ -303,9 +303,9 @@ def analyze_trade_flow(
             sell_vol += notional
 
     total = buy_vol + sell_vol
-    buy_ratio = buy_vol / total if total else 0.5
+    buy_ratio = round(buy_vol / total if total else 0.5, 4)
     return TradeFlowResult(
-        buy_ratio=round(buy_ratio, 4),
+        buy_ratio=buy_ratio,
         buy_volume=buy_vol,
         sell_volume=sell_vol,
         aggressive_buyers=buy_ratio >= aggressive_buyer_threshold,
@@ -331,8 +331,15 @@ def support_resistance(candles: Sequence[Candle], lookback: int = 30) -> Support
     if not candles:
         return SupportResistance(0.0, 0.0, lookback)
     recent = candles[-lookback:]
-    support = min(c.low for c in recent)
-    resistance = max(c.high for c in recent)
+    lows = sorted(c.low for c in recent)
+    highs = sorted(c.high for c in recent)
+    n = len(lows)
+    # Use the 10th-percentile low as support and 90th-percentile high as
+    # resistance to avoid single-candle outliers (wicks) distorting the levels.
+    lo_idx = max(0, int(n * 0.10) - 1)
+    hi_idx = min(n - 1, int(n * 0.90))
+    support = lows[lo_idx]
+    resistance = highs[hi_idx]
     return SupportResistance(support=support, resistance=resistance, lookback=lookback)
 
 

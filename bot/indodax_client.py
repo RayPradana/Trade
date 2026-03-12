@@ -47,6 +47,11 @@ class IndodaxClient:
         #   values are dicts with "min_coin" (min base currency amount)
         #   and "min_idr" (min IDR value).
         self._pair_min_order: Dict[str, Dict[str, float]] = {}
+        # TTL for the pair-minimum-order cache.  Defaults to 3600 s (1 hour).
+        # Indodax rarely changes minimum order requirements, but a TTL ensures
+        # the cache is eventually refreshed when the bot runs for multiple days.
+        self._pair_min_order_cache_ttl: float = 3600.0
+        self._pair_min_order_expires: float = 0.0
         # ── Private API response caches ───────────────────────────────────────
         # TTL-based in-memory caches for expensive private REST endpoints.
         # Each entry is (cached_value, expiry_timestamp).
@@ -137,14 +142,25 @@ class IndodaxClient:
             self._pair_min_order[pair_id] = {"min_coin": min_coin, "min_idr": min_idr}
             loaded += 1
         logger.info("load_pair_min_orders: cached minimum orders for %d pairs", loaded)
+        ttl = getattr(self, "_pair_min_order_cache_ttl", 3600.0)
+        self._pair_min_order_expires = time.time() + ttl
 
     def get_pair_min_order(self, pair: str) -> Dict[str, float]:
         """Return the cached minimum order sizes for *pair*.
 
+        The cache is considered stale when it has passed its TTL.  The caller
+        (Trader._ensure_pair_min_order_cache) is responsible for periodic
+        refreshes; this method only returns whatever is currently cached.
+
         :returns: ``{"min_coin": float, "min_idr": float}`` — both default to
-                  0.0 when the pair is not in the cache.
+                  0.0 when the pair is not in the cache or the cache is empty.
         """
         return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+    def is_pair_min_order_cache_stale(self) -> bool:
+        """Return ``True`` when the pair minimum-order cache needs refreshing."""
+        expires = getattr(self, "_pair_min_order_expires", 0.0)
+        return time.time() >= expires
 
     def get_summaries(self) -> Dict[str, Any]:
         return self._get("/api/summaries")

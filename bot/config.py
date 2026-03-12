@@ -269,8 +269,8 @@ class BotConfig:
     # Skip any buy when the current coin price is below this IDR amount.
     # Prevents entry into very cheap coins (e.g. DENT at 4 IDR) where the
     # minimum price increment represents a disproportionately large move.
-    # E.g. 10.0 = skip coins priced below 10 IDR.  0 = disabled (default).
-    min_buy_price_idr: float = 0.0
+    # E.g. 100.0 = skip coins priced below 100 IDR.  0 = disabled.
+    min_buy_price_idr: float = 100.0
     # ── Tick-move filter ──────────────────────────────────────────────────────
     # Skip any buy when the minimum possible price increment (tick) represents
     # a fraction of the current price that exceeds this threshold.
@@ -658,7 +658,7 @@ class BotConfig:
             pump_protection_pct=_env_float("PUMP_PROTECTION_PCT", "0"),
             pump_lookback_seconds=_env_float("PUMP_LOOKBACK_SECONDS", "60"),
             max_spread_pct=_env_float("MAX_SPREAD_PCT", "0"),
-            min_buy_price_idr=_env_float("MIN_BUY_PRICE_IDR", "0"),
+            min_buy_price_idr=_env_float("MIN_BUY_PRICE_IDR", "100"),
             max_tick_move_pct=_env_float("MAX_TICK_MOVE_PCT", "0"),
             see_enabled=os.getenv("SEE_ENABLED", "false").lower() in {"1", "true", "yes"},
             see_volume_surge_ratio=_env_float("SEE_VOLUME_SURGE_RATIO", "2.0"),
@@ -845,8 +845,8 @@ class BotConfig:
             raise ValueError("PUMP_LOOKBACK_SECONDS must be positive")
         if self.max_spread_pct < 0:
             raise ValueError("MAX_SPREAD_PCT must be non-negative")
-        if self.min_buy_price_idr < 0:
-            raise ValueError("MIN_BUY_PRICE_IDR must be non-negative")
+        if not (0 <= self.min_buy_price_idr < 1e9):
+            raise ValueError("MIN_BUY_PRICE_IDR must be between 0 and 1e9")
         if self.max_tick_move_pct < 0:
             raise ValueError("MAX_TICK_MOVE_PCT must be non-negative")
         if self.see_volume_surge_ratio <= 0:
