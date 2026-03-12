@@ -2811,3 +2811,141 @@ class PairMinOrderCacheTests(unittest.TestCase):
 
         result = IndodaxClient.parse_minimum_order_error("Some other error")
         self.assertIsNone(result)
+
+
+class TimeBasedExitTest(unittest.TestCase):
+    """Tests for the time-based exit feature (MAX_HOLD_SECONDS)."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader(self, max_hold_seconds: float, max_hold_profit_pct: float = 0.01) -> Trader:
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            max_hold_seconds=max_hold_seconds,
+            max_hold_profit_pct=max_hold_profit_pct,
+        )
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        return trader
+
+    def test_time_exit_triggers_when_stagnant(self):
+        """Position held too long below profit threshold must be force-sold."""
+        import time as _time
+        trader = self._trader(max_hold_seconds=1, max_hold_profit_pct=0.05)
+        # Open a position at avg_cost=100 → current price=100 → profit=0% < 5%
+        trader.tracker.record_trade("buy", 100.0, 0.5)
+        # Backdate the open time so the position appears stale
+        trader.tracker.position_open_time = _time.time() - 10  # 10s > 1s limit
+        snap = _make_buy_snap(price=100.0, action="hold")
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "time_exit")
+        self.assertIn("max_hold_seconds", outcome["reason"])
+
+    def test_time_exit_does_not_trigger_when_profitable(self):
+        """Position above the profit threshold must NOT be force-sold by time exit."""
+        import time as _time
+        trader = self._trader(max_hold_seconds=1, max_hold_profit_pct=0.01)
+        # Buy at 90, current price=100 → profit ≈ 11% > 1% threshold
+        trader.tracker.record_trade("buy", 90.0, 0.5)
+        trader.tracker.position_open_time = _time.time() - 10
+        snap = _make_buy_snap(price=100.0, action="hold")
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome["status"], "time_exit")
+
+    def test_time_exit_does_not_trigger_before_limit(self):
+        """Position held less than max_hold_seconds must not be time-exited."""
+        trader = self._trader(max_hold_seconds=3600, max_hold_profit_pct=0.05)
+        # Open position just now — well within the hold limit
+        trader.tracker.record_trade("buy", 100.0, 0.5)
+        snap = _make_buy_snap(price=100.0, action="hold")
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome["status"], "time_exit")
+
+    def test_time_exit_disabled_when_zero(self):
+        """When max_hold_seconds=0, time-based exit must be disabled."""
+        import time as _time
+        trader = self._trader(max_hold_seconds=0)
+        trader.tracker.record_trade("buy", 100.0, 0.5)
+        trader.tracker.position_open_time = _time.time() - 86400  # 1 day old
+        snap = _make_buy_snap(price=100.0, action="hold")
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome["status"], "time_exit")
+
+    def test_time_exit_no_position_no_trigger(self):
+        """Time exit must not trigger when no position is held."""
+        import time as _time
+        trader = self._trader(max_hold_seconds=1)
+        # No buy recorded — base_position is 0
+        snap = _make_buy_snap(price=100.0, action="buy")
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome["status"], "time_exit")
+
+
+class PositionOpenTimeTest(unittest.TestCase):
+    """Tests for position_open_time tracking in PortfolioTracker."""
+
+    def test_position_open_time_set_on_first_buy(self):
+        """position_open_time must be recorded when first buy is placed."""
+        import time as _time
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        before = _time.time()
+        tracker.record_trade("buy", 100.0, 1.0)
+        after = _time.time()
+        self.assertGreaterEqual(tracker.position_open_time, before)
+        self.assertLessEqual(tracker.position_open_time, after)
+
+    def test_position_open_time_not_reset_on_staged_buy(self):
+        """A second buy (staged entry) must NOT overwrite position_open_time."""
+        import time as _time
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        first_open_time = tracker.position_open_time
+        _time.sleep(0.01)
+        tracker.record_trade("buy", 101.0, 0.5)
+        self.assertEqual(tracker.position_open_time, first_open_time)
+
+    def test_position_open_time_cleared_on_full_close(self):
+        """position_open_time must be reset to 0 when position is fully sold."""
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        self.assertGreater(tracker.position_open_time, 0.0)
+        tracker.record_trade("sell", 110.0, 1.0)
+        self.assertEqual(tracker.position_open_time, 0.0)
+
+    def test_position_open_time_not_cleared_on_partial_sell(self):
+        """position_open_time must persist after a partial sell."""
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 2.0)
+        open_time = tracker.position_open_time
+        tracker.record_trade("sell", 110.0, 1.0)  # partial sell
+        self.assertEqual(tracker.position_open_time, open_time)
+
+    def test_position_hold_seconds_returns_zero_when_no_position(self):
+        """position_hold_seconds must be 0.0 when no position is held."""
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        self.assertEqual(tracker.position_hold_seconds, 0.0)
+
+    def test_position_hold_seconds_positive_while_holding(self):
+        """position_hold_seconds must be > 0 immediately after a buy."""
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        self.assertGreater(tracker.position_hold_seconds, 0.0)
+
+    def test_position_open_time_serialized_and_restored(self):
+        """position_open_time must survive a to_state / load_state round-trip."""
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        original = tracker.position_open_time
+        state = tracker.to_state()
+        restored = PortfolioTracker(500_000.0, 0.2, 0.1)
+        restored.load_state(state)
+        self.assertEqual(restored.position_open_time, original)

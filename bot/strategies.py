@@ -247,6 +247,7 @@ def _position_size(
     confidence: float,
     vol: VolatilityStats,
     effective_capital: Optional[float] = None,
+    ob_imbalance: float = 0.0,
 ) -> float:
     """Dynamic position sizing: base size = risk_per_trade * capital / price.
 
@@ -254,10 +255,19 @@ def _position_size(
     computed as a direct percentage of available capital determined by the
     confidence tier (see :func:`confidence_position_pct`).
 
+    When ``config.ob_imbalance_boost_threshold > 0`` and ``ob_imbalance`` meets
+    or exceeds that threshold the computed size is multiplied by
+    ``config.ob_imbalance_size_multiplier``.  This allows the bot to enter with
+    a larger stake when strong buy pressure (bid >> ask) is detected — a common
+    signal before a pump on illiquid pairs.
+
     :param effective_capital: When provided, this is used as the capital base
         for sizing instead of ``config.initial_capital``.  Pass
         ``tracker.effective_capital()`` to enable automatic compounding: as
         profits accumulate, position sizes grow proportionally.
+    :param ob_imbalance: Current order-book imbalance
+        ``(bid_vol − ask_vol) / (bid_vol + ask_vol)``, range ``−1 … +1``.
+        Used for the OB imbalance size boost when the feature is enabled.
     """
     if current_price <= 0:
         return 0.0
@@ -269,23 +279,32 @@ def _position_size(
         pct = confidence_position_pct(confidence, config)
         if pct <= 0.0:
             return 0.0
-        return (pct * capital) / current_price
+        size = (pct * capital) / current_price
+    else:
+        # ── Original risk/stop-distance-based sizing ──────────────────────────
+        if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
+            return 0.0
+        # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
+        risk = adaptive_risk_per_trade(capital, config)
+        # Compute how many units of the base asset represent one "risk unit" of capital
+        dynamic_base = (risk * capital) / current_price
+        desired_risk_value = capital * risk
+        base_order_risk = risk_per_unit * dynamic_base
+        dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
+        scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
+        confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
+        volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
+        size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
+        size = max(size, dynamic_base * 0.25)
 
-    # ── Original risk/stop-distance-based sizing ──────────────────────────────
-    if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
-        return 0.0
-    # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
-    risk = adaptive_risk_per_trade(capital, config)
-    # Compute how many units of the base asset represent one "risk unit" of capital
-    dynamic_base = (risk * capital) / current_price
-    desired_risk_value = capital * risk
-    base_order_risk = risk_per_unit * dynamic_base
-    dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
-    scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
-    confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
-    volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
-    size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
-    return max(size, dynamic_base * 0.25)
+    # ── Orderbook imbalance size boost ───────────────────────────────────────
+    if (
+        config.ob_imbalance_boost_threshold > 0
+        and ob_imbalance >= config.ob_imbalance_boost_threshold
+    ):
+        size *= config.ob_imbalance_size_multiplier
+
+    return size
 
 
 def make_trade_decision(
@@ -495,7 +514,10 @@ def make_trade_decision(
 
     # size based on risk per trade relative to stop distance
     risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
-    amount = _position_size(current_price, stop_loss, config, risk_per_unit, conf, vol, effective_capital)
+    amount = _position_size(
+        current_price, stop_loss, config, risk_per_unit, conf, vol,
+        effective_capital, ob_imbalance=orderbook.imbalance,
+    )
 
     return StrategyDecision(
         mode=mode,

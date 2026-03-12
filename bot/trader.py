@@ -926,6 +926,34 @@ class Trader:
             outcome = {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
             return outcome
 
+        # ── Time-based exit (anti-stagnation for illiquid coins) ─────────────
+        # Force-sell an open position that has been held longer than
+        # max_hold_seconds without reaching the profit threshold.  This
+        # prevents capital from being tied up in slow/illiquid pairs.
+        if (
+            self.config.max_hold_seconds > 0
+            and self.tracker.base_position > 0
+            and self.tracker.avg_cost > 0
+        ):
+            hold_secs = self.tracker.position_hold_seconds
+            if hold_secs >= self.config.max_hold_seconds:
+                unrealised_pct = (price - self.tracker.avg_cost) / self.tracker.avg_cost
+                if unrealised_pct < self.config.max_hold_profit_pct:
+                    logger.info(
+                        "Time-based exit: held %.0fs ≥ %.0fs, profit=%.2f%% < %.2f%% — force selling",
+                        hold_secs,
+                        self.config.max_hold_seconds,
+                        unrealised_pct * 100,
+                        self.config.max_hold_profit_pct * 100,
+                    )
+                    result = self.force_sell(snapshot)
+                    result["status"] = "time_exit"
+                    result["reason"] = (
+                        f"max_hold_seconds exceeded: held {hold_secs:.0f}s, "
+                        f"profit {unrealised_pct:.2%} < {self.config.max_hold_profit_pct:.2%}"
+                    )
+                    return result
+
         # ── Daily loss cap ────────────────────────────────────────────────────
         if self.config.max_daily_loss_pct > 0 and decision.action == "buy":
             daily_loss_pct = self.tracker.daily_loss_pct(price)

@@ -459,3 +459,71 @@ class TestConfidencePositionSizing(unittest.TestCase):
         size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.82, vol, capital)
         idr_value = size * price
         self.assertAlmostEqual(idr_value, 0.25 * capital, delta=1.0)
+
+
+class TestObImbalanceSizeBoost(unittest.TestCase):
+    """Tests for the OB imbalance position-size boost in _position_size()."""
+
+    def _cfg(self, threshold: float = 0.5, multiplier: float = 2.0, **kwargs) -> BotConfig:
+        return BotConfig(
+            api_key=None,
+            confidence_position_sizing_enabled=True,
+            confidence_tier_skip=0.40,
+            confidence_tier_low=0.50,
+            confidence_tier_mid=0.65,
+            confidence_tier_high=0.80,
+            confidence_tier_low_pct=0.10,
+            confidence_tier_mid_pct=0.15,
+            confidence_tier_high_pct=0.20,
+            confidence_tier_max_pct=0.25,
+            ob_imbalance_boost_threshold=threshold,
+            ob_imbalance_size_multiplier=multiplier,
+            **kwargs,
+        )
+
+    def test_boost_applied_when_imbalance_meets_threshold(self):
+        """When imbalance >= threshold, size should be multiplied."""
+        cfg = self._cfg(threshold=0.5, multiplier=2.0, initial_capital=500_000.0)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price = 100_000.0
+        # confidence=0.70 → high tier → 20% of 500k = 100k IDR
+        base_size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.0)
+        boosted_size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.5)
+        self.assertAlmostEqual(boosted_size, base_size * 2.0, places=8)
+
+    def test_boost_not_applied_below_threshold(self):
+        """When imbalance < threshold, size should not be multiplied."""
+        cfg = self._cfg(threshold=0.5, multiplier=2.0, initial_capital=500_000.0)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price = 100_000.0
+        base_size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.0)
+        below_thresh = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.49)
+        self.assertAlmostEqual(below_thresh, base_size, places=8)
+
+    def test_boost_disabled_when_threshold_zero(self):
+        """When ob_imbalance_boost_threshold=0 (disabled), size is unaffected."""
+        cfg = self._cfg(threshold=0.0, multiplier=2.0, initial_capital=500_000.0)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price = 100_000.0
+        base = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.0)
+        high_imbalance = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.99)
+        self.assertAlmostEqual(base, high_imbalance, places=8)
+
+    def test_boost_idr_value_doubles(self):
+        """When boosted 2×, IDR value of position should double vs. non-boosted."""
+        cfg = self._cfg(threshold=0.5, multiplier=2.0, initial_capital=500_000.0)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price, capital = 91_496.0, 500_000.0
+        # confidence=0.70 → 20% of 500k = 100k IDR without boost
+        size_no_boost = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, capital, ob_imbalance=0.0)
+        size_boosted = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, capital, ob_imbalance=0.5)
+        self.assertAlmostEqual(size_boosted * price, size_no_boost * price * 2.0, delta=1.0)
+
+    def test_boost_exact_threshold_triggers(self):
+        """Imbalance exactly equal to the threshold should trigger the boost."""
+        cfg = self._cfg(threshold=0.5, multiplier=3.0, initial_capital=500_000.0)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price = 100_000.0
+        base = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.0)
+        boosted = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.5)
+        self.assertAlmostEqual(boosted, base * 3.0, places=8)

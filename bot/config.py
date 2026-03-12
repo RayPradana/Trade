@@ -340,6 +340,40 @@ class BotConfig:
     # 0 = never refresh (one-time fetch on startup).
     pair_min_order_cache_enabled: bool = True
     pair_min_order_refresh_cycles: int = 0  # 0 = fetch once, never refresh
+    # ── Time-based exit (anti-stagnation) ─────────────────────────────────────
+    # Force-sell a position that has been open longer than this many seconds
+    # without reaching the profit threshold below.  Prevents capital from being
+    # locked in illiquid / slow-moving coins (e.g. tiny-cap pairs on Indodax).
+    #
+    # max_hold_seconds:
+    #   Maximum number of seconds to hold an open position before the
+    #   time-based exit check fires.  0 = disabled (default).
+    #   E.g. 1800 = exit after 30 minutes.
+    #
+    # max_hold_profit_pct:
+    #   The time-exit only triggers when the unrealised profit is *below* this
+    #   fraction.  Positions that are already profitable beyond this level are
+    #   left alone to continue running.
+    #   E.g. 0.01 = only force-exit if profit < 1% after max_hold_seconds.
+    #   Default: 0.01.
+    max_hold_seconds: float = 0.0
+    max_hold_profit_pct: float = 0.01
+    # ── Orderbook imbalance position-size boost ────────────────────────────────
+    # Multiply the computed position size by ob_imbalance_size_multiplier when
+    # the order-book imbalance exceeds ob_imbalance_boost_threshold.  This lets
+    # the bot enter with a larger stake when strong buy pressure is detected
+    # (bid volume >> ask volume) — a common precursor to a pump on Indodax.
+    #
+    # ob_imbalance_boost_threshold:
+    #   Minimum imbalance value to trigger the boost.
+    #   Imbalance = (bid_vol − ask_vol) / (bid_vol + ask_vol), range −1 … +1.
+    #   E.g. 0.50 ≈ bid volume is 3× ask volume.  0 = disabled (default).
+    #
+    # ob_imbalance_size_multiplier:
+    #   Factor by which the position size is multiplied when the threshold is met.
+    #   E.g. 2.0 = double the normal entry size on a whale-bid signal.
+    ob_imbalance_boost_threshold: float = 0.0
+    ob_imbalance_size_multiplier: float = 2.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -471,6 +505,10 @@ class BotConfig:
             confidence_tier_mid_pct=float(os.getenv("CONFIDENCE_TIER_MID_PCT", "0.15")),
             confidence_tier_high_pct=float(os.getenv("CONFIDENCE_TIER_HIGH_PCT", "0.20")),
             confidence_tier_max_pct=float(os.getenv("CONFIDENCE_TIER_MAX_PCT", "0.25")),
+            max_hold_seconds=float(os.getenv("MAX_HOLD_SECONDS", "0")),
+            max_hold_profit_pct=float(os.getenv("MAX_HOLD_PROFIT_PCT", "0.01")),
+            ob_imbalance_boost_threshold=float(os.getenv("OB_IMBALANCE_BOOST_THRESHOLD", "0")),
+            ob_imbalance_size_multiplier=float(os.getenv("OB_IMBALANCE_SIZE_MULTIPLIER", "2.0")),
         )
         cfg._validate()
         return cfg
@@ -635,6 +673,14 @@ class BotConfig:
             raise ValueError("RUG_PULL_MIN_TRADES_24H must be non-negative")
         if self.pair_min_order_refresh_cycles < 0:
             raise ValueError("PAIR_MIN_ORDER_REFRESH_CYCLES must be non-negative")
+        if self.max_hold_seconds < 0:
+            raise ValueError("MAX_HOLD_SECONDS must be non-negative")
+        if self.max_hold_profit_pct < 0:
+            raise ValueError("MAX_HOLD_PROFIT_PCT must be non-negative")
+        if self.ob_imbalance_boost_threshold < 0 or self.ob_imbalance_boost_threshold > 1:
+            raise ValueError("OB_IMBALANCE_BOOST_THRESHOLD must be in [0, 1]")
+        if self.ob_imbalance_size_multiplier <= 0:
+            raise ValueError("OB_IMBALANCE_SIZE_MULTIPLIER must be positive")
         if self.confidence_position_sizing_enabled:
             for name, val in (
                 ("CONFIDENCE_TIER_SKIP", self.confidence_tier_skip),

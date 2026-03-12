@@ -65,6 +65,10 @@ class PortfolioTracker:
         # Re-entry tracking
         self.last_sell_price: float = 0.0
         self.last_sell_time: float = 0.0
+        # Position open time — set when the first buy of a new position is recorded,
+        # reset to 0.0 when the position is fully closed.  Used by the time-based
+        # exit feature (MAX_HOLD_SECONDS) to detect stagnant / illiquid positions.
+        self.position_open_time: float = 0.0
         # Partial TP state: True when the first partial TP has been taken on the
         # current position.  Reset to False on each new buy or full close.
         self.partial_tp_taken: bool = False
@@ -126,6 +130,9 @@ class PortfolioTracker:
             self.trade_count += 1
             # A new buy resets the partial-TP flag for the fresh position
             self.partial_tp_taken = False
+            # Record when this position was first opened (first buy only)
+            if self.position_open_time == 0.0:
+                self.position_open_time = time.time()
         elif action == "sell":
             sell_qty = min(amount, self.base_position)
             self.cash += price * sell_qty
@@ -158,6 +165,8 @@ class PortfolioTracker:
                 self._tp_activated = False
                 self._trailing_tp_stop = None
                 self._trailing_tp_peak = None
+                # Reset position open time on full close
+                self.position_open_time = 0.0
 
     def cancel_pending_buy(self) -> None:
         """Roll back a buy that was tracked but never actually filled on the exchange.
@@ -184,6 +193,7 @@ class PortfolioTracker:
         self._tp_activated = False
         self._trailing_tp_stop = None
         self._trailing_tp_peak = None
+        self.position_open_time = 0.0
 
     def activate_trailing_tp(self, mark_price: float, trailing_tp_pct: float) -> None:
         """Activate or tighten the trailing take-profit floor.
@@ -214,6 +224,16 @@ class PortfolioTracker:
     def tp_activated(self) -> bool:
         """``True`` once the initial TP level has been reached in the current position."""
         return self._tp_activated
+
+    @property
+    def position_hold_seconds(self) -> float:
+        """Seconds elapsed since the current position was opened.
+
+        Returns ``0.0`` when no position is held.
+        """
+        if self.position_open_time <= 0 or self.base_position <= 0:
+            return 0.0
+        return time.time() - self.position_open_time
 
     def update_trailing_stop(self, mark_price: float, trailing_pct: float) -> None:
         """Update the trailing stop based on the current market price.
@@ -270,6 +290,9 @@ class PortfolioTracker:
         ptt = state.get("partial_tp_taken")
         if ptt is not None:
             self.partial_tp_taken = bool(ptt)
+        pot = state.get("position_open_time")
+        if pot is not None:
+            self.position_open_time = float(pot)
         # Restore profit-buffer peak for drawdown guard
         ppb = state.get("peak_profit_buffer")
         if ppb is not None:
@@ -365,6 +388,7 @@ class PortfolioTracker:
             "last_sell_price": self.last_sell_price,
             "last_sell_time": self.last_sell_time,
             "partial_tp_taken": self.partial_tp_taken,
+            "position_open_time": self.position_open_time,
             "peak_profit_buffer": self._peak_profit_buffer,
             # Trailing TP
             "tp_activated": self._tp_activated,
