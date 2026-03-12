@@ -41,11 +41,19 @@ class GuardedTrader(Trader):
     """Trader with stubbed client to test balance guards."""
 
     class _Client:
+        _pair_min_order: Dict[str, Any] = {}
+
         def get_depth(self, pair: str, count: int = 5) -> Dict[str, Any]:
             return {"buy": [["100", "1"]], "sell": [["100.05", "1"]]}
 
         def get_summaries(self) -> dict:
             return {}
+
+        def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+            return {"min_coin": 0.0, "min_idr": 0.0}
+
+        def load_pair_min_orders(self) -> None:
+            pass
 
     def __init__(self, config: BotConfig) -> None:
         super().__init__(config, client=self._Client())
@@ -2576,3 +2584,230 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         outcome = trader.maybe_execute(snap)
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("all_steps_below_min_order", outcome["reason"])
+
+
+class ForceSellDustTests(unittest.TestCase):
+    """Tests for the minimum-order / dust handling in force_sell."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def test_force_sell_clears_dust_when_below_min_coin(self) -> None:
+        """force_sell returns dust_cleared when actual balance < per-pair min_coin."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                # Exchange shows only 100 WTEC — way below min 3333.33
+                return {"return": {"balance": {"wtec": "100", "idr": "459125"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_pair_min_order(self, pair: str):
+                return {"min_coin": 3333.33, "min_idr": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 3.0, 13625.0)
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=3.0,
+            amount=13625.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "wtec_idr", "price": 3.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        # Should return dust_cleared — not raise, not place a sell order
+        self.assertEqual(outcome["status"], "dust_cleared")
+        # Position should be cleared
+        self.assertEqual(trader.tracker.base_position, 0.0)
+
+    def test_force_sell_handles_minimum_order_api_error(self) -> None:
+        """force_sell must catch 'Minimum order' API error and clear position as dust."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"wtec": "2000", "idr": "459125"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def create_order(self, pair, order_type, price, amount):
+                raise RuntimeError(
+                    "API error: {'success': 0, 'error': 'Minimum order 3333.33333333 WTEC', 'error_code': ''}"
+                )
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+            # Keep min_order_idr low so the IDR check doesn't trigger first
+            min_order_idr=1.0,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 3.0, 13625.0)
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=3.0,
+            amount=13625.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "wtec_idr", "price": 3.0, "decision": decision}
+        # Should not raise; should be handled gracefully
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "dust_cleared")
+        self.assertEqual(trader.tracker.base_position, 0.0)
+
+
+class RugPullFilterTests(unittest.TestCase):
+    """Tests for the rug-pull / dead-coin filter in analyze_market."""
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def test_detect_rug_pull_drop(self) -> None:
+        """detect_rug_pull_risk flags pair with >50% 24h drop."""
+        from bot.analysis import detect_rug_pull_risk
+
+        ticker = {"ticker": {"high": "100", "last": "30", "vol_idr": "5000000"}}
+        result = detect_rug_pull_risk(ticker, max_drop_24h_pct=0.50)
+        self.assertTrue(result.detected)
+        self.assertIn("24h_drop", result.reason)
+        self.assertGreater(result.drop_24h_pct, 0.5)
+
+    def test_detect_rug_pull_no_drop(self) -> None:
+        """detect_rug_pull_risk does not flag normal pair."""
+        from bot.analysis import detect_rug_pull_risk
+
+        ticker = {"ticker": {"high": "100", "last": "92", "vol_idr": "5000000"}}
+        result = detect_rug_pull_risk(ticker, max_drop_24h_pct=0.50)
+        self.assertFalse(result.detected)
+
+    def test_detect_dead_coin_volume(self) -> None:
+        """detect_rug_pull_risk flags dead coin with near-zero volume."""
+        from bot.analysis import detect_rug_pull_risk
+
+        ticker = {"ticker": {"high": "10", "last": "9.5", "vol_idr": "500"}}
+        result = detect_rug_pull_risk(ticker, min_volume_24h_idr=1_000_000)
+        self.assertTrue(result.detected)
+        self.assertIn("dead_coin_volume", result.reason)
+
+    def test_analyze_market_skips_rug_pull_pair(self) -> None:
+        """analyze_market returns hold with rug_pull_risk when coin has crashed >50%."""
+        from bot.analysis import RugPullRisk
+
+        class _RugClient(GuardedTrader._Client):
+            def get_ticker(self, pair: str):
+                # 70% drop from high
+                return {"ticker": {"high": "100", "last": "30", "vol_idr": "5000000"}}
+
+            def get_depth(self, pair: str, count: int = 50):
+                return {"buy": [["30", "1000"]], "sell": [["31", "1000"]]}
+
+            def get_trades(self, pair: str, count: int = 200):
+                return []
+
+        config = BotConfig(
+            api_key=None,
+            rug_pull_max_drop_24h_pct=0.50,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _RugClient()
+        trader._multi_feed = type(
+            "_Feed", (), {
+                "has_snapshot": False,
+                "is_seeded": False,
+                "get_ticker": lambda self, p: None,
+            }
+        )()
+
+        snap = trader.analyze_market("rug_idr")
+        self.assertEqual(snap["decision"].action, "hold")
+        self.assertIn("rug_pull_risk", snap["decision"].reason)
+        rug = snap.get("rug_pull_risk")
+        self.assertIsNotNone(rug)
+        self.assertTrue(rug.detected)
+
+
+class PairMinOrderCacheTests(unittest.TestCase):
+    """Tests for the per-pair minimum order cache (load_pair_min_orders / get_pair_min_order)."""
+
+    def test_load_pair_min_orders_populates_cache(self) -> None:
+        """load_pair_min_orders must populate _pair_min_order from /api/pairs response."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+
+        class _MockSession:
+            def get(self, url, **kwargs):
+                import json
+
+                class _Resp:
+                    def raise_for_status(self): pass
+                    def json(self):
+                        return [
+                            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
+                            {"id": "wtecidr", "trade_min_base_currency": "3333.33333333", "trade_min_traded_currency": "10000"},
+                        ]
+                return _Resp()
+
+        client.session = _MockSession()
+        client.base_url = "https://indodax.com"
+        client.timeout = 10
+        client.load_pair_min_orders()
+
+        self.assertIn("btcidr", client._pair_min_order)
+        self.assertAlmostEqual(client._pair_min_order["btcidr"]["min_coin"], 0.0001)
+        self.assertAlmostEqual(client._pair_min_order["wtecidr"]["min_coin"], 3333.33333333, places=5)
+
+    def test_get_pair_min_order_returns_zero_for_unknown(self) -> None:
+        """get_pair_min_order must return zeros for unknown pairs."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        result = client.get_pair_min_order("unknown_idr")
+        self.assertEqual(result["min_coin"], 0.0)
+        self.assertEqual(result["min_idr"], 0.0)
+
+    def test_parse_minimum_order_error(self) -> None:
+        """parse_minimum_order_error must extract the minimum amount from error text."""
+        from bot.indodax_client import IndodaxClient
+
+        msg = "API error: {'success': 0, 'error': 'Minimum order 3333.33333333 WTEC', 'error_code': ''}"
+        result = IndodaxClient.parse_minimum_order_error(msg)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 3333.33333333, places=5)
+
+    def test_parse_minimum_order_error_no_match(self) -> None:
+        """parse_minimum_order_error must return None for non-matching errors."""
+        from bot.indodax_client import IndodaxClient
+
+        result = IndodaxClient.parse_minimum_order_error("Some other error")
+        self.assertIsNone(result)

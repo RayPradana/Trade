@@ -14,6 +14,7 @@ from .analysis import (
     candles_from_ohlc,
     derive_indicators,
     detect_flash_dump,
+    detect_rug_pull_risk,
     detect_spread_anomaly,
     detect_spoofing,
     detect_whale_activity,
@@ -22,6 +23,7 @@ from .analysis import (
     smart_entry_filter,
     MomentumIndicators,
     MultiTimeframeResult,
+    RugPullRisk,
     SmartEntryResult,
     SpoofingResult,
     WhaleActivity,
@@ -100,10 +102,36 @@ class Trader:
         self._spread_history: Dict[str, List[float]] = {}
         # Per-pair cooldown: maps pair → unix timestamp of last executed trade
         self._pair_last_trade: Dict[str, float] = {}
+        # ── Per-pair minimum order cache ─────────────────────────────────────
+        # Populated by _ensure_pair_min_order_cache().  Tracks how many scan
+        # cycles have elapsed since the last cache refresh.
+        self._pair_min_order_cache_cycles: int = 0
 
     # ------------------------------------------------------------------
     # Auto-resume helpers
     # ------------------------------------------------------------------
+
+    def _ensure_pair_min_order_cache(self) -> None:
+        """Lazily load (and optionally refresh) the per-pair minimum order cache.
+
+        Called once at the start of each scan cycle.  The first call always
+        triggers a ``/api/pairs`` fetch.  Subsequent calls only refresh when
+        ``pair_min_order_refresh_cycles > 0`` and the configured number of
+        cycles has elapsed.
+        """
+        if not self.config.pair_min_order_cache_enabled:
+            return
+        if not hasattr(self.client, "load_pair_min_orders"):
+            return
+        refresh = self.config.pair_min_order_refresh_cycles
+        cached: dict = getattr(self.client, "_pair_min_order", {})
+        already_loaded = bool(cached)
+        cycle_due = refresh > 0 and self._pair_min_order_cache_cycles >= refresh
+        if not already_loaded or cycle_due:
+            self.client.load_pair_min_orders()
+            self._pair_min_order_cache_cycles = 0
+        else:
+            self._pair_min_order_cache_cycles += 1
 
     def _try_restore_state(self) -> None:
         """Load persisted state on startup and restore PortfolioTracker.
@@ -699,6 +727,49 @@ class Trader:
         # high-volume pairs.  Fall back to building candles from raw trades
         # (the legacy path) when the OHLC call fails.
         candles = self._fetch_candles(pair, trades)
+
+        # ── Rug-pull / dead coin filter ──────────────────────────────────────
+        # Check the ticker for extreme 24-h price drops or near-zero volume
+        # before spending time on indicators.  When a rug-pull risk is detected
+        # the snapshot is returned immediately with a hard "hold" decision so
+        # the pair is skipped without burning API quota on depth / candles.
+        rug_pull_risk: Optional[RugPullRisk] = None
+        _rug_enabled = (
+            self.config.rug_pull_max_drop_24h_pct > 0
+            or self.config.rug_pull_min_volume_idr > 0
+            or self.config.rug_pull_min_trades_24h > 0
+        )
+        if _rug_enabled:
+            rug_pull_risk = detect_rug_pull_risk(
+                ticker,
+                max_drop_24h_pct=self.config.rug_pull_max_drop_24h_pct,
+                min_volume_24h_idr=self.config.rug_pull_min_volume_idr,
+                min_trades_24h=self.config.rug_pull_min_trades_24h,
+            )
+            if rug_pull_risk.detected:
+                logger.warning(
+                    "Rug-pull/dead-coin risk on %s: %s — skipping",
+                    pair,
+                    rug_pull_risk.reason,
+                )
+                price = self._extract_price(ticker)
+                _hold_decision = StrategyDecision(
+                    mode="hold",
+                    action="hold",
+                    confidence=0.0,
+                    reason=f"rug_pull_risk:{rug_pull_risk.reason}",
+                    target_price=price,
+                    amount=0.0,
+                    stop_loss=None,
+                    take_profit=None,
+                )
+                return {
+                    "pair": pair,
+                    "price": price,
+                    "decision": _hold_decision,
+                    "rug_pull_risk": rug_pull_risk,
+                    "insufficient_data": False,
+                }
 
         insufficient_data = len(candles) < self.config.min_candles
         if insufficient_data:
@@ -1697,7 +1768,89 @@ class Trader:
                 exc,
             )
 
-        order_resp = self.client.create_order(pair, "sell", reference_price, amount)
+        # ── Per-pair minimum order check (auto-adjust / skip dust) ───────────
+        # Check the cached per-pair minimum before sending the sell order.
+        # If the amount falls below the exchange floor, treat it as unsellable
+        # "dust" and clear the position without submitting an API call (which
+        # would raise "Minimum order X COIN" and cause repeated error loops).
+        _get_min = getattr(self.client, "get_pair_min_order", None)
+        min_info = _get_min(pair) if callable(_get_min) else {}
+        min_coin = min_info.get("min_coin", 0.0)
+        min_idr_per_pair = min_info.get("min_idr", 0.0)
+        sell_idr_value = amount * reference_price
+
+        # Compute effective minimum from both per-pair info and global config.
+        effective_min_idr = max(self.config.min_order_idr, min_idr_per_pair)
+        is_below_coin_min = min_coin > 0 and amount < min_coin
+        is_below_idr_min = effective_min_idr > 0 and sell_idr_value < effective_min_idr
+
+        if is_below_coin_min or is_below_idr_min:
+            logger.warning(
+                "force_sell: sell amount %.8f %s (Rp %.0f) is below exchange minimum "
+                "(min_coin=%.8f  min_idr=%.0f) — clearing dust position without order",
+                amount,
+                pair.split("_")[0].upper(),
+                sell_idr_value,
+                min_coin,
+                effective_min_idr,
+            )
+            self.tracker.cancel_pending_buy()
+            outcome: Dict[str, Any] = {
+                "status": "dust_cleared",
+                "pair": pair,
+                "price": reference_price,
+                "amount": amount,
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
+            self._persist_after_trade(pair)
+            return outcome
+
+        # ── Place the sell order ─────────────────────────────────────────────
+        try:
+            order_resp = self.client.create_order(pair, "sell", reference_price, amount)
+        except RuntimeError as exc:
+            # If the exchange still rejects with a "Minimum order" error
+            # (e.g. min_coin cache is stale or not populated), parse the
+            # exchange-reported minimum and clear the position as dust.
+            exc_str = str(exc)
+            _parse_min = getattr(self.client, "parse_minimum_order_error", None)
+            parsed_min = _parse_min(exc_str) if callable(_parse_min) else None
+            if parsed_min is None:
+                # Fallback: detect via the error text directly
+                import re as _re
+                _m = _re.search(r"Minimum order\s+([\d.]+)", exc_str, _re.IGNORECASE)
+                if _m:
+                    try:
+                        parsed_min = float(_m.group(1))
+                    except ValueError:
+                        pass
+            if parsed_min is not None:
+                logger.warning(
+                    "force_sell: caught minimum order error for %s "
+                    "(amount=%.8f < min=%.8f) — clearing dust position",
+                    pair,
+                    amount,
+                    parsed_min,
+                )
+                # Update the cache with the exchange-reported minimum so
+                # future attempts won't hit the same error.
+                _cache = getattr(self.client, "_pair_min_order", None)
+                if isinstance(_cache, dict):
+                    cached = _cache.setdefault(pair.lower(), {})
+                    if parsed_min > cached.get("min_coin", 0.0):
+                        cached["min_coin"] = parsed_min
+                self.tracker.cancel_pending_buy()
+                outcome = {
+                    "status": "dust_cleared",
+                    "pair": pair,
+                    "price": reference_price,
+                    "amount": amount,
+                    "portfolio": self.tracker.as_dict(reference_price),
+                }
+                self._persist_after_trade(pair)
+                return outcome
+            raise
+
         self.tracker.record_trade("sell", reference_price, amount)
         outcome = {
             "status": "force_sold",
@@ -1765,6 +1918,9 @@ class Trader:
         raise last_exc
 
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
+        # ── Per-pair minimum order cache ─────────────────────────────────────
+        self._ensure_pair_min_order_cache()
+
         if self._all_pairs is None:
             try:
                 pairs_data = self.client.get_pairs()

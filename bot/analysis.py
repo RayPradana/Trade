@@ -1033,3 +1033,114 @@ def detect_flash_dump(
         drop_pct=round(drop, 4),
         duration_seconds=round(duration, 2),
     )
+
+
+# ---------------------------------------------------------------------------
+# Rug-Pull / Dead Coin Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RugPullRisk:
+    """Result of rug-pull / dead-coin risk evaluation for a trading pair.
+
+    A pair is flagged when it exhibits characteristics typical of scam tokens
+    or abandoned coins:
+    - Extreme 24-h price drop (the coin has "rug-pulled" or crashed)
+    - Near-zero or no trading volume (dead / illiquid coin)
+    - Extremely low price with no recent trade activity
+
+    ``detected`` is ``True`` when any risk criterion is met.
+
+    ``reason`` describes which criterion triggered the flag
+    (e.g. ``"24h_drop=45%"`` or ``"dead_coin_volume=0"``).
+
+    ``drop_24h_pct`` is the absolute fraction of 24-h price decline
+    (0.0 when not computed).
+
+    ``volume_24h_idr`` is the 24-h IDR trading volume (0.0 when not available).
+    """
+
+    detected: bool
+    reason: str
+    drop_24h_pct: float
+    volume_24h_idr: float
+
+
+def detect_rug_pull_risk(
+    ticker: Dict[str, Any],
+    max_drop_24h_pct: float = 0.50,
+    min_volume_24h_idr: float = 0.0,
+    min_trades_24h: int = 0,
+) -> RugPullRisk:
+    """Detect rug-pull or dead-coin risk from the 24-h ticker snapshot.
+
+    :param ticker:
+        Indodax ticker dict (either ``{"ticker": {...}}`` wrapper or the inner
+        dict directly).  Expected keys: ``"high"``, ``"low"``, ``"last"``
+        (or ``"last_price"``), ``"vol_idr"`` (or ``"volume"``) and optionally
+        ``"trade_count"`` / ``"count"`` for the number of trades in 24 h.
+    :param max_drop_24h_pct:
+        Flag when ``(high − last) / high ≥ max_drop_24h_pct``.
+        Default 0.50 = 50% drop flags the pair as rug-pull risk.
+        Set to 0 to disable this check.
+    :param min_volume_24h_idr:
+        Minimum 24-h IDR volume required.  When volume is below this value the
+        pair is flagged as a dead coin.  0 = disabled (default).
+    :param min_trades_24h:
+        Minimum number of trades in the past 24 h.  0 = disabled (default).
+    :returns: :class:`RugPullRisk` with ``detected=False`` when all checks pass.
+    """
+    no_risk = RugPullRisk(detected=False, reason="", drop_24h_pct=0.0, volume_24h_idr=0.0)
+
+    # Unwrap {"ticker": {...}} wrapper if present
+    inner = ticker.get("ticker", ticker) if isinstance(ticker, dict) else {}
+    if not isinstance(inner, dict):
+        inner = {}
+
+    def _f(key: str, *aliases: str) -> float:
+        for k in (key,) + aliases:
+            v = inner.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
+    high = _f("high")
+    last = _f("last", "last_price")
+    volume_idr = _f("vol_idr", "volume", "vol")
+
+    # ── 24-h price drop check ────────────────────────────────────────────────
+    drop_24h = 0.0
+    if max_drop_24h_pct > 0 and high > 0 and last >= 0:
+        drop_24h = (high - last) / high
+        if drop_24h >= max_drop_24h_pct:
+            return RugPullRisk(
+                detected=True,
+                reason=f"24h_drop={drop_24h:.1%}",
+                drop_24h_pct=round(drop_24h, 4),
+                volume_24h_idr=volume_idr,
+            )
+
+    # ── Volume / dead coin check ─────────────────────────────────────────────
+    if min_volume_24h_idr > 0 and volume_idr < min_volume_24h_idr:
+        return RugPullRisk(
+            detected=True,
+            reason=f"dead_coin_volume={volume_idr:.0f}_idr",
+            drop_24h_pct=round(drop_24h, 4),
+            volume_24h_idr=volume_idr,
+        )
+
+    # ── Trade count check ────────────────────────────────────────────────────
+    if min_trades_24h > 0:
+        trade_count = int(_f("trade_count", "count") or 0)
+        if trade_count < min_trades_24h:
+            return RugPullRisk(
+                detected=True,
+                reason=f"dead_coin_trades={trade_count}",
+                drop_24h_pct=round(drop_24h, 4),
+                volume_24h_idr=volume_idr,
+            )
+
+    return no_risk

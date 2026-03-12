@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
+import re
 import time
 from urllib.parse import urlencode
 from typing import Any, Dict, List, Optional
@@ -10,6 +12,8 @@ import requests
 
 from .rate_limit import RateLimitedOrderQueue
 from .analysis import _TF_SECONDS as _OHLC_TF_SECONDS  # shared timeframe → seconds map
+
+logger = logging.getLogger(__name__)
 
 
 class IndodaxClient:
@@ -38,10 +42,61 @@ class IndodaxClient:
         )
         if self.order_queue is None and enable_queue:
             self.order_queue = RateLimitedOrderQueue(min_interval=order_min_interval)
+        # Per-pair minimum order cache:
+        #   keys are pair names (e.g. "btc_idr")
+        #   values are dicts with "min_coin" (min base currency amount)
+        #   and "min_idr" (min IDR value).
+        self._pair_min_order: Dict[str, Dict[str, float]] = {}
 
     # -------------------- public API -------------------- #
     def get_pairs(self) -> List[Dict[str, Any]]:
         return self._get("/api/pairs")
+
+    def load_pair_min_orders(self) -> None:
+        """Fetch exchange pair list and cache per-pair minimum order sizes.
+
+        The Indodax ``/api/pairs`` endpoint returns a list of pair objects,
+        each containing ``trade_min_base_currency`` (minimum coin amount) and
+        ``trade_min_traded_currency`` (minimum IDR amount).  This method
+        populates :attr:`_pair_min_order` for quick lookup before order
+        placement so that "Minimum order" errors are prevented proactively.
+
+        Safe to call multiple times; the cache is fully replaced on each call.
+        """
+        try:
+            pairs_info = self.get_pairs()
+        except Exception as exc:
+            logger.warning("load_pair_min_orders: failed to fetch /api/pairs: %s", exc)
+            return
+        if not isinstance(pairs_info, list):
+            logger.warning("load_pair_min_orders: unexpected response format")
+            return
+        loaded = 0
+        for info in pairs_info:
+            if not isinstance(info, dict):
+                continue
+            pair_id = (info.get("id") or info.get("pair_id") or "").lower().replace("/", "_")
+            if not pair_id:
+                continue
+            try:
+                min_coin = float(info.get("trade_min_base_currency") or 0)
+            except (TypeError, ValueError):
+                min_coin = 0.0
+            try:
+                min_idr = float(info.get("trade_min_traded_currency") or 0)
+            except (TypeError, ValueError):
+                min_idr = 0.0
+            self._pair_min_order[pair_id] = {"min_coin": min_coin, "min_idr": min_idr}
+            loaded += 1
+        logger.info("load_pair_min_orders: cached minimum orders for %d pairs", loaded)
+
+    def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+        """Return the cached minimum order sizes for *pair*.
+
+        :returns: ``{"min_coin": float, "min_idr": float}`` — both default to
+                  0.0 when the pair is not in the cache.
+        """
+        return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
 
     def get_summaries(self) -> Dict[str, Any]:
         return self._get("/api/summaries")
@@ -146,6 +201,27 @@ class IndodaxClient:
 
     def cancel_order(self, pair: str, order_id: str) -> Dict[str, Any]:
         return self._enqueue_private("cancelOrder", {"pair": pair, "order_id": order_id})
+
+    @staticmethod
+    def parse_minimum_order_error(error_message: str) -> Optional[float]:
+        """Extract the minimum required coin amount from a 'Minimum order' error.
+
+        Indodax returns messages like ``"Minimum order 3333.33333333 WTEC"``
+        when a sell/buy amount is below the exchange floor.  This helper parses
+        that message and returns the minimum amount as a float, or ``None`` if
+        the message does not match the expected pattern.
+
+        :param error_message: The ``error`` string from the Indodax API response
+                              dict, or the full ``str(exc)`` text.
+        :returns: Minimum coin amount (float) or ``None``.
+        """
+        match = re.search(r"Minimum order\s+([\d.]+)", error_message, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+        return None
 
     # -------------------- helpers -------------------- #
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:

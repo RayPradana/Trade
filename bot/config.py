@@ -295,6 +295,33 @@ class BotConfig:
     # below resistance.  Only active when resistance data is available.
     # 0 = disabled.  Default: 0.01 (1%).
     buy_max_resistance_proximity_pct: float = 0.01
+    # ── Anti rug-pull / dead coin filter ─────────────────────────────────────
+    # Skip BUY signals on pairs that look like rug-pulls or dead coins.
+    # Criteria are evaluated from the 24-h ticker before any other analysis.
+    #
+    # rug_pull_max_drop_24h_pct:
+    #   Skip pairs where the 24-h high-to-last drop exceeds this fraction.
+    #   E.g. 0.50 = skip if price dropped ≥ 50% from its 24-h high.
+    #   0 = disabled (default).
+    rug_pull_max_drop_24h_pct: float = 0.0
+    # rug_pull_min_volume_idr:
+    #   Skip pairs whose 24-h IDR volume is below this amount.
+    #   Complements the existing MIN_VOLUME_IDR scan filter by applying
+    #   a hard per-pair minimum directly inside the rug-pull check.
+    #   0 = disabled (default).
+    rug_pull_min_volume_idr: float = 0.0
+    # rug_pull_min_trades_24h:
+    #   Skip pairs with fewer than this many trades in the last 24 h.
+    #   0 = disabled (default).
+    rug_pull_min_trades_24h: int = 0
+    # ── Per-pair minimum order auto-detection ─────────────────────────────────
+    # When enabled, the bot fetches the exchange pair list on startup and caches
+    # the per-pair minimum trade amounts (coin and IDR).  Before every order the
+    # cached minimum is consulted so tiny amounts never reach the exchange.
+    # The cache is refreshed automatically every pair_min_order_refresh_cycles.
+    # 0 = never refresh (one-time fetch on startup).
+    pair_min_order_cache_enabled: bool = True
+    pair_min_order_refresh_cycles: int = 0  # 0 = fetch once, never refresh
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -412,6 +439,11 @@ class BotConfig:
             pair_cooldown_seconds=float(os.getenv("PAIR_COOLDOWN_SECONDS", "300")),
             buy_max_rsi=float(os.getenv("BUY_MAX_RSI", "85")),
             buy_max_resistance_proximity_pct=float(os.getenv("BUY_MAX_RESISTANCE_PROXIMITY_PCT", "0.01")),
+            rug_pull_max_drop_24h_pct=float(os.getenv("RUG_PULL_MAX_DROP_24H_PCT", "0")),
+            rug_pull_min_volume_idr=float(os.getenv("RUG_PULL_MIN_VOLUME_IDR", "0")),
+            rug_pull_min_trades_24h=int(os.getenv("RUG_PULL_MIN_TRADES_24H", "0")),
+            pair_min_order_cache_enabled=os.getenv("PAIR_MIN_ORDER_CACHE_ENABLED", "true").lower() in {"1", "true", "yes"},
+            pair_min_order_refresh_cycles=int(os.getenv("PAIR_MIN_ORDER_REFRESH_CYCLES", "0")),
         )
         cfg._validate()
         return cfg
@@ -568,5 +600,13 @@ class BotConfig:
             raise ValueError("BUY_MAX_RSI must be non-negative")
         if self.buy_max_resistance_proximity_pct < 0:
             raise ValueError("BUY_MAX_RESISTANCE_PROXIMITY_PCT must be non-negative")
+        if self.rug_pull_max_drop_24h_pct < 0 or self.rug_pull_max_drop_24h_pct > 1:
+            raise ValueError("RUG_PULL_MAX_DROP_24H_PCT must be in [0, 1]")
+        if self.rug_pull_min_volume_idr < 0:
+            raise ValueError("RUG_PULL_MIN_VOLUME_IDR must be non-negative")
+        if self.rug_pull_min_trades_24h < 0:
+            raise ValueError("RUG_PULL_MIN_TRADES_24H must be non-negative")
+        if self.pair_min_order_refresh_cycles < 0:
+            raise ValueError("PAIR_MIN_ORDER_REFRESH_CYCLES must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()
