@@ -277,3 +277,71 @@ class AdaptiveSizingTests(unittest.TestCase):
         cfg = self._cfg(initial_capital=500_000.0)
         dec = make_trade_decision(trend, ob, vol, 50_000.0, cfg, effective_capital=500_000.0)
         self.assertIn("adaptive_risk=", dec.reason)
+
+
+class BuyFilterTests(unittest.TestCase):
+    """Tests for hard-skip buy filters: RSI overbought and resistance proximity."""
+
+    def _base_inputs(self):
+        trend = TrendResult(direction="up", fast_ma=102.0, slow_ma=100.0, strength=0.02)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=100.0, ask_volume=70.0, imbalance=0.3)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        return trend, ob, vol
+
+    def test_rsi_overbought_forces_hold(self):
+        """When RSI >= buy_max_rsi and buy_max_rsi > 0, action must be hold."""
+        from bot.analysis import MomentumIndicators
+        trend, ob, vol = self._base_inputs()
+        cfg = BotConfig(api_key=None, dry_run=True, buy_max_rsi=85.0)
+        ind = MomentumIndicators(rsi=90.0, macd=0.0, macd_signal=0.0, macd_hist=0.0, bb_upper=None, bb_mid=None, bb_lower=None)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg, indicators=ind)
+        self.assertEqual(dec.action, "hold")
+        self.assertIn("rsi_overbought", dec.reason)
+
+    def test_rsi_below_threshold_allows_buy(self):
+        """When RSI < buy_max_rsi, buy should not be blocked."""
+        from bot.analysis import MomentumIndicators
+        trend, ob, vol = self._base_inputs()
+        cfg = BotConfig(api_key=None, dry_run=True, buy_max_rsi=85.0, min_confidence=0.0)
+        ind = MomentumIndicators(rsi=60.0, macd=0.0, macd_signal=0.0, macd_hist=0.0, bb_upper=None, bb_mid=None, bb_lower=None)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg, indicators=ind)
+        self.assertEqual(dec.action, "buy")
+
+    def test_rsi_filter_disabled_when_zero(self):
+        """buy_max_rsi=0 disables the filter even when RSI is 100."""
+        from bot.analysis import MomentumIndicators
+        trend, ob, vol = self._base_inputs()
+        cfg = BotConfig(api_key=None, dry_run=True, buy_max_rsi=0.0, min_confidence=0.0)
+        ind = MomentumIndicators(rsi=100.0, macd=0.0, macd_signal=0.0, macd_hist=0.0, bb_upper=None, bb_mid=None, bb_lower=None)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg, indicators=ind)
+        self.assertEqual(dec.action, "buy")
+
+    def test_resistance_proximity_forces_hold(self):
+        """When price is within buy_max_resistance_proximity_pct of resistance, force hold."""
+        from bot.analysis import SupportResistance
+        trend, ob, vol = self._base_inputs()
+        # price=99, resistance=100 → distance = 1/100 = 1% → equals threshold → blocked
+        cfg = BotConfig(api_key=None, dry_run=True, buy_max_resistance_proximity_pct=0.01)
+        levels = SupportResistance(support=90.0, resistance=100.0, lookback=20)
+        dec = make_trade_decision(trend, ob, vol, 99.0, cfg, levels=levels)
+        self.assertEqual(dec.action, "hold")
+        self.assertIn("too_close_to_resistance", dec.reason)
+
+    def test_resistance_proximity_far_allows_buy(self):
+        """When price is far from resistance, buy should not be blocked."""
+        from bot.analysis import SupportResistance
+        trend, ob, vol = self._base_inputs()
+        # price=95, resistance=100 → distance = 5% > threshold 1%
+        cfg = BotConfig(api_key=None, dry_run=True, buy_max_resistance_proximity_pct=0.01, min_confidence=0.0)
+        levels = SupportResistance(support=85.0, resistance=100.0, lookback=20)
+        dec = make_trade_decision(trend, ob, vol, 95.0, cfg, levels=levels)
+        self.assertEqual(dec.action, "buy")
+
+    def test_resistance_proximity_disabled_when_zero(self):
+        """buy_max_resistance_proximity_pct=0 disables filter at any distance."""
+        from bot.analysis import SupportResistance
+        trend, ob, vol = self._base_inputs()
+        cfg = BotConfig(api_key=None, dry_run=True, buy_max_resistance_proximity_pct=0.0, min_confidence=0.0)
+        levels = SupportResistance(support=90.0, resistance=100.0, lookback=20)
+        dec = make_trade_decision(trend, ob, vol, 99.9, cfg, levels=levels)
+        self.assertEqual(dec.action, "buy")

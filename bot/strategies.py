@@ -333,6 +333,30 @@ def make_trade_decision(
                 conf *= 0.7
                 sr_note = "near_support"
 
+    # ── Hard-skip filters (configurable) ─────────────────────────────────────
+    # These override action to "hold" immediately without running further
+    # scoring, so no fee-wasting order is ever placed.
+
+    # 1. RSI overbought buy filter
+    if action == "buy" and config.buy_max_rsi > 0 and indicators:
+        if indicators.rsi >= config.buy_max_rsi:
+            action = "hold"
+            stop_loss = None
+            take_profit = None
+            sr_note = f"rsi_overbought(rsi={indicators.rsi:.1f}>={config.buy_max_rsi:.0f})"
+
+    # 2. Distance-to-resistance buy filter
+    if action == "buy" and config.buy_max_resistance_proximity_pct > 0 and levels and levels.resistance:
+        distance = (levels.resistance - current_price) / levels.resistance
+        if 0 <= distance <= config.buy_max_resistance_proximity_pct:
+            action = "hold"
+            stop_loss = None
+            take_profit = None
+            sr_note = (
+                f"too_close_to_resistance(dist={distance:.2%}"
+                f"<={config.buy_max_resistance_proximity_pct:.2%})"
+            )
+
     if indicators:
         if action == "buy" and indicators.bb_upper:
             take_profit = min(take_profit, indicators.bb_upper)

@@ -98,6 +98,8 @@ class Trader:
         self._volatility_cooldown_until: float = 0.0
         self.journal: Optional[TradeJournal] = None
         self._spread_history: Dict[str, List[float]] = {}
+        # Per-pair cooldown: maps pair → unix timestamp of last executed trade
+        self._pair_last_trade: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Auto-resume helpers
@@ -262,6 +264,8 @@ class Trader:
 
     def _persist_after_trade(self, pair: str) -> None:
         """Save state if still in a position, or clear it if the position is closed."""
+        if self.config.pair_cooldown_seconds > 0:
+            self._pair_last_trade[pair] = time.time()
         if self.tracker.base_position <= 0:
             self._clear_state()
         else:
@@ -935,6 +939,23 @@ class Trader:
         if self.config.max_consecutive_losses > 0 and decision.action == "buy":
             if self.tracker.loss_streak >= self.config.max_consecutive_losses:
                 return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": self.tracker.as_dict(price)}
+
+        # ── Per-pair trade cooldown ───────────────────────────────────────────
+        if self.config.pair_cooldown_seconds > 0 and decision.action == "buy":
+            pair = snapshot["pair"]
+            last_trade = self._pair_last_trade.get(pair, 0.0)
+            elapsed = time.time() - last_trade
+            if elapsed < self.config.pair_cooldown_seconds:
+                remaining = self.config.pair_cooldown_seconds - elapsed
+                logger.info(
+                    "Pair cooldown active for %s — %.0fs remaining",
+                    pair, remaining,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"pair_cooldown remaining={remaining:.0f}s",
+                    "portfolio": self.tracker.as_dict(price),
+                }
 
         # Max open positions check (static or adaptive)
         if decision.action == "buy":

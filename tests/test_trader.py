@@ -2094,3 +2094,101 @@ class ScanAndChooseUnexpectedExceptionTest(unittest.TestCase):
         with mock.patch.object(trader, "_analyze_with_retry", side_effect=IndexError("index")):
             with self.assertRaises(RuntimeError):
                 trader.scan_and_choose()
+
+
+class PairCooldownTraderTest(unittest.TestCase):
+    """Tests for the per-pair trade cooldown guard."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_snapshot(self, pair="eth_idr", action="buy", conf=0.9):
+        return {
+            "pair": pair,
+            "price": 5_000_000.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=conf,
+                reason="test",
+                target_price=5_000_000.0,
+                amount=0.001,
+                stop_loss=4_500_000.0,
+                take_profit=5_500_000.0,
+            ),
+        }
+
+    def test_pair_cooldown_blocks_buy_within_window(self):
+        import time
+        config = BotConfig(api_key=None, pair_cooldown_seconds=3600, dry_run=True)
+        trader = Trader(config)
+        # Simulate that this pair was just traded
+        trader._pair_last_trade["eth_idr"] = time.time()
+        outcome = trader.maybe_execute(self._make_snapshot(pair="eth_idr", action="buy"))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("pair_cooldown", outcome["reason"])
+
+    def test_pair_cooldown_allows_buy_after_window(self):
+        import time
+        config = BotConfig(api_key=None, pair_cooldown_seconds=5, dry_run=True)
+        trader = Trader(config)
+        # Trade was 10s ago, window = 5s → should be allowed
+        trader._pair_last_trade["eth_idr"] = time.time() - 10
+        # Attach a dummy depth client so the buy isn't blocked elsewhere
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["4999999", "1"]], "sell": [["5000001", "1"]]},
+        })()
+        outcome = trader.maybe_execute(self._make_snapshot(pair="eth_idr", action="buy"))
+        self.assertNotIn("pair_cooldown", outcome.get("reason", ""))
+
+    def test_pair_cooldown_does_not_block_different_pair(self):
+        import time
+        config = BotConfig(api_key=None, pair_cooldown_seconds=3600, dry_run=True)
+        trader = Trader(config)
+        # Only eth_idr is in cooldown
+        trader._pair_last_trade["eth_idr"] = time.time()
+        # btc_idr should NOT be blocked
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["4999999", "1"]], "sell": [["5000001", "1"]]},
+        })()
+        outcome = trader.maybe_execute(self._make_snapshot(pair="btc_idr", action="buy"))
+        self.assertNotIn("pair_cooldown", outcome.get("reason", ""))
+
+    def test_pair_cooldown_disabled_when_zero(self):
+        import time
+        config = BotConfig(api_key=None, pair_cooldown_seconds=0, dry_run=True)
+        trader = Trader(config)
+        # Set trade timestamp to "just now" — should not block because feature is off
+        trader._pair_last_trade["eth_idr"] = time.time()
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["4999999", "1"]], "sell": [["5000001", "1"]]},
+        })()
+        outcome = trader.maybe_execute(self._make_snapshot(pair="eth_idr", action="buy"))
+        self.assertNotIn("pair_cooldown", outcome.get("reason", ""))
+
+    def test_persist_after_trade_records_cooldown_timestamp(self):
+        import time
+        config = BotConfig(api_key=None, pair_cooldown_seconds=60, dry_run=True)
+        trader = Trader(config)
+        before = time.time()
+        trader._persist_after_trade("sol_idr")
+        after = time.time()
+        self.assertIn("sol_idr", trader._pair_last_trade)
+        self.assertGreaterEqual(trader._pair_last_trade["sol_idr"], before)
+        self.assertLessEqual(trader._pair_last_trade["sol_idr"], after)
+
+    def test_persist_after_trade_does_not_record_when_disabled(self):
+        config = BotConfig(api_key=None, pair_cooldown_seconds=0, dry_run=True)
+        trader = Trader(config)
+        trader._persist_after_trade("sol_idr")
+        self.assertNotIn("sol_idr", trader._pair_last_trade)
