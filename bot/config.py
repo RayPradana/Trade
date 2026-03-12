@@ -307,6 +307,12 @@ class BotConfig:
     # Volume surge ratio: recent_avg / baseline_avg must exceed this to detect
     # a pre-pump accumulation phase.  E.g. 2.0 = 2× average baseline volume.
     see_volume_surge_ratio: float = 2.0
+    # Pump-sniper: momentum + volume surge combo (disabled by default).
+    see_pump_sniper_enabled: bool = False
+    see_pump_sniper_price_ratio: float = 1.02
+    see_pump_sniper_volume_ratio: float = 2.5
+    see_pump_sniper_short: int = 3
+    see_pump_sniper_long: int = 12
     # Minimum net whale pressure ratio (bid_whale_ratio − ask_whale_ratio) to
     # classify as significant directional whale activity.
     see_whale_pressure_min: float = 2.0
@@ -682,6 +688,11 @@ class BotConfig:
             max_tick_move_pct=_env_float("MAX_TICK_MOVE_PCT", "0"),
             see_enabled=os.getenv("SEE_ENABLED", "false").lower() in {"1", "true", "yes"},
             see_volume_surge_ratio=_env_float("SEE_VOLUME_SURGE_RATIO", "2.0"),
+            see_pump_sniper_enabled=os.getenv("SEE_PUMP_SNIPER_ENABLED", "false").lower() in {"1", "true", "yes"},
+            see_pump_sniper_price_ratio=_env_float("SEE_PUMP_SNIPER_PRICE_RATIO", "1.02"),
+            see_pump_sniper_volume_ratio=_env_float("SEE_PUMP_SNIPER_VOLUME_RATIO", "2.5"),
+            see_pump_sniper_short=_env_int("SEE_PUMP_SNIPER_SHORT", "3"),
+            see_pump_sniper_long=_env_int("SEE_PUMP_SNIPER_LONG", "12"),
             see_whale_pressure_min=_env_float("SEE_WHALE_PRESSURE_MIN", "2.0"),
             see_breakout_volume_min=_env_float("SEE_BREAKOUT_VOLUME_MIN", "0.7"),
             fake_pump_reversal_pct=_env_float("FAKE_PUMP_REVERSAL_PCT", "0"),
@@ -879,6 +890,14 @@ class BotConfig:
             raise ValueError("MAX_TICK_MOVE_PCT must be non-negative")
         if self.see_volume_surge_ratio <= 0:
             raise ValueError("SEE_VOLUME_SURGE_RATIO must be positive")
+        if self.see_pump_sniper_price_ratio <= 0:
+            raise ValueError("SEE_PUMP_SNIPER_PRICE_RATIO must be positive")
+        if self.see_pump_sniper_volume_ratio <= 0:
+            raise ValueError("SEE_PUMP_SNIPER_VOLUME_RATIO must be positive")
+        if self.see_pump_sniper_short <= 0 or self.see_pump_sniper_long <= 0:
+            raise ValueError("SEE_PUMP_SNIPER_SHORT/LONG must be positive integers")
+        if self.see_pump_sniper_long <= self.see_pump_sniper_short:
+            raise ValueError("SEE_PUMP_SNIPER_LONG must be greater than SEE_PUMP_SNIPER_SHORT")
         if self.see_whale_pressure_min < 0:
             raise ValueError("SEE_WHALE_PRESSURE_MIN must be non-negative")
         if not (0.0 <= self.see_breakout_volume_min <= 1.0):

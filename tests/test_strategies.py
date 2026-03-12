@@ -108,14 +108,16 @@ class SmartEntryStrategyTests(unittest.TestCase):
         config = BotConfig(api_key=None)
         return trend, orderbook, vol, levels, config
 
-    def _make_see(self, pre_pump=False, pp_score=0.0, wp_detected=False,
-                  wp_side=None, wp_pressure=0.0, fb_detected=False,
+    def _make_see(self, pre_pump=False, pp_score=0.0, pump_detected=False, pump_score=0.0,
+                  wp_detected=False, wp_side=None, wp_pressure=0.0, fb_detected=False,
                   fb_score=0.0):
         from bot.analysis import (
-            PrePumpSignal, WhalePressure, FakeBreakoutRisk, SmartEntryResult
+            PrePumpSignal, PumpSniperSignal, WhalePressure, FakeBreakoutRisk, SmartEntryResult
         )
         return SmartEntryResult(
             pre_pump=PrePumpSignal(detected=pre_pump, volume_surge_ratio=2.0 if pre_pump else 1.0, score=pp_score),
+            pump_sniper=PumpSniperSignal(detected=pump_detected, price_ratio=1.05 if pump_detected else 1.0,
+                                         volume_ratio=3.0 if pump_detected else 1.0, score=pump_score),
             whale_pressure=WhalePressure(detected=wp_detected, side=wp_side, pressure=wp_pressure),
             fake_breakout=FakeBreakoutRisk(breakout_present=fb_detected, detected=fb_detected,
                                            volume_ratio=1.0 - fb_score, score=fb_score),
@@ -129,6 +131,14 @@ class SmartEntryStrategyTests(unittest.TestCase):
         # Pre-pump should boost confidence
         self.assertGreater(see_decision.confidence, base_decision.confidence)
         self.assertIn("see_pre_pump", see_decision.reason)
+
+    def test_pump_sniper_boosts_buy_confidence(self):
+        trend, orderbook, vol, levels, config = self._base_inputs()
+        base_decision = make_trade_decision(trend, orderbook, vol, 100.0, config, levels)
+        see = self._make_see(pump_detected=True, pump_score=1.0)
+        see_decision = make_trade_decision(trend, orderbook, vol, 100.0, config, levels, smart_entry=see)
+        self.assertGreater(see_decision.confidence, base_decision.confidence)
+        self.assertIn("see_pump_sniper", see_decision.reason)
 
     def test_pre_pump_ignored_on_sell(self):
         from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats

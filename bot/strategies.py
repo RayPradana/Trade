@@ -539,6 +539,10 @@ def make_trade_decision(
             boost = round(0.06 * smart_entry.pre_pump.score, 4)
             conf = min(1.0, conf + boost)
             see_note = "see_pre_pump"
+        # 1b. Pump-sniper signal: momentum + volume surge combo
+        if getattr(smart_entry, "pump_sniper", None) and smart_entry.pump_sniper.detected and action == "buy":
+            conf = min(1.0, conf + 0.05 * smart_entry.pump_sniper.score)
+            see_note = (see_note + "_" if see_note else "") + "see_pump_sniper"
         # 2. Whale pressure: net bid/ask imbalance confirms or opposes action
         if smart_entry.whale_pressure.detected:
             if (action == "buy" and smart_entry.whale_pressure.side == "buy") or (

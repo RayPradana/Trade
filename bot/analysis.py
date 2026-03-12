@@ -633,6 +633,24 @@ class PrePumpSignal:
 
 
 @dataclass
+class PumpSniperSignal:
+    """Momentum + volume surge signal to snipe early pumps.
+
+    ``detected`` becomes ``True`` when short-window price and volume both
+    exceed the longer-window baseline by the configured ratios.
+
+    ``price_ratio`` is (recent_avg_price / baseline_avg_price).
+    ``volume_ratio`` is (recent_avg_volume / baseline_avg_volume).
+    ``score`` is a 0..1 normalised strength (1 = very strong surge).
+    """
+
+    detected: bool
+    price_ratio: float
+    volume_ratio: float
+    score: float
+
+
+@dataclass
 class WhalePressure:
     """Net directional pressure from whale-sized orders in the order book.
 
@@ -682,12 +700,13 @@ class FakeBreakoutRisk:
 class SmartEntryResult:
     """Combined result of all Smart Entry Engine checks.
 
-    Aggregates :class:`PrePumpSignal`, :class:`WhalePressure`, and
-    :class:`FakeBreakoutRisk` into a single object passed to
-    ``make_trade_decision`` for confidence adjustment.
+    Aggregates :class:`PrePumpSignal`, :class:`PumpSniperSignal`,
+    :class:`WhalePressure`, and :class:`FakeBreakoutRisk` into a single object
+    passed to ``make_trade_decision`` for confidence adjustment.
     """
 
     pre_pump: PrePumpSignal
+    pump_sniper: PumpSniperSignal
     whale_pressure: WhalePressure
     fake_breakout: FakeBreakoutRisk
 
@@ -809,6 +828,52 @@ def detect_pre_pump_signal(
     )
 
 
+def detect_pump_sniper(
+    candles: Sequence[Candle],
+    min_price_ratio: float = 1.02,
+    min_volume_ratio: float = 2.5,
+    short_window: int = 3,
+    long_window: int = 12,
+) -> PumpSniperSignal:
+    """Detect rapid price + volume surge that often precedes a pump.
+
+    Compares the short-window average price/volume against a longer baseline.
+    Flags when both price and volume exceed their respective thresholds.
+    """
+    if long_window <= short_window or short_window <= 0:
+        return PumpSniperSignal(detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0)
+    if len(candles) < long_window:
+        return PumpSniperSignal(detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0)
+
+    recent = list(candles)[-short_window:]
+    baseline = list(candles)[-(long_window + short_window):-short_window]
+    if not baseline or not recent:
+        return PumpSniperSignal(detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0)
+
+    recent_price_avg = mean(c.close for c in recent)
+    baseline_price_avg = mean(c.close for c in baseline)
+    recent_vol_avg = mean(c.volume for c in recent)
+    baseline_vol_avg = mean(c.volume for c in baseline)
+
+    if baseline_price_avg <= 0 or baseline_vol_avg <= 0:
+        return PumpSniperSignal(detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0)
+
+    price_ratio = recent_price_avg / baseline_price_avg
+    vol_ratio = recent_vol_avg / baseline_vol_avg
+    detected = price_ratio >= min_price_ratio and vol_ratio >= min_volume_ratio
+
+    price_factor = price_ratio / min_price_ratio if min_price_ratio > 0 else 0.0
+    vol_factor = vol_ratio / min_volume_ratio if min_volume_ratio > 0 else 0.0
+    score = max(0.0, min(1.0, min(price_factor, vol_factor) - 1.0))
+
+    return PumpSniperSignal(
+        detected=detected,
+        price_ratio=round(price_ratio, 4),
+        volume_ratio=round(vol_ratio, 4),
+        score=round(score, 4),
+    )
+
+
 def detect_whale_pressure(
     depth: Dict[str, object],
     pressure_threshold: float = 2.0,
@@ -924,15 +989,20 @@ def smart_entry_filter(
     current_price: float,
     levels: Optional[SupportResistance],
     volume_surge_ratio: float = 2.0,
+    pump_sniper_enabled: bool = False,
+    pump_sniper_price_ratio: float = 1.02,
+    pump_sniper_volume_ratio: float = 2.5,
+    pump_sniper_short: int = 3,
+    pump_sniper_long: int = 12,
     whale_pressure_min: float = 2.0,
     breakout_volume_min: float = 0.7,
 ) -> SmartEntryResult:
     """Run all Smart Entry Engine checks and return a combined result.
 
     Convenience wrapper that calls :func:`detect_pre_pump_signal`,
-    :func:`detect_whale_pressure`, and :func:`detect_fake_breakout` with the
-    provided parameters and bundles the results into a
-    :class:`SmartEntryResult`.
+    :func:`detect_pump_sniper`, :func:`detect_whale_pressure`, and
+    :func:`detect_fake_breakout` with the provided parameters and bundles the
+    results into a :class:`SmartEntryResult`.
 
     :param candles: Primary candle series (oldest → newest).
     :param depth: Current order-book depth dict.
@@ -940,11 +1010,27 @@ def smart_entry_filter(
     :param levels: Support / resistance levels.
     :param volume_surge_ratio: Passed to :func:`detect_pre_pump_signal`.
     :param whale_pressure_min: Passed to :func:`detect_whale_pressure`.
+    :param pump_sniper_enabled: Whether to compute the pump-sniper signal.
+    :param pump_sniper_price_ratio: Passed to :func:`detect_pump_sniper`.
+    :param pump_sniper_volume_ratio: Passed to :func:`detect_pump_sniper`.
+    :param pump_sniper_short: Passed to :func:`detect_pump_sniper`.
+    :param pump_sniper_long: Passed to :func:`detect_pump_sniper`.
     :param breakout_volume_min: Passed to :func:`detect_fake_breakout`.
     :returns: :class:`SmartEntryResult`.
     """
+    pump_signal = detect_pump_sniper(
+        candles,
+        min_price_ratio=pump_sniper_price_ratio,
+        min_volume_ratio=pump_sniper_volume_ratio,
+        short_window=pump_sniper_short,
+        long_window=pump_sniper_long,
+    ) if pump_sniper_enabled else PumpSniperSignal(
+        detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0
+    )
+
     return SmartEntryResult(
         pre_pump=detect_pre_pump_signal(candles, volume_surge_ratio),
+        pump_sniper=pump_signal,
         whale_pressure=detect_whale_pressure(depth, whale_pressure_min),
         fake_breakout=detect_fake_breakout(candles, current_price, levels, breakout_volume_min),
     )

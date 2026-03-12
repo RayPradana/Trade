@@ -14,7 +14,9 @@ from bot.analysis import (
     detect_spread_anomaly,
     detect_orderbook_absorption,
     detect_flash_dump,
+    detect_pump_sniper,
     MarketRegime,
+    PumpSniperSignal,
     SpreadAnomaly,
     OrderbookAbsorption,
     FlashDumpSignal,
@@ -126,6 +128,31 @@ class AnalysisTests(unittest.TestCase):
         vol = VolatilityStats(volatility=0.005, avg_volume=1.0)
         regime = detect_market_regime(candles, trend, vol)
         self.assertEqual(regime.regime, "ranging")
+
+    def test_detect_pump_sniper_flags_price_and_volume_surge(self) -> None:
+        baseline = [Candle(i, 100, 105, 95, 100, 10.0) for i in range(10)]
+        recent = [
+            Candle(10, 105, 108, 104, 106, 30.0),
+            Candle(11, 107, 110, 106, 108, 35.0),
+            Candle(12, 109, 112, 108, 111, 40.0),
+        ]
+        candles = baseline + recent
+        signal: PumpSniperSignal = detect_pump_sniper(
+            candles,
+            min_price_ratio=1.02,
+            min_volume_ratio=2.5,
+            short_window=3,
+            long_window=12,
+        )
+        self.assertTrue(signal.detected)
+        self.assertGreater(signal.price_ratio, 1.0)
+        self.assertGreater(signal.volume_ratio, 1.0)
+
+    def test_detect_pump_sniper_not_enough_candles(self) -> None:
+        candles = [Candle(i, 100, 101, 99, 100, 10.0) for i in range(5)]
+        signal = detect_pump_sniper(candles, short_window=3, long_window=12)
+        self.assertFalse(signal.detected)
+        self.assertEqual(signal.score, 0.0)
 
     def test_detect_spread_anomaly_detected(self) -> None:
         recent = [0.001, 0.001, 0.001, 0.001, 0.001]

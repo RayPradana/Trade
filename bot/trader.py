@@ -1371,6 +1371,11 @@ class Trader:
                 price,
                 levels,
                 volume_surge_ratio=self.config.see_volume_surge_ratio,
+                pump_sniper_enabled=self.config.see_pump_sniper_enabled,
+                pump_sniper_price_ratio=self.config.see_pump_sniper_price_ratio,
+                pump_sniper_volume_ratio=self.config.see_pump_sniper_volume_ratio,
+                pump_sniper_short=self.config.see_pump_sniper_short,
+                pump_sniper_long=self.config.see_pump_sniper_long,
                 whale_pressure_min=self.config.see_whale_pressure_min,
                 breakout_volume_min=self.config.see_breakout_volume_min,
             )
