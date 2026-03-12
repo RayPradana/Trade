@@ -622,6 +622,16 @@ class Trader:
         which produces more consistent trading opportunities and avoids
         scanning illiquid or stale coins.
 
+        Optional pre-filters applied before ranking:
+
+        * ``top_volume_min_volume_idr`` – exclude pairs whose 24-h IDR volume
+          is below this threshold so ultra-low-liquidity coins never enter the
+          watchlist regardless of their volatility score.
+        * ``top_volume_min_price_change_24h_pct`` – exclude stagnant pairs
+          whose 24-h absolute price change is below this fraction.  This drops
+          dead coins (e.g. DENT at 4 IDR sitting unchanged for hours) before
+          the ranking step.
+
         The refresh is best-effort: any exception is logged and the existing
         watchlist is kept unchanged.
         """
@@ -631,15 +641,86 @@ class Trader:
             all_known = list(self._multi_feed._cache.keys())
             if not all_known:
                 return
-            ranked = sorted(all_known, key=self._pair_composite_score, reverse=True)
+
+            # ── Pre-filter: minimum volume ────────────────────────────────────
+            min_vol = self.config.top_volume_min_volume_idr
+            min_chg = self.config.top_volume_min_price_change_24h_pct
+            candidates = all_known
+            dropped_vol: List[str] = []
+            dropped_stagnant: List[str] = []
+
+            if min_vol > 0 or min_chg > 0:
+                filtered: List[str] = []
+                for p in candidates:
+                    ticker = self._multi_feed.get_ticker(p)
+                    if ticker is None:
+                        filtered.append(p)  # no data → keep and let score sort it out
+                        continue
+
+                    # Volume check
+                    if min_vol > 0:
+                        vol = 0.0
+                        for key in ("vol_idr", "idr_volume", "volume"):
+                            val = ticker.get(key)
+                            if val is not None:
+                                try:
+                                    vol = float(val)
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                        if vol < min_vol:
+                            dropped_vol.append(p)
+                            continue
+
+                    # Price-change (momentum) check
+                    if min_chg > 0:
+                        try:
+                            last = float(ticker.get("last") or ticker.get("last_price") or 0)
+                            open_ = float(ticker.get("open") or ticker.get("open_price") or 0)
+                            if last > 0 and open_ > 0:
+                                chg = abs(last - open_) / open_
+                                if chg < min_chg:
+                                    dropped_stagnant.append(p)
+                                    continue
+                        except (ValueError, TypeError):
+                            pass  # data missing → keep pair
+
+                    filtered.append(p)
+                candidates = filtered
+
+            if dropped_vol:
+                logger.debug(
+                    "Top-volume selector: dropped %d low-volume pairs (< Rp%.0f)",
+                    len(dropped_vol),
+                    min_vol,
+                )
+            if dropped_stagnant:
+                logger.debug(
+                    "Top-volume selector: dropped %d stagnant pairs (< %.2f%% 24h change)",
+                    len(dropped_stagnant),
+                    min_chg * 100,
+                )
+
+            if not candidates:
+                logger.warning(
+                    "Top-volume selector: all pairs filtered out — keeping existing watchlist"
+                )
+                return
+
+            # ── Rank remaining candidates by composite score ──────────────────
+            ranked = sorted(candidates, key=self._pair_composite_score, reverse=True)
             top_n = self.config.dynamic_pairs_top_n
             new_pairs = ranked[:top_n] if top_n > 0 else ranked
             if new_pairs:
                 self._all_pairs = new_pairs
                 logger.info(
-                    "Dynamic pairs: refreshed watchlist → %d pairs (top=%d by volume×volatility)",
+                    "Top-volume selector: watchlist updated → %d pairs "
+                    "(top=%d, filtered_vol=%d, filtered_stagnant=%d): %s",
                     len(new_pairs),
                     top_n,
+                    len(dropped_vol),
+                    len(dropped_stagnant),
+                    ", ".join(new_pairs[:10]) + (" …" if len(new_pairs) > 10 else ""),
                 )
         except Exception:
             logger.warning("Dynamic pair refresh failed", exc_info=True)

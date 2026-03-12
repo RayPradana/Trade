@@ -1851,6 +1851,143 @@ class TickMoveFilterTest(unittest.TestCase):
         self.assertNotIn("tick_too_large", outcome.get("reason", ""))
 
 
+class TopVolumeAutoSelectorTest(unittest.TestCase):
+    """Tests for enhanced _refresh_dynamic_pairs top-volume pair selector."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_feed_with_tickers(self, ticker_map: dict):
+        """Build a minimal mock MultiPairFeed with a populated _cache."""
+        import threading
+        feed = type("FakeFeed", (), {
+            "_cache": ticker_map,
+            "_lock": threading.Lock(),
+            "get_ticker": lambda self, p: self._cache.get(p),
+            "is_seeded": True,
+        })()
+        return feed
+
+    def _trader_with_feed(self, feed, **cfg_kwargs) -> Trader:
+        config = BotConfig(api_key=None, dry_run=True, **cfg_kwargs)
+        trader = Trader(config)
+        trader._multi_feed = feed
+        return trader
+
+    def test_low_volume_pairs_excluded_from_watchlist(self):
+        """Pairs below top_volume_min_volume_idr must not appear in the watchlist."""
+        tickers = {
+            "btc_idr": {"vol_idr": "5000000000", "last": "1000000000", "high": "1100000000", "low": "900000000"},
+            "skya_idr": {"vol_idr": "1000000", "last": "17", "high": "18", "low": "16"},  # tiny volume
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            top_volume_min_volume_idr=100_000_000,  # 100M IDR minimum
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("btc_idr", trader._all_pairs)
+        self.assertNotIn("skya_idr", trader._all_pairs)
+
+    def test_stagnant_pairs_excluded_from_watchlist(self):
+        """Pairs with < top_volume_min_price_change_24h_pct movement must be excluded."""
+        tickers = {
+            "btc_idr": {"vol_idr": "5000000000", "last": "1000000", "open": "950000",
+                        "high": "1050000", "low": "940000"},
+            "dent_idr": {"vol_idr": "200000000", "last": "4", "open": "4",  # 0% change
+                         "high": "4", "low": "4"},
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            top_volume_min_price_change_24h_pct=0.005,  # require 0.5% movement
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("btc_idr", trader._all_pairs)
+        self.assertNotIn("dent_idr", trader._all_pairs)
+
+    def test_active_pairs_pass_all_filters(self):
+        """Pairs meeting both volume and price-change criteria must be in the watchlist."""
+        tickers = {
+            "eth_idr": {"vol_idr": "800000000", "last": "50000", "open": "47000",
+                        "high": "52000", "low": "46000"},
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            top_volume_min_volume_idr=100_000_000,
+            top_volume_min_price_change_24h_pct=0.005,
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("eth_idr", trader._all_pairs)
+
+    def test_top_n_limits_watchlist_size(self):
+        """Watchlist must never exceed dynamic_pairs_top_n entries."""
+        tickers = {
+            f"coin{i}_idr": {
+                "vol_idr": str(1_000_000_000 - i * 1_000_000),
+                "last": "1000", "high": "1100", "low": "900",
+            }
+            for i in range(30)
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(feed, dynamic_pairs_top_n=10)
+        trader._refresh_dynamic_pairs()
+        self.assertLessEqual(len(trader._all_pairs), 10)
+
+    def test_filters_disabled_when_zero(self):
+        """When both filter thresholds are 0, all pairs must pass to the ranking step."""
+        tickers = {
+            "btc_idr": {"vol_idr": "5000000000", "last": "1000000", "high": "1100000", "low": "900000"},
+            "skya_idr": {"vol_idr": "500", "last": "17", "open": "17", "high": "17", "low": "17"},
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            top_volume_min_volume_idr=0,
+            top_volume_min_price_change_24h_pct=0,
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("btc_idr", trader._all_pairs)
+        self.assertIn("skya_idr", trader._all_pairs)
+
+    def test_watchlist_empty_candidates_keeps_existing(self):
+        """When all pairs are filtered out, the existing watchlist must be preserved."""
+        tickers = {
+            "dent_idr": {"vol_idr": "100", "last": "4", "open": "4", "high": "4", "low": "4"},
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            top_volume_min_volume_idr=1_000_000_000,  # impossibly high
+        )
+        trader._all_pairs = ["btc_idr"]  # pre-existing watchlist
+        trader._refresh_dynamic_pairs()
+        self.assertEqual(trader._all_pairs, ["btc_idr"])  # unchanged
+
+    def test_selected_pairs_logged_in_order(self):
+        """Top-N pairs must be ranked by composite score (higher vol×volatility first)."""
+        tickers = {
+            "lowvol_idr": {"vol_idr": "100000000", "last": "100", "high": "101", "low": "99"},
+            "highvol_idr": {"vol_idr": "9000000000", "last": "100", "high": "120", "low": "80"},
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(feed, dynamic_pairs_top_n=20)
+        trader._refresh_dynamic_pairs()
+        pairs = trader._all_pairs
+        self.assertIsNotNone(pairs)
+        # highvol pair should rank above lowvol pair
+        self.assertLess(pairs.index("highvol_idr"), pairs.index("lowvol_idr"))
+
+
 class SellWallGuardTest(unittest.TestCase):
     """Tests for ORDERBOOK_WALL_THRESHOLD sell-wall guard in maybe_execute."""
 

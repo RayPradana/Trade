@@ -126,16 +126,37 @@ class BotConfig:
     # Discord webhook URL for order / error notifications.  When set, the
     # bot posts a plain-text message to this webhook.
     discord_webhook_url: Optional[str] = None
-    # Number of scan cycles between dynamic-pair-list refreshes.
-    # 0 = disabled (use the static pair list from get_pairs() forever).
-    # Default 5: refresh the watchlist every 5 cycles to keep the top-N
-    # by volume+volatility without hammering the API.
+    # ── Top Volume Auto Pair Selector ─────────────────────────────────────────
+    # Automatically limits the trading watchlist to the top-N most active pairs
+    # ranked by 24-h IDR volume × daily price range (volume×volatility score).
+    # This focuses the bot exclusively on liquid, actively moving instruments
+    # and avoids slow/illiquid coins like tiny-cap pairs that barely move.
+    #
+    # dynamic_pairs_refresh_cycles:
+    #   Number of scan cycles between watchlist refreshes.
+    #   0 = disabled (use static pair list forever).
+    #   Default 5: refresh every 5 cycles; pairs are re-ranked by
+    #   volume×volatility so the list stays current without hammering the API.
     dynamic_pairs_refresh_cycles: int = 5
-    # Number of top pairs (by composite volume×volatility score) kept in the
-    # dynamic watchlist.  Scanning fewer pairs avoids rate limits and focuses
-    # the bot on the most active instruments.  Default 20 follows the
-    # professional practice of trading only the best 20–30 pairs at a time.
+    # dynamic_pairs_top_n:
+    #   Maximum number of pairs kept in the active watchlist after ranking.
+    #   Default 20 follows professional practice (scan only the 15–20 best).
+    #   0 = no limit (keep all pairs that pass the filters below).
     dynamic_pairs_top_n: int = 20
+    # top_volume_min_volume_idr:
+    #   Minimum 24-h IDR trading volume a pair must have to be *included in
+    #   the dynamic watchlist* (applied before top-N ranking).  This is a
+    #   stricter, watchlist-specific threshold that complements MIN_VOLUME_IDR.
+    #   E.g. 300_000_000 = only consider pairs with ≥ 300 M IDR daily volume.
+    #   0 = no minimum (default).
+    top_volume_min_volume_idr: float = 0.0
+    # top_volume_min_price_change_24h_pct:
+    #   Minimum absolute 24-h price change a pair must show to be included
+    #   in the dynamic watchlist.  Excludes stagnant pairs (e.g. DENT at 4 IDR
+    #   that sits unchanged for hours) where technical signals are meaningless.
+    #   E.g. 0.005 = skip pairs with < 0.5% 24-h price change.
+    #   0 = disabled (default).
+    top_volume_min_price_change_24h_pct: float = 0.0
     # Partial take-profit: when > 0, sell this fraction of the position when
     # price first reaches the TP level, and let the remainder run.
     # E.g. 0.5 = sell half at TP, keep the rest.  0 = sell all (default).
@@ -457,6 +478,8 @@ class BotConfig:
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL") or None,
             dynamic_pairs_refresh_cycles=int(os.getenv("DYNAMIC_PAIRS_REFRESH_CYCLES", "5")),
             dynamic_pairs_top_n=int(os.getenv("DYNAMIC_PAIRS_TOP_N", "20")),
+            top_volume_min_volume_idr=float(os.getenv("TOP_VOLUME_MIN_VOLUME_IDR", "0")),
+            top_volume_min_price_change_24h_pct=float(os.getenv("TOP_VOLUME_MIN_PRICE_CHANGE_24H_PCT", "0")),
             partial_tp_fraction=float(os.getenv("PARTIAL_TP_FRACTION", "0")),
             re_entry_cooldown_seconds=float(os.getenv("RE_ENTRY_COOLDOWN_SECONDS", "0")),
             re_entry_dip_pct=float(os.getenv("RE_ENTRY_DIP_PCT", "0")),
@@ -588,6 +611,10 @@ class BotConfig:
             raise ValueError("DYNAMIC_PAIRS_REFRESH_CYCLES must be non-negative")
         if self.dynamic_pairs_top_n < 0:
             raise ValueError("DYNAMIC_PAIRS_TOP_N must be non-negative")
+        if self.top_volume_min_volume_idr < 0:
+            raise ValueError("TOP_VOLUME_MIN_VOLUME_IDR must be non-negative")
+        if self.top_volume_min_price_change_24h_pct < 0:
+            raise ValueError("TOP_VOLUME_MIN_PRICE_CHANGE_24H_PCT must be non-negative")
         _valid_tfs = {"1", "15", "30", "60", "240", "1D", "3D", "1W"}
         for tf in self.mtf_timeframes:
             if tf not in _valid_tfs:
