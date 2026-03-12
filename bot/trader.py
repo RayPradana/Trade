@@ -1634,6 +1634,69 @@ class Trader:
         if self.config.api_key is None:
             raise ValueError("API credentials required for live trading")
 
+        # Verify the actual coin balance before placing the sell order.
+        # A buy limit order may have been placed and recorded internally but not
+        # yet filled by the exchange (receive_<coin>=0 in the order response).
+        # In that case the exchange balance is zero while the tracker thinks a
+        # position is held.  We detect this by fetching the live account balance
+        # and, when the discrepancy is larger than 1 %, cancel any open buy
+        # orders so the IDR is returned to the account and then either sell the
+        # actual available coins or roll back the phantom position cleanly.
+        base_coin = pair.split("_")[0].lower()
+        try:
+            acct_info = self.client.get_account_info()
+            balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+            actual_balance = float(balance_dict.get(base_coin) or "0")
+            if actual_balance < amount * 0.99:
+                logger.warning(
+                    "force_sell: exchange balance %.8f %s < tracked %.8f — "
+                    "cancelling open buy orders for %s",
+                    actual_balance,
+                    base_coin,
+                    amount,
+                    pair,
+                )
+                # Cancel any pending buy orders so the reserved IDR is freed.
+                try:
+                    open_resp = self.client.open_orders(pair)
+                    orders = (open_resp.get("return") or {}).get("orders") or []
+                    for order in (orders if isinstance(orders, list) else []):
+                        if str(order.get("type", "")).lower() == "buy":
+                            self.client.cancel_order(pair, str(order["order_id"]))
+                            logger.info(
+                                "Cancelled pending buy order %s for %s",
+                                order["order_id"],
+                                pair,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "force_sell: failed to cancel open orders for %s: %s",
+                        pair,
+                        exc,
+                    )
+                if actual_balance <= 0:
+                    # No coins available — the buy was never filled.  Roll back
+                    # the phantom position so the tracker reflects reality.
+                    self.tracker.cancel_pending_buy()
+                    outcome: Dict[str, Any] = {
+                        "status": "no_position",
+                        "pair": pair,
+                        "price": reference_price,
+                        "amount": 0.0,
+                        "portfolio": self.tracker.as_dict(reference_price),
+                    }
+                    self._persist_after_trade(pair)
+                    return outcome
+                # Use the actual available balance for the sell.
+                amount = actual_balance
+        except Exception as exc:
+            logger.warning(
+                "force_sell: could not verify balance for %s: %s — "
+                "proceeding with tracked amount",
+                pair,
+                exc,
+            )
+
         order_resp = self.client.create_order(pair, "sell", reference_price, amount)
         self.tracker.record_trade("sell", reference_price, amount)
         outcome = {

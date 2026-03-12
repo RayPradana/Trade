@@ -374,3 +374,60 @@ class TrailingTpTest(unittest.TestCase):
         t2.load_state(state)
         self.assertTrue(t2.tp_activated)
         self.assertAlmostEqual(t2.trailing_tp_stop, t.trailing_tp_stop)
+
+
+class CancelPendingBuyTest(unittest.TestCase):
+    """Tests for PortfolioTracker.cancel_pending_buy()."""
+
+    def _tracker(self, capital: float = 500_000.0) -> PortfolioTracker:
+        return PortfolioTracker(
+            initial_capital=capital,
+            target_profit_pct=0.2,
+            max_loss_pct=0.1,
+        )
+
+    def test_cancel_pending_buy_restores_cash(self) -> None:
+        t = self._tracker()
+        t.record_trade("buy", 3.0, 13625.0)
+        self.assertAlmostEqual(t.cash, 500_000.0 - 3.0 * 13625.0, places=2)
+        t.cancel_pending_buy()
+        self.assertAlmostEqual(t.cash, 500_000.0, places=2)
+
+    def test_cancel_pending_buy_clears_position(self) -> None:
+        t = self._tracker()
+        t.record_trade("buy", 3.0, 13625.0)
+        t.cancel_pending_buy()
+        self.assertEqual(t.base_position, 0.0)
+        self.assertEqual(t.avg_cost, 0.0)
+
+    def test_cancel_pending_buy_reverts_trade_count(self) -> None:
+        t = self._tracker()
+        t.record_trade("buy", 3.0, 13625.0)
+        self.assertEqual(t.trade_count, 1)
+        t.cancel_pending_buy()
+        self.assertEqual(t.trade_count, 0)
+
+    def test_cancel_pending_buy_does_not_affect_sell_stats(self) -> None:
+        t = self._tracker()
+        t.record_trade("buy", 3.0, 13625.0)
+        loss_streak_before = t.loss_streak
+        sell_count_before = t.total_sell_count
+        t.cancel_pending_buy()
+        self.assertEqual(t.loss_streak, loss_streak_before)
+        self.assertEqual(t.total_sell_count, sell_count_before)
+
+    def test_cancel_pending_buy_resets_position_state(self) -> None:
+        t = self._tracker()
+        t.record_trade("buy", 100.0, 5.0)
+        t.activate_trailing_tp(110.0, 0.02)
+        t.cancel_pending_buy()
+        self.assertFalse(t.tp_activated)
+        self.assertIsNone(t.trailing_tp_stop)
+        self.assertFalse(t.partial_tp_taken)
+
+    def test_cancel_pending_buy_noop_when_no_position(self) -> None:
+        t = self._tracker()
+        initial_cash = t.cash
+        t.cancel_pending_buy()  # no position — should not raise or change anything
+        self.assertEqual(t.cash, initial_cash)
+        self.assertEqual(t.trade_count, 0)

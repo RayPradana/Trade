@@ -490,6 +490,119 @@ class TraderSelectionTests(unittest.TestCase):
         outcome = trader.force_sell(snapshot)
         self.assertEqual(outcome["status"], "no_position")
 
+    def test_force_sell_cancels_unfilled_buy_and_returns_no_position(self) -> None:
+        """force_sell must gracefully handle unfilled buy limit orders.
+
+        When the exchange balance is 0 (buy was placed but not filled), the bot
+        should cancel pending buy orders and roll back the phantom position
+        instead of raising a RuntimeError.
+        """
+        import unittest.mock as mock
+
+        cancelled_orders: list = []
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                # Exchange shows 0 WTEC — buy limit order not yet filled
+                return {"return": {"balance": {"wtec": "0", "idr": "459125"}}}
+
+            def open_orders(self, pair: str):
+                return {
+                    "return": {
+                        "orders": [{"order_id": "1975685", "type": "buy", "price": "3.0"}]
+                    }
+                }
+
+            def cancel_order(self, pair: str, order_id: str):
+                cancelled_orders.append(order_id)
+                return {"success": 1}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        # Simulate bot having recorded a buy of 13625 WTEC at Rp 3
+        trader.tracker.record_trade("buy", 3.0, 13625.0)
+        self.assertEqual(trader.tracker.base_position, 13625.0)
+        post_buy_cash = 500_000.0 - 3.0 * 13625.0
+        self.assertAlmostEqual(trader.tracker.cash, post_buy_cash, places=2)
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=3.0,
+            amount=13625.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "wtec_idr", "price": 3.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        # Should return no_position (not raise, not place a sell order)
+        self.assertEqual(outcome["status"], "no_position")
+        self.assertAlmostEqual(outcome["amount"], 0.0)
+        # The phantom position must be cleared
+        self.assertEqual(trader.tracker.base_position, 0.0)
+        # Cash should be restored to pre-buy level
+        self.assertAlmostEqual(trader.tracker.cash, 500_000.0, places=2)
+        # The pending buy order should have been cancelled
+        self.assertIn("1975685", cancelled_orders)
+
+    def test_force_sell_uses_actual_balance_when_partial_fill(self) -> None:
+        """force_sell uses the real exchange balance when partially filled."""
+        import unittest.mock as mock
+
+        placed_sell_amount: list = []
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                # Exchange shows only 5000 WTEC instead of tracked 13625
+                return {"return": {"balance": {"wtec": "5000", "idr": "459125"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": [{"order_id": "9999", "type": "buy"}]}}
+
+            def cancel_order(self, pair: str, order_id: str):
+                return {"success": 1}
+
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                placed_sell_amount.append(amount)
+                return {"success": 1, "return": {}}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 3.0, 13625.0)
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=3.0,
+            amount=13625.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "wtec_idr", "price": 3.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "force_sold")
+        # Sell should use actual exchange balance, not tracked amount
+        self.assertAlmostEqual(outcome["amount"], 5000.0, places=2)
+        self.assertEqual(placed_sell_amount, [5000.0])
+
     def test_analyze_with_retry_succeeds_after_429(self) -> None:
         """_analyze_with_retry must back off and succeed when the first call gets a 429."""
         config = BotConfig(api_key=None, scan_request_delay=0.0)

@@ -159,6 +159,32 @@ class PortfolioTracker:
                 self._trailing_tp_stop = None
                 self._trailing_tp_peak = None
 
+    def cancel_pending_buy(self) -> None:
+        """Roll back a buy that was tracked but never actually filled on the exchange.
+
+        Called when a buy limit order was placed and recorded internally but the
+        exchange never filled it (e.g. ``receive_<coin>: 0`` in the response).
+        Cash is restored to its pre-buy level, the position is cleared, and the
+        ``trade_count`` increment from the phantom buy is reversed.  Sell-side
+        statistics (sell count, win rate, loss streak, PnL) are *not* modified
+        because no real sale occurred.
+        """
+        if self.base_position <= 0:
+            return
+        # Restore cash to the level it was at before the buy was recorded.
+        self.cash += self.avg_cost * self.base_position
+        # Undo the trade_count increment from the phantom buy.
+        self.trade_count = max(0, self.trade_count - 1)
+        # Clear position state (mirrors the full-close path in record_trade).
+        self.base_position = 0.0
+        self.avg_cost = 0.0
+        self.partial_tp_taken = False
+        self._trailing_stop = None
+        self._peak_price = None
+        self._tp_activated = False
+        self._trailing_tp_stop = None
+        self._trailing_tp_peak = None
+
     def activate_trailing_tp(self, mark_price: float, trailing_tp_pct: float) -> None:
         """Activate or tighten the trailing take-profit floor.
 
