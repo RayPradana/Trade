@@ -329,6 +329,12 @@ class BotConfig:
     # volume surge (potential early breakout before a confirmed break).
     early_breakout_proximity_pct: float = 0.005  # within 0.5% of resistance
     early_breakout_min_volume_ratio: float = 1.2  # recent_vol / avg_vol
+
+    # ── AI / ML scoring ───────────────────────────────────────────────────────
+    # Optional machine-scored entry confidence (0..1).  When enabled, blends
+    # with rule-based confidence to smooth decisions.
+    ai_scoring_enabled: bool = False
+    ai_scoring_weight: float = 0.25  # 0 = off, 1 = fully trust AI score
     # ── Anti-fake-pump detection ──────────────────────────────────────────────
     # On Indodax, manipulative actors frequently execute a rapid pump followed
     # by an equally rapid dump within ≈20 seconds.  This guard watches the
@@ -709,6 +715,8 @@ class BotConfig:
             see_breakout_volume_min=_env_float("SEE_BREAKOUT_VOLUME_MIN", "0.7"),
             early_breakout_proximity_pct=_env_float("EARLY_BREAKOUT_PROXIMITY_PCT", "0.005"),
             early_breakout_min_volume_ratio=_env_float("EARLY_BREAKOUT_MIN_VOLUME_RATIO", "1.2"),
+            ai_scoring_enabled=os.getenv("AI_SCORING_ENABLED", "false").lower() in {"1", "true", "yes"},
+            ai_scoring_weight=_env_float("AI_SCORING_WEIGHT", "0.25"),
             fake_pump_reversal_pct=_env_float("FAKE_PUMP_REVERSAL_PCT", "0"),
             min_order_idr=_env_float("MIN_ORDER_IDR", "15000"),
             max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", "0"),
@@ -924,6 +932,8 @@ class BotConfig:
             raise ValueError("EARLY_BREAKOUT_PROXIMITY_PCT must be non-negative")
         if self.early_breakout_min_volume_ratio < 0:
             raise ValueError("EARLY_BREAKOUT_MIN_VOLUME_RATIO must be non-negative")
+        if not (0.0 <= self.ai_scoring_weight <= 1.0):
+            raise ValueError("AI_SCORING_WEIGHT must be between 0 and 1")
         if self.fake_pump_reversal_pct < 0:
             raise ValueError("FAKE_PUMP_REVERSAL_PCT must be non-negative")
         if self.min_order_idr <= 0:

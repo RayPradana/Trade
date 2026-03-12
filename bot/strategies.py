@@ -36,6 +36,51 @@ MIN_STOP_DISTANCE = 1e-6
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
 
 
+def _ai_entry_score(
+    trend: TrendResult,
+    orderbook: OrderbookInsight,
+    vol: VolatilityStats,
+    action: str,
+    smart_entry: Optional[SmartEntryResult],
+) -> float:
+    """Heuristic machine-style score synthesising multiple signals (0..1)."""
+    trend_score = min(1.0, max(0.0, abs(trend.strength) * 12))
+    if action == "buy" and trend.direction != "up":
+        trend_score *= 0.4
+    if action == "sell" and trend.direction != "down":
+        trend_score *= 0.4
+
+    ob_bias = orderbook.imbalance
+    ob_score = (
+        max(0.0, min(1.0, (ob_bias + 0.5))) if action == "buy" else max(0.0, min(1.0, (-ob_bias + 0.5)))
+    )
+
+    vol_score = max(0.0, min(1.0, 1.0 - vol.volatility * 50))
+
+    see_bonus = 0.0
+    if smart_entry:
+        if smart_entry.pre_pump.detected and action == "buy":
+            see_bonus += 0.1 * smart_entry.pre_pump.score
+        if getattr(smart_entry, "pump_sniper", None) and smart_entry.pump_sniper.detected and action == "buy":
+            see_bonus += 0.1 * smart_entry.pump_sniper.score
+        if smart_entry.whale_pressure.detected:
+            aligned = (action == "buy" and smart_entry.whale_pressure.side == "buy") or (
+                action == "sell" and smart_entry.whale_pressure.side == "sell"
+            )
+            if aligned:
+                see_bonus += 0.1
+            else:
+                see_bonus -= 0.1
+        if getattr(smart_entry, "early_breakout", None) and smart_entry.early_breakout.detected and action == "buy":
+            see_bonus += 0.05 * smart_entry.early_breakout.score
+        if smart_entry.fake_breakout.detected and action == "buy":
+            see_bonus -= 0.15 * smart_entry.fake_breakout.score
+
+    base = (trend_score * 0.4) + (ob_score * 0.35) + (vol_score * 0.25)
+    score = max(0.0, min(1.0, base + see_bonus))
+    return round(score, 3)
+
+
 def adaptive_risk_per_trade(equity: float, config: BotConfig) -> float:
     """Return the effective risk-per-trade fraction for the given equity.
 
@@ -629,9 +674,16 @@ def make_trade_decision(
             conf = min(1.0, conf + 0.03 * micro_trend.strength)
             micro_note = f"micro_down_sell"
 
+    ai_note = ""
+    if config.ai_scoring_enabled:
+        ai_score = _ai_entry_score(trend, orderbook, vol, action, smart_entry)
+        weight = config.ai_scoring_weight
+        conf = (conf * (1 - weight)) + (ai_score * weight)
+        ai_note = f"ai={ai_score:.2f}"
+
     conf = round(max(0.0, min(1.0, conf)), 3)
 
-    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note, sweep_note, trap_note, vacuum_note, smart_money_note, vaccel_note, micro_note) if n)
+    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note, sweep_note, trap_note, vacuum_note, smart_money_note, vaccel_note, micro_note, ai_note) if n)
 
     # Adaptive sizing note: show effective risk when adaptive mode is on
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital

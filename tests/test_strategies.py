@@ -188,6 +188,21 @@ class SmartEntryStrategyTests(unittest.TestCase):
         self.assertGreater(see_dec.confidence, base.confidence)
         self.assertIn("see_early_breakout", see_dec.reason)
 
+    def test_ai_scoring_blends_confidence(self):
+        from bot.strategies import _ai_entry_score
+        # Set up a strong bullish context
+        trend = TrendResult(direction="up", fast_ma=105.0, slow_ma=100.0, strength=0.10)
+        orderbook = OrderbookInsight(spread_pct=0.001, bid_volume=200, ask_volume=100, imbalance=0.3)
+        vol = VolatilityStats(volatility=0.005, avg_volume=10)
+        levels = SupportResistance(support=90.0, resistance=120.0, lookback=10)
+        config = BotConfig(api_key=None, ai_scoring_enabled=True, ai_scoring_weight=1.0)
+
+        ai_score = _ai_entry_score(trend, orderbook, vol, "buy", smart_entry=None)
+        decision = make_trade_decision(trend, orderbook, vol, 110.0, config, levels, smart_entry=None)
+
+        self.assertAlmostEqual(decision.confidence, ai_score, places=3)
+        self.assertIn("ai=", decision.reason)
+
     def test_no_smart_entry_unchanged(self):
         """Passing smart_entry=None should produce the same result as omitting it."""
         trend, orderbook, vol, levels, config = self._base_inputs()
