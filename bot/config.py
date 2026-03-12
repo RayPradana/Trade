@@ -427,12 +427,12 @@ class BotConfig:
     #
     # multi_position_enabled:
     #   When True the bot can open up to multi_position_max trades in parallel.
-    #   False = classic single-position mode (default).
+    #   Set to False for classic single-position mode (one pair at a time).
     #
     # multi_position_max:
     #   Maximum number of simultaneous open positions.  E.g. 3 = at most three
     #   different pairs can be held at the same time.  Default: 3.
-    multi_position_enabled: bool = False
+    multi_position_enabled: bool = True
     multi_position_max: int = 3
     # ── Orderbook imbalance position-size boost ────────────────────────────────
     # Multiply the computed position size by ob_imbalance_size_multiplier when
@@ -676,7 +676,7 @@ class BotConfig:
             volume_high_threshold_idr=float(os.getenv("VOLUME_HIGH_THRESHOLD_IDR", "0")),
             max_hold_seconds_volume_high=float(os.getenv("MAX_HOLD_SECONDS_VOLUME_HIGH", "5400")),
             max_hold_seconds_volume_low=float(os.getenv("MAX_HOLD_SECONDS_VOLUME_LOW", "1800")),
-            multi_position_enabled=os.getenv("MULTI_POSITION_ENABLED", "false").lower() in {"1", "true", "yes"},
+            multi_position_enabled=os.getenv("MULTI_POSITION_ENABLED", "true").lower() in {"1", "true", "yes"},
             multi_position_max=int(os.getenv("MULTI_POSITION_MAX", "3")),
             ob_imbalance_boost_threshold=float(os.getenv("OB_IMBALANCE_BOOST_THRESHOLD", "0")),
             ob_imbalance_size_multiplier=float(os.getenv("OB_IMBALANCE_SIZE_MULTIPLIER", "2.0")),

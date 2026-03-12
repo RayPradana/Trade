@@ -452,3 +452,28 @@ class ConfigNewFieldsTest(TestCase):
         cfg = BotConfig(api_key=None, momentum_exit_min_profit_pct=-0.01)
         with self.assertRaises(ValueError):
             cfg._validate()
+
+
+class MultiPositionDefaultTest(TestCase):
+    def test_multi_position_enabled_default_true(self):
+        """multi_position_enabled should default to True so the bot scans while holding."""
+        cfg = BotConfig(api_key=None)
+        self.assertTrue(cfg.multi_position_enabled)
+
+    def test_multi_position_enabled_can_be_disabled(self):
+        """Users can explicitly opt-in to classic single-position mode."""
+        cfg = BotConfig(api_key=None, multi_position_enabled=False)
+        self.assertFalse(cfg.multi_position_enabled)
+
+    def test_multi_position_enabled_from_env_default_true(self):
+        """MULTI_POSITION_ENABLED env default should be 'true'."""
+        with patch.dict(os.environ, {"INDODAX_API_KEY": "k", "INDODAX_API_SECRET": "s", "INITIAL_CAPITAL": "100000"}):
+            os.environ.pop("MULTI_POSITION_ENABLED", None)
+            cfg = BotConfig.from_env()
+            self.assertTrue(cfg.multi_position_enabled)
+
+    def test_multi_position_disabled_via_env(self):
+        """Setting MULTI_POSITION_ENABLED=false should disable multi-position mode."""
+        with patch.dict(os.environ, {"INDODAX_API_KEY": "k", "INDODAX_API_SECRET": "s", "INITIAL_CAPITAL": "100000", "MULTI_POSITION_ENABLED": "false"}):
+            cfg = BotConfig.from_env()
+            self.assertFalse(cfg.multi_position_enabled)

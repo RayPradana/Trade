@@ -108,7 +108,7 @@ class TraderAutoResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "bot_state.json"
             config = BotConfig(api_key=None, dry_run=True, state_path=state_path,
-                               staged_entry_steps=1, min_order_idr=1.0)  # disable min-order guard
+                               staged_entry_steps=1, min_order_idr=1.0, multi_position_enabled=False)  # disable min-order guard
             trader = _BuyTrader(config, client=_FakeClient())
             snapshot = trader.analyze_market("btc_idr")
             trader.maybe_execute(snapshot)
@@ -124,7 +124,7 @@ class TraderAutoResumeTests(unittest.TestCase):
         """State file must be removed after the entire position is sold."""
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "bot_state.json"
-            config = BotConfig(api_key=None, dry_run=True, state_path=state_path, staged_entry_steps=1)
+            config = BotConfig(api_key=None, dry_run=True, state_path=state_path, staged_entry_steps=1, multi_position_enabled=False)
             trader = _BuyTrader(config, client=_FakeClient())
             # Manually open a position and save state
             trader.tracker.record_trade("buy", 100.0, 2.0)

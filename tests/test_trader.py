@@ -459,6 +459,7 @@ class TraderSelectionTests(unittest.TestCase):
             initial_capital=1000.0,
             max_loss_pct=0.9,
             target_profit_pct=2.0,
+            multi_position_enabled=False,
         )
         trader = GuardedTrader(config)
         # Simulate an open position: bought 5 units at 90
@@ -530,6 +531,7 @@ class TraderSelectionTests(unittest.TestCase):
             api_secret="secret",
             dry_run=False,
             initial_capital=500_000.0,
+            multi_position_enabled=False,
         )
         trader = GuardedTrader(config)
         trader.client = _LiveClient()
@@ -588,6 +590,7 @@ class TraderSelectionTests(unittest.TestCase):
             api_secret="secret",
             dry_run=False,
             initial_capital=500_000.0,
+            multi_position_enabled=False,
         )
         trader = GuardedTrader(config)
         trader.client = _LiveClient()
@@ -1392,7 +1395,7 @@ class RiskExposureCapTests(unittest.TestCase):
 
     def test_exposure_cap_skips_buy_when_over_limit(self):
         """maybe_execute should skip buy when per-coin exposure cap is reached."""
-        config = BotConfig(api_key=None, max_exposure_per_coin_pct=0.05, dry_run=True)
+        config = BotConfig(api_key=None, max_exposure_per_coin_pct=0.05, dry_run=True, multi_position_enabled=False)
         trader = Trader(config)
         # Simulate: 1000 coins at price 100 = 100_000 exposure on initial capital 1_000_000 → 10%
         trader.tracker.base_position = 1000.0
@@ -1462,7 +1465,7 @@ class PartialTakeProfitTests(unittest.TestCase):
         }
 
     def test_partial_tp_sells_fraction_dry_run(self):
-        config = BotConfig(api_key=None, partial_tp_fraction=0.5, dry_run=True)
+        config = BotConfig(api_key=None, partial_tp_fraction=0.5, dry_run=True, multi_position_enabled=False)
         trader = Trader(config)
         trader.tracker.record_trade("buy", 100.0, 2.0)  # buy 2 coins
         trader.client = type("_C", (), {
@@ -1482,7 +1485,7 @@ class PartialTakeProfitTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "no_position")
 
     def test_partial_tp_invalid_fraction(self):
-        config = BotConfig(api_key=None, dry_run=True)
+        config = BotConfig(api_key=None, dry_run=True, multi_position_enabled=False)
         trader = Trader(config)
         trader.tracker.record_trade("buy", 100.0, 1.0)
         outcome = trader.partial_take_profit(self._make_snapshot(), fraction=0.0)
@@ -1521,7 +1524,7 @@ class ReEntryCooldownTraderTest(unittest.TestCase):
 
     def test_re_entry_blocked_within_cooldown(self):
         import time
-        config = BotConfig(api_key=None, re_entry_cooldown_seconds=3600, dry_run=True)
+        config = BotConfig(api_key=None, re_entry_cooldown_seconds=3600, dry_run=True, multi_position_enabled=False)
         trader = Trader(config)
         trader.tracker.last_sell_price = 100.0
         trader.tracker.last_sell_time = time.time()  # just sold
@@ -2394,7 +2397,7 @@ class EvaluateDynamicTpTest(unittest.TestCase):
         self.assertEqual(result, "target_profit_reached")
 
     def test_trailing_tp_activates_and_holds(self):
-        config = BotConfig(api_key=None, trailing_tp_pct=0.02)
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02, multi_position_enabled=False)
         trader = Trader(config)
         trader.tracker.record_trade("buy", 100.0, 1.0)
         # Price at 110 — trailing TP not yet triggered (just activated)
@@ -2404,7 +2407,7 @@ class EvaluateDynamicTpTest(unittest.TestCase):
         self.assertAlmostEqual(trader.tracker.trailing_tp_stop, 107.8)
 
     def test_trailing_tp_triggered_returns_correct_reason(self):
-        config = BotConfig(api_key=None, trailing_tp_pct=0.02)
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02, multi_position_enabled=False)
         trader = Trader(config)
         trader.tracker.record_trade("buy", 100.0, 1.0)
         trader.tracker.activate_trailing_tp(120.0, 0.02)  # floor = 117.6
@@ -2912,6 +2915,7 @@ class ForceSellDustTests(unittest.TestCase):
             api_secret="secret",
             dry_run=False,
             initial_capital=500_000.0,
+            multi_position_enabled=False,
         )
         trader = GuardedTrader(config)
         trader.client = _LiveClient()
@@ -2957,6 +2961,7 @@ class ForceSellDustTests(unittest.TestCase):
             initial_capital=500_000.0,
             # Keep min_order_idr low so the IDR check doesn't trigger first
             min_order_idr=1.0,
+            multi_position_enabled=False,
         )
         trader = GuardedTrader(config)
         trader.client = _LiveClient()
@@ -3170,6 +3175,7 @@ class TimeBasedExitTest(unittest.TestCase):
             dry_run=True,
             max_hold_seconds=max_hold_seconds,
             max_hold_profit_pct=max_hold_profit_pct,
+            multi_position_enabled=False,
         )
         trader = Trader(config)
         trader.client = type("_C", (), {
@@ -3326,6 +3332,7 @@ class MomentumExitTest(unittest.TestCase):
             api_key=None,
             momentum_exit_ob_threshold=0.0,
             momentum_exit_min_profit_pct=0.02,
+            multi_position_enabled=False,
         )
         trader = Trader(config)
         trader.tracker.record_trade("buy", 100.0, 1.0)
@@ -3629,8 +3636,8 @@ class MultiPositionTraderTest(unittest.TestCase):
         self.assertNotAlmostEqual(btc_tracker.avg_cost, eth_tracker.avg_cost, delta=100_000)
 
     def test_single_position_mode_unchanged(self):
-        """Ensure single-position mode behavior is unaffected."""
-        config = BotConfig(api_key=None, dry_run=True, initial_capital=1_000_000.0)
+        """Ensure single-position mode behavior is unaffected when explicitly disabled."""
+        config = BotConfig(api_key=None, dry_run=True, initial_capital=1_000_000.0, multi_position_enabled=False)
         trader = Trader(config)
         self.assertIsNone(trader.multi_manager)
         trader.tracker.record_trade("buy", 500_000.0, 1.0)
