@@ -296,6 +296,7 @@ class TraderSelectionTests(unittest.TestCase):
             max_loss_pct=0.9,
             target_profit_pct=1.0,
             staged_entry_steps=3,
+            staged_entry_min_equity=0,  # disable small-equity single-step override
             min_order_idr=1.0,  # disable minimum-order guard (not under test here)
         )
         trader = GuardedTrader(config)
@@ -321,6 +322,76 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertIn("executed_steps", outcome)
         self.assertGreater(len(outcome["executed_steps"]), 1)
         self.assertLessEqual(outcome["amount"], decision.amount)
+
+    def test_staged_entry_collapsed_to_single_step_for_small_equity(self) -> None:
+        """When cash < staged_entry_min_equity, staged entry is forced to 1 step."""
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=500_000.0,
+            max_loss_pct=0.9,
+            target_profit_pct=1.0,
+            staged_entry_steps=3,
+            staged_entry_min_equity=1_000_000.0,  # threshold above current cash
+            min_order_idr=1.0,
+        )
+        trader = GuardedTrader(config)
+        trader.tracker.cash = 500_000.0  # below threshold
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="buy",
+            confidence=0.6,
+            reason="test-small-equity",
+            target_price=100,
+            amount=3.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "decision": decision,
+            "volatility": VolStub(0.03),  # high vol — would normally trigger 3 steps
+        }
+        outcome = trader.maybe_execute(snapshot)
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertIn("executed_steps", outcome)
+        self.assertEqual(len(outcome["executed_steps"]), 1, "small equity must use single-step entry")
+
+    def test_staged_entry_uses_multiple_steps_above_equity_threshold(self) -> None:
+        """When cash >= staged_entry_min_equity, multi-step staged entry is used."""
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=2_000_000.0,
+            max_loss_pct=0.9,
+            target_profit_pct=1.0,
+            staged_entry_steps=3,
+            staged_entry_min_equity=1_000_000.0,  # threshold below current cash
+            min_order_idr=1.0,
+        )
+        trader = GuardedTrader(config)
+        trader.tracker.cash = 2_000_000.0  # above threshold
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="buy",
+            confidence=0.6,
+            reason="test-large-equity",
+            target_price=100,
+            amount=3.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "decision": decision,
+            "volatility": VolStub(0.03),  # high vol triggers staging
+        }
+        outcome = trader.maybe_execute(snapshot)
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertIn("executed_steps", outcome)
+        self.assertGreater(len(outcome["executed_steps"]), 1, "large equity must use multi-step entry")
 
     def test_force_sell_liquidates_entire_position(self) -> None:
         config = BotConfig(

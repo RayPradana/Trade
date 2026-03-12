@@ -625,6 +625,13 @@ class Trader:
         confidence = decision.confidence
         max_steps = max(1, self.config.staged_entry_steps)
 
+        # For small portfolios, collapse to a single-step entry so that
+        # individual staged tranches don't fall below the exchange minimum
+        # order size and cause the entire trade to be skipped.
+        min_eq = self.config.staged_entry_min_equity
+        if min_eq > 0 and self.tracker.cash < min_eq:
+            max_steps = 1
+
         if volatility < 0.01 and confidence >= 0.75:
             fractions = [1.0]
         elif volatility < 0.02:

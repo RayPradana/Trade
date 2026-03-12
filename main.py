@@ -114,6 +114,12 @@ def configure_logging(log_file: Optional[str] = None) -> None:
     is attached so every log record is written to both the terminal and the
     file simultaneously.  The file is opened in *append* mode so restarting
     the bot does not overwrite previous runs.
+
+    ``force=True`` is passed to :func:`logging.basicConfig` so that the
+    function is idempotent and can be called more than once (e.g. once for
+    early bootstrap and again after the config is loaded with a log-file path).
+    Without ``force=True`` the second call would be a silent no-op and file
+    logging would never be activated.
     """
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(
@@ -139,11 +145,11 @@ def configure_logging(log_file: Optional[str] = None) -> None:
             handlers.append(file_handler)
         except OSError as exc:
             # Don't crash if the log file can't be created; just warn.
-            logging.basicConfig(level=logging.INFO, handlers=[console_handler])
+            logging.basicConfig(level=logging.INFO, handlers=[console_handler], force=True)
             logging.warning("Could not open log file '%s': %s", log_file, exc)
             return
 
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    logging.basicConfig(level=logging.INFO, handlers=handlers, force=True)
 
 
 # ── Telegram notifications ───────────────────────────────────────────────

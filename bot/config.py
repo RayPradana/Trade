@@ -63,6 +63,12 @@ class BotConfig:
     max_loss_pct: float = 0.1  # 10%
     trailing_stop_pct: float = 0.0  # 0 = disabled; e.g. 0.02 = 2% trailing stop
     staged_entry_steps: int = 3
+    # Minimum portfolio cash (IDR) required to use multi-step staged entry.
+    # When the available cash falls below this threshold the bot collapses to a
+    # single-step entry so that the trade is not discarded because individual
+    # staged steps fall below the exchange minimum order size.  Set to 0 to
+    # always use staged entry regardless of equity.
+    staged_entry_min_equity: float = 1_000_000.0
     position_check_interval_seconds: int = 60  # faster poll when monitoring an open position
     cycle_summary_interval: int = 10  # print a performance summary every N full scan cycles
     trade_mode: str = "continuous"  # "single": one buy→sell cycle then stop; "continuous": 24/7
@@ -335,6 +341,7 @@ class BotConfig:
             max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
             trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.0")),
             staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
+            staged_entry_min_equity=float(os.getenv("STAGED_ENTRY_MIN_EQUITY", "1000000")),
             position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
             cycle_summary_interval=int(os.getenv("CYCLE_SUMMARY_INTERVAL", "10")),
             trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
@@ -442,6 +449,8 @@ class BotConfig:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
         if self.staged_entry_steps <= 0:
             raise ValueError("STAGED_ENTRY_STEPS must be positive")
+        if self.staged_entry_min_equity < 0:
+            raise ValueError("STAGED_ENTRY_MIN_EQUITY must be non-negative")
         if self.position_check_interval_seconds <= 0:
             raise ValueError("POSITION_CHECK_INTERVAL must be positive")
         if self.cycle_summary_interval <= 0:

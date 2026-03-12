@@ -354,7 +354,9 @@ class LoggingTests(unittest.TestCase):
         """configure_logging() without log_file should not add a FileHandler."""
         main.configure_logging(log_file=None)
         root = logging.getLogger()
-        file_handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+        # Exclude pytest's own _FileHandler subclass (used for log capturing)
+        # by using an exact type check instead of isinstance().
+        file_handlers = [h for h in root.handlers if type(h) is logging.FileHandler]
         self.assertEqual(len(file_handlers), 0)
 
     def test_configure_logging_with_file(self):
@@ -365,7 +367,8 @@ class LoggingTests(unittest.TestCase):
         try:
             main.configure_logging(log_file=path)
             root = logging.getLogger()
-            file_handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+            # Use exact type check to avoid matching pytest's _FileHandler subclass.
+            file_handlers = [h for h in root.handlers if type(h) is logging.FileHandler]
             self.assertGreater(len(file_handlers), 0)
         finally:
             os.unlink(path)
