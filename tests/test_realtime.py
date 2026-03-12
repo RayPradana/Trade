@@ -433,3 +433,169 @@ class PrivateFeedImportTest(unittest.TestCase):
             feed.stop()
         finally:
             rt_mod.websocket = original_ws
+
+
+class PositionFeedLifecycleTests(unittest.TestCase):
+    """Tests for per-pair position feed start/stop in Trader."""
+
+    def _make_trader(self) -> "Trader":
+        from bot.config import BotConfig
+        from bot.trader import Trader
+
+        class _Client:
+            def get_ticker(self, pair):
+                return {"ticker": {"last": "100"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []
+            def get_ohlc(self, pair, tf="1m", limit=200):
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(api_key=None, real_time=False)
+        return Trader(config, client=_Client())
+
+    def test_ensure_position_feed_noop_when_realtime_disabled(self):
+        """_ensure_position_feed must be a no-op when real_time=False."""
+        trader = self._make_trader()
+        trader._ensure_position_feed("eth_idr")
+        self.assertNotIn("eth_idr", trader._position_feeds)
+
+    def test_ensure_position_feed_starts_feed_when_enabled(self):
+        """_ensure_position_feed starts a RealtimeFeed for a non-primary pair."""
+        from bot.config import BotConfig
+        from bot.trader import Trader
+
+        class _Client:
+            def get_ticker(self, pair):
+                return {"ticker": {"last": "100"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []
+            def get_ohlc(self, pair, tf="1m", limit=200):
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(api_key=None, real_time=True, websocket_enabled=False,
+                           pair="btc_idr")
+        trader = Trader(config, client=_Client())
+        try:
+            trader._ensure_position_feed("eth_idr")
+            self.assertIn("eth_idr", trader._position_feeds)
+        finally:
+            # Clean up background threads
+            for feed in trader._position_feeds.values():
+                feed.stop()
+            if trader.realtime:
+                trader.realtime.stop()
+
+    def test_ensure_position_feed_skips_primary_pair(self):
+        """_ensure_position_feed must not create a duplicate feed for the primary pair."""
+        from bot.config import BotConfig
+        from bot.trader import Trader
+
+        class _Client:
+            def get_ticker(self, pair):
+                return {"ticker": {"last": "100"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []
+            def get_ohlc(self, pair, tf="1m", limit=200):
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(api_key=None, real_time=True, websocket_enabled=False,
+                           pair="btc_idr")
+        trader = Trader(config, client=_Client())
+        try:
+            trader._ensure_position_feed("btc_idr")
+            self.assertNotIn("btc_idr", trader._position_feeds)
+        finally:
+            if trader.realtime:
+                trader.realtime.stop()
+
+    def test_remove_position_feed_stops_and_removes(self):
+        """_remove_position_feed stops the feed and removes it from the dict."""
+        from bot.config import BotConfig
+        from bot.trader import Trader
+        from bot.realtime import RealtimeFeed
+
+        class _Client:
+            def get_ticker(self, pair):
+                return {"ticker": {"last": "100"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []
+            def get_ohlc(self, pair, tf="1m", limit=200):
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(api_key=None, real_time=False, pair="btc_idr")
+        trader = Trader(config, client=_Client())
+
+        # Manually insert a stub feed
+        stopped = []
+
+        class _FeedStub:
+            def stop(self):
+                stopped.append(True)
+
+        trader._position_feeds["eth_idr"] = _FeedStub()  # type: ignore
+        trader._remove_position_feed("eth_idr")
+        self.assertNotIn("eth_idr", trader._position_feeds)
+        self.assertEqual(stopped, [True])
+
+    def test_remove_position_feed_noop_for_unknown_pair(self):
+        """_remove_position_feed must not raise for a pair with no active feed."""
+        trader = self._make_trader()
+        # Should not raise
+        trader._remove_position_feed("unknown_idr")
+
+    def test_analyze_market_uses_position_feed_when_available(self):
+        """analyze_market must prefer the per-pair position feed over REST."""
+        from bot.config import BotConfig
+        from bot.trader import Trader
+
+        class _Client:
+            def __init__(self):
+                self.ticker_calls = 0
+            def get_ticker(self, pair):
+                self.ticker_calls += 1
+                return {"ticker": {"last": "100"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []
+            def get_ohlc(self, pair, tf="1m", limit=200):
+                return []
+            def get_summaries(self):
+                return {}
+
+        class _FeedStub:
+            @property
+            def has_snapshot(self):
+                return True
+            def snapshot(self):
+                return {
+                    "ticker": {"ticker": {"last": 999.0}},
+                    "depth": {"buy": [], "sell": []},
+                    "trades": [],
+                }
+
+        config = BotConfig(api_key=None, real_time=False, pair="btc_idr")
+        client = _Client()
+        trader = Trader(config, client=client)
+        trader._position_feeds["eth_idr"] = _FeedStub()  # type: ignore
+
+        snapshot = trader.analyze_market("eth_idr")
+        # REST ticker should NOT have been called
+        self.assertEqual(client.ticker_calls, 0)
+        self.assertEqual(snapshot["price"], 999.0)

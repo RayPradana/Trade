@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import logging
 import os
@@ -685,12 +686,31 @@ def main() -> None:
             # ── Position monitoring ──────────────────────────────────────────
             # When the bot is holding one or more positions (from this run or
             # restored via auto-resume) analyse each held pair first.
-            # In multi-position mode all active pairs are checked in sequence;
-            # in single-position mode this iterates over at most one pair.
+            # In multi-position mode all active pairs are fetched in parallel so
+            # the market-data round-trip for each pair does not block the others.
+            # Decision-making and order execution remain sequential to avoid race
+            # conditions on shared tracker state.
             _active = list(trader.active_positions.items())
             _still_holding = False
+
+            # Fetch market snapshots for all held pairs in parallel.
+            _held_snapshots: dict = {}
+            if len(_active) > 1:
+                def _fetch_held(pair_tracker: tuple) -> tuple:
+                    _p, _t = pair_tracker
+                    return _p, trader.analyze_market(_p)
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(_active), thread_name_prefix="held-fetch"
+                ) as _pool:
+                    for _p, _snap in _pool.map(_fetch_held, _active):
+                        _held_snapshots[_p] = _snap
+            elif _active:
+                _p, _t = _active[0]
+                _held_snapshots[_p] = trader.analyze_market(_p)
+
             for held_pair, held_tracker in _active:
-                held_snapshot = trader.analyze_market(held_pair)
+                held_snapshot = _held_snapshots.get(held_pair) or trader.analyze_market(held_pair)
                 held_price = held_snapshot["price"]
 
                 if config.trailing_stop_pct > 0:

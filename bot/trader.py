@@ -112,6 +112,16 @@ class Trader:
                 subscribe_message=config.websocket_subscribe_message,
             )
             self.realtime.start()
+        # ── Per-pair position feeds (realtime for actively held pairs) ────────
+        # When a position is opened on a pair that differs from self.config.pair
+        # a dedicated RealtimeFeed is started so that holding-loop analysis uses
+        # WebSocket data rather than polling REST for every held pair.
+        self._position_feeds: Dict[str, RealtimeFeed] = {}
+        # Start feeds for any positions that were already restored from state.
+        if config.real_time:
+            for _restored_pair in list(self.active_positions.keys()):
+                if _restored_pair != self.config.pair:
+                    self._ensure_position_feed(_restored_pair)
         # New feature state
         self._consecutive_errors: int = 0
         self._circuit_breaker_until: float = 0.0
@@ -151,6 +161,44 @@ class Trader:
                 max_loss_pct=0.0,
             )
         return self.tracker
+
+    def _ensure_position_feed(self, pair: str) -> None:
+        """Start a dedicated :class:`RealtimeFeed` for a held-position pair.
+
+        Called when a new position is opened on *pair* so that the holding
+        loop can use WebSocket market data instead of polling REST on every
+        cycle.  No-op when real-time mode is disabled, when the pair is
+        already covered by the primary :attr:`realtime` feed, or when a feed
+        for this pair is already running.
+        """
+        if not self.config.real_time:
+            return
+        if pair == self.config.pair and self.realtime is not None:
+            return  # primary feed already covers this pair
+        if pair in self._position_feeds:
+            return  # already running
+        feed = RealtimeFeed(
+            pair=pair,
+            client=self.client,
+            websocket_url=self.config.websocket_url,
+            poll_interval=max(0.5, float(self.config.interval_seconds)),
+            websocket_enabled=self.config.websocket_enabled,
+            subscribe_message=self.config.websocket_subscribe_message,
+        )
+        feed.start()
+        self._position_feeds[pair] = feed
+        logger.info("Started realtime feed for held position: %s", pair)
+
+    def _remove_position_feed(self, pair: str) -> None:
+        """Stop and remove the :class:`RealtimeFeed` for a closed position.
+
+        Called when a position on *pair* is fully closed so that the
+        background WebSocket thread is cleaned up promptly.
+        """
+        feed = self._position_feeds.pop(pair, None)
+        if feed is not None:
+            feed.stop()
+            logger.debug("Stopped realtime feed for closed position: %s", pair)
 
     @property
     def active_positions(self) -> Dict[str, PortfolioTracker]:
@@ -1049,14 +1097,25 @@ class Trader:
         # which is acceptable because depth is only needed for the final trade
         # execution decision, not for pair selection.
         _empty_depth: Dict[str, Any] = {"buy": [], "sell": []}
-        if self.realtime and self.realtime.has_snapshot and pair == self.config.pair:
-            snap = self.realtime.snapshot()
-            ticker = snap.get("ticker") or prefetched_ticker or self.client.get_ticker(pair)
+        # Determine the best available realtime snapshot for this pair:
+        # 1. Per-pair position feed (started when a position on this pair is opened)
+        # 2. Primary realtime feed (only covers self.config.pair)
+        # 3. Fall back to REST API calls
+        _pos_feed = self._position_feeds.get(pair)
+        if _pos_feed and _pos_feed.has_snapshot:
+            _rt_snap = _pos_feed.snapshot()
+        elif self.realtime and self.realtime.has_snapshot and pair == self.config.pair:
+            _rt_snap = self.realtime.snapshot()
+        else:
+            _rt_snap = None
+
+        if _rt_snap is not None:
+            ticker = _rt_snap.get("ticker") or prefetched_ticker or self.client.get_ticker(pair)
             if skip_depth:
                 depth = _empty_depth
             else:
-                depth = snap.get("depth") or self.client.get_depth(pair, count=200)
-            trades = snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
+                depth = _rt_snap.get("depth") or self.client.get_depth(pair, count=200)
+            trades = _rt_snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
         else:
             ticker = prefetched_ticker or self.client.get_ticker(pair)
             if skip_depth:
@@ -1860,6 +1919,11 @@ class Trader:
             # Multi-position: return cash to pool after a full sell-close.
             if decision.action == "sell" and self.multi_manager is not None and _tracker.base_position <= 0:
                 self.multi_manager.return_position_cash(_pair)
+            # Manage per-pair realtime feeds: start on first buy, stop on full close.
+            if decision.action == "buy" and _tracker.base_position > 0:
+                self._ensure_position_feed(_pair)
+            elif decision.action == "sell" and _tracker.base_position <= 0:
+                self._remove_position_feed(_pair)
             outcome = {
                 "status": "simulated",
                 "action": decision.action,
@@ -1955,6 +2019,11 @@ class Trader:
         # Multi-position: return cash to pool after a full sell-close (live path).
         if decision.action == "sell" and self.multi_manager is not None and _tracker.base_position <= 0:
             self.multi_manager.return_position_cash(_pair)
+        # Manage per-pair realtime feeds: start on first buy, stop on full close.
+        if decision.action == "buy" and _tracker.base_position > 0:
+            self._ensure_position_feed(_pair)
+        elif decision.action == "sell" and _tracker.base_position <= 0:
+            self._remove_position_feed(_pair)
         outcome = {
             "status": "placed",
             "action": decision.action,
@@ -2289,6 +2358,8 @@ class Trader:
             _tracker.record_trade("sell", reference_price, amount)
             if self.multi_manager is not None and _tracker.base_position <= 0:
                 self.multi_manager.return_position_cash(pair)
+            if _tracker.base_position <= 0:
+                self._remove_position_feed(pair)
             outcome: Dict[str, Any] = {
                 "status": "force_sold",
                 "action": "sell",
@@ -2458,6 +2529,8 @@ class Trader:
         _tracker.record_trade("sell", reference_price, amount)
         if self.multi_manager is not None and _tracker.base_position <= 0:
             self.multi_manager.return_position_cash(pair)
+        if _tracker.base_position <= 0:
+            self._remove_position_feed(pair)
         # Invalidate balance cache so next getInfo reflects the sell proceeds.
         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
         # Invalidate open-orders cache for this pair; the order is now closed.
