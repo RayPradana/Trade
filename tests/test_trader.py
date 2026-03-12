@@ -2499,14 +2499,57 @@ class TrailingTpFloorAdvancementTest(unittest.TestCase):
         self.assertAlmostEqual(floor_after_125, 123.75)
 
         # Price rises to 130: simulate the main.py per-tick advancement.
-        # This replicates the code added to main.py's position monitoring loop
-        # (the bug fix: advance floor before evaluating stop_reason each tick).
-        if config.trailing_tp_pct > 0 and tracker.tp_activated:
+        # The guard no longer requires tp_activated — the floor advances every
+        # cycle unconditionally (tp_activated is always True after first call).
+        if config.trailing_tp_pct > 0:
             tracker.activate_trailing_tp(130.0, config.trailing_tp_pct)
 
         floor_after_130 = tracker.trailing_tp_stop
         self.assertAlmostEqual(floor_after_130, 128.7, places=2)
         self.assertGreater(floor_after_130, floor_after_125)
+
+    def test_floor_activates_from_entry_without_tp_target(self):
+        """Trailing TP floor must be set from the first holding cycle.
+
+        The main.py loop no longer requires tp_activated to be True before
+        calling activate_trailing_tp.  This means trail-TP is always shown
+        in the holding display (not '—') and the bot adapts to market
+        conditions rather than waiting for a fixed profit target.
+        """
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02)
+        tracker = PortfolioTracker(100_000.0, 0.10, 0.05)
+        tracker.record_trade("buy", 100.0, 900.0)
+
+        # Simulate the FIRST holding cycle — no prior activate_trailing_tp call,
+        # tp_activated starts False.  The new main.py behaviour (no guard) means
+        # activate_trailing_tp is called unconditionally.
+        self.assertFalse(tracker.tp_activated)
+        if config.trailing_tp_pct > 0:
+            tracker.activate_trailing_tp(100.0, config.trailing_tp_pct)
+
+        # Floor should be set immediately at 100 * (1 - 0.02) = 98.0
+        self.assertIsNotNone(tracker.trailing_tp_stop)
+        self.assertAlmostEqual(tracker.trailing_tp_stop, 98.0)
+        self.assertTrue(tracker.tp_activated)
+
+    def test_trailing_tp_exits_on_retrace_before_fixed_tp(self):
+        """Bot must exit via trailing TP even when the fixed TP target was not hit.
+
+        When trailing TP is activated from entry (no fixed-TP gate), a retrace
+        of more than trailing_tp_pct from the peak triggers an exit regardless
+        of whether the fixed profit target was reached.
+        """
+        # target_profit_pct=0.50 (50%) — an unrealistically high fixed TP
+        tracker = PortfolioTracker(100_000.0, 0.50, 0.10)
+        tracker.record_trade("buy", 100.0, 900.0)
+
+        # Price rises to 110 → floor at 110 * 0.98 = 107.8
+        tracker.activate_trailing_tp(110.0, 0.02)
+        self.assertAlmostEqual(tracker.trailing_tp_stop, 107.8)
+
+        # Price retraces to 107 — fixed TP (150) not hit, but floor is breached
+        reason = tracker.stop_reason(107.0)
+        self.assertEqual(reason, "trailing_tp_triggered")
 
     def test_floor_does_not_fall_when_price_drops(self):
         """Trailing TP floor must never fall when the price retraces."""

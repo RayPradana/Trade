@@ -668,13 +668,13 @@ def main() -> None:
                 if config.trailing_stop_pct > 0:
                     trader.tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
 
-                # Advance the trailing TP floor on every tick while the
-                # position is open and trailing TP has been activated.
-                # This ensures the floor rises with the price rather than
-                # staying fixed at the level it was first set.
-                # Without this call, the floor would remain at the initial
-                # activation level instead of rising with market gains.
-                if config.trailing_tp_pct > 0 and trader.tracker.tp_activated:
+                # Update the trailing TP floor on every tick while the
+                # position is open.  Activating from the first cycle (not
+                # just after the fixed TP target) makes the bot adaptive:
+                # the floor rises with the market and the position exits when
+                # price retraces more than trailing_tp_pct from its peak,
+                # regardless of whether the fixed profit target was reached.
+                if config.trailing_tp_pct > 0:
                     trader.tracker.activate_trailing_tp(held_price, config.trailing_tp_pct)
 
                 stop_reason = trader.tracker.stop_reason(held_price)
@@ -790,6 +790,13 @@ def main() -> None:
             _log_signal(snapshot)
             outcome = trader.maybe_execute(snapshot)
             _log_outcome(outcome)
+            # Immediately compute trailing stops after a buy so the portfolio
+            # display shows trail/trail-TP values from the very first cycle.
+            if outcome.get("action") == "buy" and trader.tracker.base_position > 0:
+                if config.trailing_stop_pct > 0:
+                    trader.tracker.update_trailing_stop(snapshot["price"], config.trailing_stop_pct)
+                if config.trailing_tp_pct > 0:
+                    trader.tracker.activate_trailing_tp(snapshot["price"], config.trailing_tp_pct)
             portfolio = trader.tracker.as_dict(snapshot["price"])
             _log_portfolio(portfolio, config.initial_capital)
 
