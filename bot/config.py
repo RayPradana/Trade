@@ -907,7 +907,7 @@ class BotConfig:
         if self.see_pump_sniper_volume_ratio <= 0:
             raise ValueError("SEE_PUMP_SNIPER_VOLUME_RATIO must be positive")
         if self.see_pump_sniper_short <= 0 or self.see_pump_sniper_long <= 0:
-            raise ValueError("SEE_PUMP_SNIPER_SHORT/LONG must be positive integers")
+            raise ValueError("Both SEE_PUMP_SNIPER_SHORT and SEE_PUMP_SNIPER_LONG must be positive integers")
         if self.see_pump_sniper_long <= self.see_pump_sniper_short:
             raise ValueError("SEE_PUMP_SNIPER_LONG must be greater than SEE_PUMP_SNIPER_SHORT")
         if self.see_whale_pressure_min < 0:

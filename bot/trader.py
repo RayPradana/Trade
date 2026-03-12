@@ -1525,7 +1525,7 @@ class Trader:
 
         return None  # all checks pass → allow the cheap coin
 
-    def _small_coin_trade_reason(self, trades_24h: int) -> Optional[str]:
+    def _small_coin_low_trade_reason(self, trades_24h: int) -> Optional[str]:
         """Return skip reason for cheap coins with insufficient reported trades.
 
         Indodax summaries often omit ``trade_count``; a missing/zero value is
@@ -1868,7 +1868,7 @@ class Trader:
                         ),
                         "portfolio": _tracker.as_dict(price),
                     }
-                trade_reason = self._small_coin_trade_reason(trades_24h)
+                trade_reason = self._small_coin_low_trade_reason(trades_24h)
                 if trade_reason:
                     logger.info(
                         "Cheap coin %s blocked by low trade count: %s",
@@ -3033,7 +3033,7 @@ class Trader:
                             skipped_pairs.append(pair)
                             continue
                         _trades_24h = self._extract_trade_count_24h(prefetched_ticker)
-                        trade_reason = self._small_coin_trade_reason(_trades_24h)
+                        trade_reason = self._small_coin_low_trade_reason(_trades_24h)
                         if trade_reason:
                             logger.debug(
                                 "Pre-scan: skipping cheap low-trade coin %s "
