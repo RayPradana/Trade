@@ -34,6 +34,17 @@ VOLATILITY_PENALTY_CAP = 0.8
 # Minimum stop distance expressed in absolute price units to avoid zero division and unrealistic sizing
 MIN_STOP_DISTANCE = 1e-6
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
+# AI-style entry scoring weights/scales (heuristic, tuned for 0..1 range)
+AI_TREND_SCALE = 12.0
+AI_VOL_SCALE = 50.0
+AI_TREND_WEIGHT = 0.4
+AI_OB_WEIGHT = 0.35
+AI_VOL_WEIGHT = 0.25
+AI_PRE_PUMP_BONUS = 0.1
+AI_PUMP_SNIPER_BONUS = 0.1
+AI_WHALE_BONUS = 0.1
+AI_EB_BONUS = 0.05
+AI_FAKE_BREAKOUT_PENALTY = 0.15
 
 
 def _ai_entry_score(
@@ -44,7 +55,7 @@ def _ai_entry_score(
     smart_entry: Optional[SmartEntryResult],
 ) -> float:
     """Heuristic machine-style score synthesising multiple signals (0..1)."""
-    trend_score = min(1.0, max(0.0, abs(trend.strength) * 12))
+    trend_score = min(1.0, max(0.0, abs(trend.strength) * AI_TREND_SCALE))
     if action == "buy" and trend.direction != "up":
         trend_score *= 0.4
     if action == "sell" and trend.direction != "down":
@@ -55,28 +66,28 @@ def _ai_entry_score(
         max(0.0, min(1.0, (ob_bias + 0.5))) if action == "buy" else max(0.0, min(1.0, (-ob_bias + 0.5)))
     )
 
-    vol_score = max(0.0, min(1.0, 1.0 - vol.volatility * 50))
+    vol_score = max(0.0, min(1.0, 1.0 - vol.volatility * AI_VOL_SCALE))
 
     see_bonus = 0.0
     if smart_entry:
         if smart_entry.pre_pump.detected and action == "buy":
-            see_bonus += 0.1 * smart_entry.pre_pump.score
+            see_bonus += AI_PRE_PUMP_BONUS * smart_entry.pre_pump.score
         if getattr(smart_entry, "pump_sniper", None) and smart_entry.pump_sniper.detected and action == "buy":
-            see_bonus += 0.1 * smart_entry.pump_sniper.score
+            see_bonus += AI_PUMP_SNIPER_BONUS * smart_entry.pump_sniper.score
         if smart_entry.whale_pressure.detected:
             aligned = (action == "buy" and smart_entry.whale_pressure.side == "buy") or (
                 action == "sell" and smart_entry.whale_pressure.side == "sell"
             )
             if aligned:
-                see_bonus += 0.1
+                see_bonus += AI_WHALE_BONUS
             else:
-                see_bonus -= 0.1
+                see_bonus -= AI_WHALE_BONUS
         if getattr(smart_entry, "early_breakout", None) and smart_entry.early_breakout.detected and action == "buy":
-            see_bonus += 0.05 * smart_entry.early_breakout.score
+            see_bonus += AI_EB_BONUS * smart_entry.early_breakout.score
         if smart_entry.fake_breakout.detected and action == "buy":
-            see_bonus -= 0.15 * smart_entry.fake_breakout.score
+            see_bonus -= AI_FAKE_BREAKOUT_PENALTY * smart_entry.fake_breakout.score
 
-    base = (trend_score * 0.4) + (ob_score * 0.35) + (vol_score * 0.25)
+    base = (trend_score * AI_TREND_WEIGHT) + (ob_score * AI_OB_WEIGHT) + (vol_score * AI_VOL_WEIGHT)
     score = max(0.0, min(1.0, base + see_bonus))
     return round(score, 3)
 
