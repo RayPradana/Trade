@@ -197,6 +197,18 @@ class BotConfig:
     # Minimum (recent_vol / avg_vol) ratio to treat a resistance breakout as
     # volume-confirmed and genuine.  E.g. 0.7 = 70% of average volume needed.
     see_breakout_volume_min: float = 0.7
+    # ── Anti-fake-pump detection ──────────────────────────────────────────────
+    # On Indodax, manipulative actors frequently execute a rapid pump followed
+    # by an equally rapid dump within ≈20 seconds.  This guard watches the
+    # per-pair price history buffer for the two-phase pattern:
+    #   Phase 1 – spike: price rose ≥ pump_protection_pct vs the oldest sample.
+    #   Phase 2 – reversal: price has since fallen ≥ fake_pump_reversal_pct from
+    #             the in-window peak back toward (or below) the spike entry.
+    # When both phases are detected the buy is skipped to avoid buying the dump.
+    #
+    # Requires pump_protection_pct > 0 (uses the same per-pair price buffer).
+    # 0 = disabled (default).  E.g. 0.03 = skip when price dropped ≥3% from peak.
+    fake_pump_reversal_pct: float = 0.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -283,6 +295,7 @@ class BotConfig:
             see_volume_surge_ratio=float(os.getenv("SEE_VOLUME_SURGE_RATIO", "2.0")),
             see_whale_pressure_min=float(os.getenv("SEE_WHALE_PRESSURE_MIN", "2.0")),
             see_breakout_volume_min=float(os.getenv("SEE_BREAKOUT_VOLUME_MIN", "0.7")),
+            fake_pump_reversal_pct=float(os.getenv("FAKE_PUMP_REVERSAL_PCT", "0")),
         )
         cfg._validate()
         return cfg
@@ -381,5 +394,7 @@ class BotConfig:
             raise ValueError("SEE_WHALE_PRESSURE_MIN must be non-negative")
         if not (0.0 <= self.see_breakout_volume_min <= 1.0):
             raise ValueError("SEE_BREAKOUT_VOLUME_MIN must be between 0 and 1")
+        if self.fake_pump_reversal_pct < 0:
+            raise ValueError("FAKE_PUMP_REVERSAL_PCT must be non-negative")
         if not self.dry_run and not self.api_key:
             self.require_auth()

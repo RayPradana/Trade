@@ -302,9 +302,10 @@ class Trader:
         incorrect rise percentages.
 
         Old entries outside the lookback window are pruned to keep the buffer
-        small.  This method is a no-op when pump protection is disabled.
+        small.  This method is a no-op when both pump protection and fake-pump
+        reversal detection are disabled.
         """
-        if self.config.pump_protection_pct <= 0:
+        if self.config.pump_protection_pct <= 0 and self.config.fake_pump_reversal_pct <= 0:
             return
         now = time.time()
         buf = self._price_history.setdefault(pair, [])
@@ -333,6 +334,43 @@ class Trader:
             return False
         rise = (current_price - oldest_price) / oldest_price
         return rise >= self.config.pump_protection_pct
+
+    def _is_fake_pump(self, pair: str, current_price: float) -> bool:
+        """Detect a pump-then-dump (fake pump) pattern in the price history.
+
+        On Indodax, manipulative actors frequently spike a price by several
+        percent and then dump it back down within ≈20 seconds.  This method
+        looks for that two-phase pattern inside the per-pair rolling buffer:
+
+        * **Phase 1 – spike**: the in-window peak price rose ≥
+          ``pump_protection_pct`` versus the oldest buffer entry.
+        * **Phase 2 – reversal / dump**: *current_price* has since fallen ≥
+          ``fake_pump_reversal_pct`` from that peak.
+
+        Both conditions must hold simultaneously to return ``True``.
+
+        Returns ``False`` when either feature is disabled, there is
+        insufficient history, or the pattern is not present.
+        """
+        if self.config.pump_protection_pct <= 0 or self.config.fake_pump_reversal_pct <= 0:
+            return False
+        buf = self._price_history.get(pair)
+        if not buf or len(buf) < 2:
+            return False
+        oldest_price = buf[0][1]
+        if oldest_price <= 0:
+            return False
+        # Find the highest price recorded within the window.
+        peak_price = max(entry[1] for entry in buf)
+        # Phase 1: was there a genuine spike (pump)?
+        spike = (peak_price - oldest_price) / oldest_price
+        if spike < self.config.pump_protection_pct:
+            return False
+        # Phase 2: has current price reversed (dump) significantly from peak?
+        if peak_price <= 0:
+            return False
+        reversal = (peak_price - current_price) / peak_price
+        return reversal >= self.config.fake_pump_reversal_pct
 
     def _pair_composite_score(self, pair: str) -> float:
         """Return a composite ranking score for *pair* used to select the top-N watchlist.
@@ -898,6 +936,31 @@ class Trader:
                 "reason": (
                     f"pump_detected rise={rise:.2%} ≥ {self.config.pump_protection_pct:.2%} "
                     f"in {self.config.pump_lookback_seconds:.0f}s"
+                ),
+                "portfolio": self.tracker.as_dict(price),
+            }
+
+        # ── Anti-fake-pump detection (spike → dump within ~20 s) ─────────────
+        # On Indodax, pump-and-dump cycles often complete within ~20 seconds.
+        # This guard checks whether price already spiked (pump) AND has since
+        # reversed (dump) within the rolling window.  Buying at the post-dump
+        # price is highly risky because further downside is likely.
+        if decision.action == "buy" and self._is_fake_pump(current_pair, price):
+            pair_buf = self._price_history.get(current_pair, [])
+            peak_price = max(entry[1] for entry in pair_buf) if pair_buf else price
+            reversal = (peak_price - price) / peak_price if peak_price > 0 else 0.0
+            logger.info(
+                "Fake-pump detected on %s: peak=%.2f current=%.2f reversal=%.2f%% — skipping buy",
+                current_pair,
+                peak_price,
+                price,
+                reversal * 100,
+            )
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"fake_pump_detected reversal={reversal:.2%} ≥ "
+                    f"{self.config.fake_pump_reversal_pct:.2%} after spike"
                 ),
                 "portfolio": self.tracker.as_dict(price),
             }

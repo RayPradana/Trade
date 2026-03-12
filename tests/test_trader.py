@@ -1549,6 +1549,127 @@ class PumpProtectionTest(unittest.TestCase):
         self.assertFalse(trader._is_pumped("btc_idr", 1_500_000_000.0))
 
 
+class FakePumpDetectionTest(unittest.TestCase):
+    """Tests for _is_fake_pump and its integration in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader(self, pump_pct: float = 0.05, reversal_pct: float = 0.03,
+                lookback: float = 60.0) -> Trader:
+        config = BotConfig(
+            api_key=None,
+            pump_protection_pct=pump_pct,
+            pump_lookback_seconds=lookback,
+            fake_pump_reversal_pct=reversal_pct,
+            dry_run=True,
+        )
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.1", "10"]],
+            },
+        })()
+        return trader
+
+    def test_is_fake_pump_returns_false_with_no_history(self):
+        trader = self._trader()
+        self.assertFalse(trader._is_fake_pump("btc_idr", 100.0))
+
+    def test_is_fake_pump_returns_false_when_disabled(self):
+        """Fake-pump check is off when reversal_pct = 0."""
+        import time as _time
+        trader = self._trader(reversal_pct=0.0)
+        trader._price_history = {"btc_idr": [
+            (_time.time() - 20, 100.0),
+            (_time.time() - 10, 110.0),  # peak: +10%
+            (_time.time() - 1,  105.0),  # current: -4.5% from peak
+        ]}
+        self.assertFalse(trader._is_fake_pump("btc_idr", 105.0))
+
+    def test_is_fake_pump_true_spike_then_dump(self):
+        """Detect spike (+10%) then dump (-5% from peak) → fake pump."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05, reversal_pct=0.03)
+        trader._price_history = {"btc_idr": [
+            (_time.time() - 25, 100.0),   # baseline
+            (_time.time() - 15, 110.0),   # peak (+10%) — spike ≥ 5%
+            (_time.time() - 5,  104.0),   # dump: (110-104)/110 ≈ 5.5% ≥ 3%
+        ]}
+        self.assertTrue(trader._is_fake_pump("btc_idr", 104.0))
+
+    def test_is_fake_pump_false_no_spike(self):
+        """No spike (rise < pump_pct) → no fake pump even if price drops."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05, reversal_pct=0.03)
+        trader._price_history = {"btc_idr": [
+            (_time.time() - 20, 100.0),   # baseline
+            (_time.time() - 10, 102.0),   # mild rise +2% < 5% threshold
+            (_time.time() - 1,   99.0),   # drop, but no real spike
+        ]}
+        self.assertFalse(trader._is_fake_pump("btc_idr", 99.0))
+
+    def test_is_fake_pump_false_spike_no_reversal(self):
+        """Spike present but price hasn't reversed enough → not yet fake pump."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05, reversal_pct=0.03)
+        trader._price_history = {"btc_idr": [
+            (_time.time() - 20, 100.0),   # baseline
+            (_time.time() - 10, 110.0),   # peak +10%
+            (_time.time() - 1,  109.5),   # only -0.5% from peak (< 3% reversal)
+        ]}
+        self.assertFalse(trader._is_fake_pump("btc_idr", 109.5))
+
+    def test_is_fake_pump_requires_two_data_points(self):
+        """Single entry in buffer → not enough data → returns False."""
+        import time as _time
+        trader = self._trader()
+        trader._price_history = {"btc_idr": [(_time.time() - 5, 100.0)]}
+        self.assertFalse(trader._is_fake_pump("btc_idr", 90.0))
+
+    def test_is_fake_pump_isolated_per_pair(self):
+        """Fake-pump check must not cross-contaminate pairs."""
+        import time as _time
+        trader = self._trader()
+        # eth_idr had a spike+dump — btc_idr has no history
+        trader._price_history = {"eth_idr": [
+            (_time.time() - 20, 100.0),
+            (_time.time() - 10, 120.0),
+            (_time.time() - 1,  110.0),
+        ]}
+        self.assertFalse(trader._is_fake_pump("btc_idr", 110.0))
+
+    def test_fake_pump_blocks_buy_in_maybe_execute(self):
+        """maybe_execute must skip buy when a fake pump is detected."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05, reversal_pct=0.03)
+        # Inject spike+dump pattern into price buffer
+        trader._price_history = {"btc_idr": [
+            (_time.time() - 25, 100.0),   # baseline
+            (_time.time() - 15, 110.0),   # spike +10%
+            (_time.time() - 5,  104.0),   # dump ~5.5% from peak
+        ]}
+        outcome = trader.maybe_execute(_make_buy_snap(price=104.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("fake_pump_detected", outcome["reason"])
+
+    def test_fake_pump_does_not_block_sell(self):
+        """Fake-pump guard only applies to buy orders."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05, reversal_pct=0.03)
+        trader._price_history = {"btc_idr": [
+            (_time.time() - 25, 100.0),
+            (_time.time() - 15, 110.0),
+            (_time.time() - 5,  104.0),
+        ]}
+        trader.tracker.record_trade("buy", 100.0, 0.1)
+        outcome = trader.maybe_execute(_make_buy_snap(price=104.0, action="sell"))
+        self.assertNotIn("fake_pump_detected", outcome.get("reason", ""))
+
+
 class EvaluateDynamicTpTest(unittest.TestCase):
     def setUp(self):
         logging.disable(logging.CRITICAL)
