@@ -10,6 +10,14 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _file_empty(path: str) -> bool:
+    """Return True when *path* is empty or cannot be stat-ed (race-safe)."""
+    try:
+        return os.path.getsize(path) == 0
+    except OSError:
+        return True
+
+
 @dataclass
 class TradeRecord:
     timestamp: float
@@ -121,7 +129,7 @@ class TradeJournal:
             self._append_to_csv(record)
 
     def _append_to_csv(self, record: TradeRecord) -> None:
-        write_header = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        write_header = not os.path.exists(self.path) or _file_empty(self.path)
         try:
             with open(self.path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)

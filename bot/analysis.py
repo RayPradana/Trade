@@ -207,7 +207,7 @@ def analyze_trend(
     candles: Sequence[Candle], fast_window: int = 12, slow_window: int = 48
 ) -> TrendResult:
     if not candles:
-        return TrendResult("flat", math.nan, math.nan, 0.0)
+        return TrendResult("flat", 0.0, 0.0, 0.0)
 
     closes = [c.close for c in candles]
     fast_ma_series = moving_average(closes, fast_window)
@@ -216,7 +216,7 @@ def analyze_trend(
     slow_ma = slow_ma_series[-1]
 
     if math.isnan(fast_ma) or math.isnan(slow_ma):
-        return TrendResult("flat", fast_ma, slow_ma, 0.0)
+        return TrendResult("flat", 0.0, 0.0, 0.0)
 
     if fast_ma > slow_ma:
         direction = "up"

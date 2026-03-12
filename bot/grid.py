@@ -26,6 +26,8 @@ class GridPlan:
 
 def build_grid_plan(current_price: float, config: BotConfig) -> GridPlan:
     """Build symmetric grid orders above and below the anchor price."""
+    if not current_price or current_price <= 0:
+        return GridPlan(anchor_price=0.0, buy_orders=[], sell_orders=[])
     levels = max(1, config.grid_levels_per_side)
     spacing = max(1e-6, config.grid_spacing_pct)
     # Use explicit override, otherwise derive dynamically from risk budget and current price

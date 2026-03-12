@@ -366,16 +366,22 @@ def _log_signal(snapshot: dict) -> None:
     logging.info("   %s├─%s reason  : %s", _DIM, _RESET, decision.reason)
 
     # ── Market data ──────────────────────────────────────────────────────
-    spread_pct = (ob.spread_pct * 100) if ob else float("nan")
-    imbalance  = ob.imbalance if ob else float("nan")
-    volatility = vol.volatility if vol else float("nan")
-    imb_color  = _GREEN if imbalance > 0.1 else (_RED if imbalance < -0.1 else _YELLOW)
+    if ob:
+        spread_str = f"{ob.spread_pct * 100:.4f}%"
+        imb_val    = ob.imbalance
+        imb_str    = f"{imb_val:+.3f}"
+        imb_color  = _GREEN if imb_val > 0.1 else (_RED if imb_val < -0.1 else _YELLOW)
+    else:
+        spread_str = "N/A"
+        imb_str    = "N/A"
+        imb_color  = _DIM
+    vol_str = f"{vol.volatility:.4f}" if vol else "N/A"
     logging.info(
-        "   %s├─%s market  : spread=%s%.4f%%%s  imbalance=%s%+.3f%s  vol=%s%.4f%s",
+        "   %s├─%s market  : spread=%s%s%s  imbalance=%s%s%s  vol=%s%s%s",
         _DIM, _RESET,
-        _DIM, spread_pct, _RESET,
-        imb_color, imbalance, _RESET,
-        _DIM, volatility, _RESET,
+        _DIM, spread_str, _RESET,
+        imb_color, imb_str, _RESET,
+        _DIM, vol_str, _RESET,
     )
 
     # ── Support / Resistance ─────────────────────────────────────────────

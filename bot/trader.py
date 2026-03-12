@@ -846,12 +846,22 @@ class Trader:
                     stop_loss=None,
                     take_profit=None,
                 )
+                # Still compute basic market data from already-fetched
+                # depth/candles so that the log shows meaningful spread,
+                # imbalance, volatility, support and resistance values
+                # instead of nan/N/A.
+                _rug_orderbook = analyze_orderbook(depth)
+                _rug_vol = analyze_volatility(candles)
+                _rug_levels = support_resistance(candles)
                 return {
                     "pair": pair,
                     "price": price,
                     "decision": _hold_decision,
                     "rug_pull_risk": rug_pull_risk,
                     "insufficient_data": False,
+                    "orderbook": _rug_orderbook,
+                    "volatility": _rug_vol,
+                    "levels": _rug_levels,
                 }
 
         insufficient_data = len(candles) < self.config.min_candles
@@ -1225,8 +1235,14 @@ class Trader:
         depth = self.client.get_depth(snapshot["pair"], count=_EXECUTION_DEPTH_LEVELS)
         bids = depth.get("buy") or []
         asks = depth.get("sell") or []
-        top_bid = float(bids[0][0]) if bids else price
-        top_ask = float(asks[0][0]) if asks else price
+        try:
+            top_bid = float(bids[0][0]) if bids else price
+        except (ValueError, TypeError):
+            top_bid = price
+        try:
+            top_ask = float(asks[0][0]) if asks else price
+        except (ValueError, TypeError):
+            top_ask = price
         reference_price = top_ask if decision.action == "buy" else top_bid
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
@@ -1284,7 +1300,10 @@ class Trader:
         if self.config.max_tick_move_pct > 0 and decision.action == "buy" and top_bid > 0:
             tick_pct: Optional[float] = None
             if len(bids) >= 2:
-                second_bid = float(bids[1][0])
+                try:
+                    second_bid = float(bids[1][0])
+                except (ValueError, TypeError):
+                    second_bid = 0.0
                 if 0 < second_bid < top_bid:
                     tick_pct = (top_bid - second_bid) / top_bid
             if tick_pct is None and top_ask > top_bid:
@@ -1322,8 +1341,17 @@ class Trader:
         # the configured multiple.  This protects against entering a market
         # where persistent sell-wall pressure will suppress price recovery.
         if self.config.orderbook_wall_threshold > 0 and decision.action == "buy":
-            bid_vol = sum(float(b[1]) for b in bids[:_EXECUTION_DEPTH_LEVELS] if len(b) >= 2)
-            ask_vol = sum(float(a[1]) for a in asks[:_EXECUTION_DEPTH_LEVELS] if len(a) >= 2)
+            def _parse_vol(entries: list) -> float:
+                total = 0.0
+                for entry in entries[:_EXECUTION_DEPTH_LEVELS]:
+                    if len(entry) >= 2:
+                        try:
+                            total += float(entry[1])
+                        except (ValueError, TypeError):
+                            pass
+                return total
+            bid_vol = _parse_vol(bids)
+            ask_vol = _parse_vol(asks)
             if bid_vol > 0 and ask_vol / bid_vol >= self.config.orderbook_wall_threshold:
                 logger.info(
                     "Sell-wall detected on %s: ask/bid=%.1f× ≥ %.1f× — skipping buy",

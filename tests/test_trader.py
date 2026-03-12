@@ -3051,6 +3051,50 @@ class RugPullFilterTests(unittest.TestCase):
         self.assertIsNotNone(rug)
         self.assertTrue(rug.detected)
 
+    def test_analyze_market_rug_pull_includes_market_data(self) -> None:
+        """analyze_market rug-pull snapshot must include orderbook/volatility/levels
+        so that the log can display spread, imbalance, vol and support/resistance
+        instead of N/A placeholders."""
+
+        class _RugClient(GuardedTrader._Client):
+            def get_ticker(self, pair: str):
+                return {"ticker": {"high": "100", "last": "30", "vol_idr": "5000000"}}
+
+            def get_depth(self, pair: str, count: int = 50):
+                return {"buy": [["30", "1000"]], "sell": [["31", "500"]]}
+
+            def get_trades(self, pair: str, count: int = 200):
+                return []
+
+        config = BotConfig(
+            api_key=None,
+            rug_pull_max_drop_24h_pct=0.50,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _RugClient()
+        trader._multi_feed = type(
+            "_Feed", (), {
+                "has_snapshot": False,
+                "is_seeded": False,
+                "get_ticker": lambda self, p: None,
+            }
+        )()
+
+        snap = trader.analyze_market("rug_idr")
+        self.assertEqual(snap["decision"].action, "hold")
+        # orderbook, volatility and levels must be present (not None / missing)
+        self.assertIn("orderbook", snap)
+        self.assertIsNotNone(snap["orderbook"])
+        self.assertIn("volatility", snap)
+        self.assertIsNotNone(snap["volatility"])
+        self.assertIn("levels", snap)
+        self.assertIsNotNone(snap["levels"])
+        # spread and imbalance should be finite numbers (not NaN)
+        import math
+        ob = snap["orderbook"]
+        self.assertFalse(math.isnan(ob.spread_pct), "spread_pct should not be NaN")
+        self.assertFalse(math.isnan(ob.imbalance), "imbalance should not be NaN")
+
 
 class PairMinOrderCacheTests(unittest.TestCase):
     """Tests for the per-pair minimum order cache (load_pair_min_orders / get_pair_min_order)."""
