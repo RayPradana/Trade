@@ -265,6 +265,7 @@ class TraderSelectionTests(unittest.TestCase):
             initial_capital=50.0,
             max_loss_pct=0.9,
             target_profit_pct=1.0,
+            min_order_idr=1.0,  # disable minimum-order guard (not under test here)
         )
         trader = GuardedTrader(config)
         trader.tracker.cash = 50.0  # very small cash
@@ -295,6 +296,7 @@ class TraderSelectionTests(unittest.TestCase):
             max_loss_pct=0.9,
             target_profit_pct=1.0,
             staged_entry_steps=3,
+            min_order_idr=1.0,  # disable minimum-order guard (not under test here)
         )
         trader = GuardedTrader(config)
         trader.tracker.cash = 1000.0
@@ -1535,6 +1537,129 @@ class SellWallGuardTest(unittest.TestCase):
         trader = self._trader_with_depth(bid_vol=1.0, ask_vol=1000.0, threshold=0.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
         self.assertNotIn("sell_wall", outcome.get("reason", ""))
+
+
+class MinOrderIdrTest(unittest.TestCase):
+    """Tests for MIN_ORDER_IDR guard in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _snap(self, price: float, action: str = "buy") -> Dict[str, Any]:
+        return {
+            "pair": "pixel_idr",
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="position_trading",
+                action=action,
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=1.0,  # very small: 1 coin × price IDR
+                stop_loss=price * 0.95,
+                take_profit=price * 1.05,
+            ),
+        }
+
+    def test_buy_below_minimum_skipped(self):
+        """An order whose total IDR value is below min_order_idr must be skipped."""
+        config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
+                           initial_capital=100_000)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            # bid=ask=253 so slippage guard passes
+            "get_depth": lambda self, *a, **kw: {"buy": [["253", "100"]], "sell": [["253", "100"]]},
+        })()
+        # price=253, amount=1 → total=253 IDR < 10,000 IDR
+        snap = self._snap(price=253.0)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("order_below_minimum", outcome["reason"])
+
+    def test_buy_above_minimum_proceeds(self):
+        """An order whose total IDR value meets or exceeds min_order_idr must proceed."""
+        config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
+                           initial_capital=100_000)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            # bid=ask=253 so slippage guard passes
+            "get_depth": lambda self, *a, **kw: {"buy": [["253", "1000"]], "sell": [["253", "1000"]]},
+        })()
+        # price=253, amount=100 → total=25,300 IDR > 10,000 IDR
+        snap = self._snap(price=253.0)
+        snap["decision"] = StrategyDecision(
+            mode="position_trading",
+            action="buy",
+            confidence=0.9,
+            reason="test",
+            target_price=253.0,
+            amount=100.0,
+            stop_loss=240.0,
+            take_profit=270.0,
+        )
+        outcome = trader.maybe_execute(snap)
+        self.assertNotIn("order_below_minimum", outcome.get("reason", ""))
+        self.assertNotEqual(outcome["status"], "skipped")
+
+    def test_config_min_order_idr_default(self):
+        """BotConfig default min_order_idr must be 10,000."""
+        config = BotConfig(api_key=None)
+        self.assertEqual(config.min_order_idr, 10_000.0)
+
+    def test_config_min_order_idr_validation(self):
+        """min_order_idr must be positive; zero or negative must raise ValueError."""
+        cfg_zero = BotConfig(api_key=None, min_order_idr=0.0)
+        with self.assertRaises(ValueError):
+            cfg_zero._validate()
+        cfg_neg = BotConfig(api_key=None, min_order_idr=-1.0)
+        with self.assertRaises(ValueError):
+            cfg_neg._validate()
+
+    def test_pixel_idr_scenario(self):
+        """Reproduce the exact pixel_idr scenario from the bug report."""
+        # pixel_idr price=253, initial capital=100K IDR.
+        # With the bot buying ~395 coins, total ≈ 99K IDR >> 10K.
+        # Bug was that small amounts from staged entry could be below minimum.
+        config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
+                           initial_capital=100_000)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["253", "500"]], "sell": [["253", "500"]]},
+        })()
+        snap = {
+            "pair": "pixel_idr",
+            "price": 253.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="position_trading",
+                action="buy",
+                confidence=0.577,
+                reason="position_trading",
+                target_price=253.0,
+                amount=395.26,   # ≈ 100,000 / 253
+                stop_loss=240.0,
+                take_profit=270.0,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        # The full order is 395 × 253 ≈ 99K IDR >> 10K, should NOT be skipped
+        self.assertNotIn("order_below_minimum", outcome.get("reason", ""))
 
 
 class PumpProtectionTest(unittest.TestCase):

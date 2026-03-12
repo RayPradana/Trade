@@ -209,6 +209,15 @@ class BotConfig:
     # Requires pump_protection_pct > 0 (uses the same per-pair price buffer).
     # 0 = disabled (default).  E.g. 0.03 = skip when price dropped ≥3% from peak.
     fake_pump_reversal_pct: float = 0.0
+    # ── Indodax minimum order value ───────────────────────────────────────────
+    # Indodax rejects any order whose total IDR value (price × amount) is below
+    # 10,000 IDR.  The bot enforces this limit before submitting to the exchange
+    # so that the error is caught gracefully as a "skipped" outcome rather than
+    # raising a runtime exception.
+    #
+    # The value can be raised above the exchange minimum if desired (e.g. to
+    # avoid wasting fees on very small trades).  Must be > 0.
+    min_order_idr: float = 10_000.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -296,6 +305,7 @@ class BotConfig:
             see_whale_pressure_min=float(os.getenv("SEE_WHALE_PRESSURE_MIN", "2.0")),
             see_breakout_volume_min=float(os.getenv("SEE_BREAKOUT_VOLUME_MIN", "0.7")),
             fake_pump_reversal_pct=float(os.getenv("FAKE_PUMP_REVERSAL_PCT", "0")),
+            min_order_idr=float(os.getenv("MIN_ORDER_IDR", "10000")),
         )
         cfg._validate()
         return cfg
@@ -396,5 +406,7 @@ class BotConfig:
             raise ValueError("SEE_BREAKOUT_VOLUME_MIN must be between 0 and 1")
         if self.fake_pump_reversal_pct < 0:
             raise ValueError("FAKE_PUMP_REVERSAL_PCT must be non-negative")
+        if self.min_order_idr <= 0:
+            raise ValueError("MIN_ORDER_IDR must be positive")
         if not self.dry_run and not self.api_key:
             self.require_auth()

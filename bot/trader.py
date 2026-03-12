@@ -1043,6 +1043,29 @@ class Trader:
             }
             return outcome
 
+        # ── Indodax minimum order value guard ─────────────────────────────────
+        # Indodax rejects orders whose total IDR value (price × amount) is below
+        # 10,000 IDR (configurable via MIN_ORDER_IDR).  Check upfront so the
+        # error is surfaced as a clean "skipped" outcome rather than a
+        # RuntimeError from the exchange.
+        total_order_value_idr = effective_amount * reference_price
+        if total_order_value_idr < self.config.min_order_idr:
+            logger.info(
+                "Order value Rp%.0f < min Rp%.0f for %s — skipping %s",
+                total_order_value_idr,
+                self.config.min_order_idr,
+                snapshot["pair"],
+                decision.action,
+            )
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"order_below_minimum Rp{total_order_value_idr:.0f} "
+                    f"< Rp{self.config.min_order_idr:.0f}"
+                ),
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
+
         staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
 
         executed_steps: List[Dict[str, Any]] = []
@@ -1051,6 +1074,15 @@ class Trader:
             for amt in staged:
                 step_amount = min(amt, remaining_amount)
                 if step_amount <= 0:
+                    continue
+                # Skip individual staged steps that fall below the minimum order
+                # value (can happen when staging splits a borderline-size order).
+                if step_amount * reference_price < self.config.min_order_idr:
+                    logger.debug(
+                        "DRY-RUN skipping staged step: Rp%.0f < min Rp%.0f",
+                        step_amount * reference_price,
+                        self.config.min_order_idr,
+                    )
                     continue
                 logger.info("DRY-RUN %s %s @ %s (staged)", decision.action, step_amount, reference_price)
                 self.tracker.record_trade(decision.action, reference_price, step_amount)
@@ -1080,6 +1112,15 @@ class Trader:
         for amt in staged:
             step_amount = min(amt, remaining_amount)
             if step_amount <= 0:
+                continue
+            # Skip steps whose IDR value would be rejected by the exchange.
+            if step_amount * reference_price < self.config.min_order_idr:
+                logger.info(
+                    "Skipping staged step: Rp%.0f < min Rp%.0f (pair=%s)",
+                    step_amount * reference_price,
+                    self.config.min_order_idr,
+                    snapshot["pair"],
+                )
                 continue
             order_resp = self.client.create_order(snapshot["pair"], decision.action, reference_price, step_amount)
             self.tracker.record_trade(decision.action, reference_price, step_amount)

@@ -107,7 +107,8 @@ class TraderAutoResumeTests(unittest.TestCase):
         """State file must exist after a successful dry-run buy."""
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "bot_state.json"
-            config = BotConfig(api_key=None, dry_run=True, state_path=state_path, staged_entry_steps=1)
+            config = BotConfig(api_key=None, dry_run=True, state_path=state_path,
+                               staged_entry_steps=1, min_order_idr=1.0)  # disable min-order guard
             trader = _BuyTrader(config, client=_FakeClient())
             snapshot = trader.analyze_market("btc_idr")
             trader.maybe_execute(snapshot)
