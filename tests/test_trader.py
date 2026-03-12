@@ -1738,7 +1738,11 @@ class SpreadFilterTest(unittest.TestCase):
 
 
 class MinBuyPriceFilterTest(unittest.TestCase):
-    """Tests for MIN_BUY_PRICE_IDR filter in maybe_execute."""
+    """Tests for MIN_BUY_PRICE_IDR soft filter in maybe_execute.
+
+    Coins below the threshold are checked for orderbook quality instead of
+    being hard-skipped.  Stuck/illiquid coins fail; active cheap coins pass.
+    """
 
     def setUp(self):
         logging.disable(logging.CRITICAL)
@@ -1746,49 +1750,86 @@ class MinBuyPriceFilterTest(unittest.TestCase):
     def tearDown(self):
         logging.disable(logging.NOTSET)
 
-    def _trader(self, min_price: float, coin_price: float) -> Trader:
-        config = BotConfig(api_key=None, min_buy_price_idr=min_price, dry_run=True)
+    def _trader(self, min_price: float, coin_price: float, bids=None, asks=None, **cfg) -> Trader:
+        config = BotConfig(api_key=None, min_buy_price_idr=min_price, dry_run=True, **cfg)
         trader = Trader(config)
+        _bids = bids if bids is not None else [[str(coin_price), "100"]]
+        _asks = asks if asks is not None else [[str(coin_price * 1.001), "100"]]
         trader.client = type("_C", (), {
-            "get_depth": lambda self, *a, **kw: {
-                "buy": [[str(coin_price), "100"]],
-                "sell": [[str(coin_price * 1.001), "100"]],
-            },
+            "get_depth": lambda self, *a, **kw: {"buy": _bids, "sell": _asks},
         })()
         return trader
 
-    def test_cheap_coin_skipped(self):
-        """Buy must be skipped when price is below min_buy_price_idr."""
-        # DENT-like: 4 IDR < 10 IDR threshold
+    def test_cheap_coin_thin_book_skipped(self):
+        """Buy must be skipped when the orderbook has fewer levels than small_coin_min_bid_levels."""
+        # Only 1 bid level; default small_coin_min_bid_levels=3
         trader = self._trader(min_price=10.0, coin_price=4.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
         self.assertEqual(outcome["status"], "skipped")
-        self.assertIn("price_too_low", outcome["reason"])
+        self.assertIn("small_coin_thin_book", outcome["reason"])
+
+    def test_cheap_coin_good_ob_allowed(self):
+        """Cheap coin with sufficient bid levels and tight spread must NOT be blocked."""
+        # 5 bid levels → passes default small_coin_min_bid_levels=3
+        bids = [["4.0", "200"], ["3.9", "300"], ["3.8", "500"], ["3.7", "400"], ["3.6", "600"]]
+        asks = [["4.01", "100"]]
+        trader = self._trader(min_price=10.0, coin_price=4.0, bids=bids, asks=asks)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertNotIn("small_coin_thin_book", outcome.get("reason", ""))
+        self.assertNotIn("small_coin_illiquid", outcome.get("reason", ""))
+
+    def test_cheap_coin_illiquid_depth_skipped(self):
+        """Buy must be skipped when total IDR bid depth is below small_coin_min_depth_idr."""
+        # 5 bid levels but tiny depth: 5 × 4 × 1 = 20 IDR total
+        bids = [["4", "1"], ["3", "1"], ["2", "1"], ["1", "1"], ["0.5", "1"]]
+        asks = [["5", "1"]]
+        trader = self._trader(
+            min_price=100.0, coin_price=4.0, bids=bids, asks=asks,
+            small_coin_min_bid_levels=0,  # disable level check
+            small_coin_min_depth_idr=1_000_000.0,  # require 1M IDR
+        )
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("small_coin_illiquid", outcome["reason"])
+
+    def test_cheap_coin_wide_spread_skipped(self):
+        """Buy must be skipped when bid-ask spread exceeds small_coin_max_spread_pct."""
+        # bid=4, ask=6 → spread = 2/4 = 50% > 10% threshold
+        bids = [["4", "100"], ["3.5", "200"], ["3", "300"], ["2.5", "400"], ["2", "500"]]
+        asks = [["6", "50"]]
+        trader = self._trader(
+            min_price=100.0, coin_price=4.0, bids=bids, asks=asks,
+            small_coin_min_bid_levels=0,  # disable level check
+            small_coin_max_spread_pct=0.10,  # max 10% spread
+        )
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("small_coin_wide_spread", outcome["reason"])
 
     def test_price_exactly_at_threshold_allowed(self):
-        """Coin priced exactly at the threshold must NOT be blocked."""
+        """Coin priced exactly at the threshold must NOT trigger the quality check."""
         trader = self._trader(min_price=10.0, coin_price=10.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=10.0))
-        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+        self.assertNotIn("small_coin_thin_book", outcome.get("reason", ""))
 
     def test_price_above_threshold_allowed(self):
-        """Coin priced above the threshold must NOT be blocked."""
+        """Coin priced above the threshold must NOT trigger the quality check."""
         trader = self._trader(min_price=10.0, coin_price=50.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=50.0))
-        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+        self.assertNotIn("small_coin_thin_book", outcome.get("reason", ""))
 
     def test_filter_disabled_when_zero(self):
-        """When min_buy_price_idr=0 the filter must be disabled."""
+        """When min_buy_price_idr=0 the filter must be fully disabled."""
         trader = self._trader(min_price=0.0, coin_price=1.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=1.0))
-        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+        self.assertNotIn("small_coin", outcome.get("reason", ""))
 
     def test_sell_not_blocked_by_price_filter(self):
-        """Min-price filter must only apply to buy signals, not sells."""
+        """Quality check must only apply to buy signals, not sells."""
         trader = self._trader(min_price=10.0, coin_price=4.0)
         trader.tracker.record_trade("buy", 4.0, 1000.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0, action="sell"))
-        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+        self.assertNotIn("small_coin", outcome.get("reason", ""))
 
 
 class TickMoveFilterTest(unittest.TestCase):
@@ -1993,27 +2034,67 @@ class TopVolumeAutoSelectorTest(unittest.TestCase):
         self.assertLess(pairs.index("highvol_idr"), pairs.index("lowvol_idr"))
 
     def test_low_price_pairs_excluded_from_watchlist(self):
-        """Pairs with last price below min_buy_price_idr must not appear in the watchlist."""
+        """Cheap coins that are stuck (high==low) must be dropped from the watchlist."""
         tickers = {
             "btc_idr": {
                 "vol_idr": "5000000000", "last": "1000000000",
                 "high": "1100000000", "low": "900000000",
             },
-            # DENT-like coin: price = 4 IDR (well below 100 IDR threshold)
+            # DENT-like coin: price = 4 IDR, high == low → completely stuck
             "dent_idr": {
                 "vol_idr": "200000000", "last": "4",
-                "high": "5", "low": "3",
+                "high": "4", "low": "4",  # stuck: no movement
             },
         }
         feed = self._make_feed_with_tickers(tickers)
         trader = self._trader_with_feed(
             feed,
             dynamic_pairs_top_n=20,
-            min_buy_price_idr=100.0,  # skip coins below 100 IDR
+            min_buy_price_idr=100.0,
         )
         trader._refresh_dynamic_pairs()
         self.assertIn("btc_idr", trader._all_pairs)
         self.assertNotIn("dent_idr", trader._all_pairs)
+
+    def test_cheap_active_coin_stays_in_watchlist(self):
+        """Cheap coin with price movement (high != low) must stay on watchlist."""
+        tickers = {
+            "shib_idr": {
+                "vol_idr": "300000000", "last": "50",
+                "high": "55", "low": "48",  # active: high != low
+            },
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            min_buy_price_idr=100.0,
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("shib_idr", trader._all_pairs)
+
+    def test_cheap_dead_coin_excluded_from_watchlist(self):
+        """Cheap coin with zero volume (dead) must be dropped from watchlist."""
+        tickers = {
+            "dead_idr": {
+                "vol_idr": "0", "last": "20",
+                "high": "22", "low": "18",  # price moved but no volume
+            },
+            "btc_idr": {
+                "vol_idr": "5000000000", "last": "500000000",
+                "high": "550000000", "low": "480000000",
+            },
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            min_buy_price_idr=100.0,
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIsNotNone(trader._all_pairs)
+        self.assertIn("btc_idr", trader._all_pairs)
+        self.assertNotIn("dead_idr", trader._all_pairs)
 
     def test_low_price_filter_disabled_when_zero(self):
         """min_buy_price_idr=0 must not filter any pairs by price."""

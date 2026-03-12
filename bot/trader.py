@@ -982,13 +982,28 @@ class Trader:
                         filtered.append(p)  # no data → keep and let score sort it out
                         continue
 
-                    # Price check (skip tiny-price coins like DENT at 4 IDR)
+                    # Price check – only drop cheap coins that are also stuck or dead.
+                    # A coin is "stuck" when its 24h high equals its low (no movement
+                    # at all).  A coin is "dead" when it has no volume.  Active cheap
+                    # coins (e.g. SHIB at 50 IDR but with regular trades) are kept on
+                    # the watchlist and face an orderbook quality check at execution.
                     if min_price > 0:
                         try:
                             last_price = float(ticker.get("last") or ticker.get("last_price") or 0)
                             if 0 < last_price < min_price:
-                                dropped_low_price.append(p)
-                                continue
+                                high = float(ticker.get("high") or 0)
+                                low = float(ticker.get("low") or 0)
+                                vol_idr = float(
+                                    ticker.get("vol_idr")
+                                    or ticker.get("idr_volume")
+                                    or ticker.get("volume")
+                                    or 0
+                                )
+                                is_stuck = high > 0 and low > 0 and high == low
+                                is_dead = vol_idr <= 0
+                                if is_stuck or is_dead:
+                                    dropped_low_price.append(p)
+                                    continue
                         except (ValueError, TypeError):
                             pass  # price missing → keep pair
 
@@ -1025,7 +1040,7 @@ class Trader:
 
             if dropped_low_price:
                 logger.debug(
-                    "Top-volume selector: dropped %d low-price pairs (< Rp%.0f)",
+                    "Top-volume selector: dropped %d stuck/dead cheap pairs (price < Rp%.0f)",
                     len(dropped_low_price),
                     min_price,
                 )
@@ -1387,6 +1402,57 @@ class Trader:
             "volume_24h_idr": self._extract_volume_idr(ticker),
         }
 
+    def _check_small_coin_ob_quality(
+        self,
+        bids: List[Any],
+        top_bid: float,
+        top_ask: float,
+    ) -> Optional[str]:
+        """Return a skip reason if orderbook quality is insufficient for a cheap coin.
+
+        Called when ``price < config.min_buy_price_idr``.  Checks:
+
+        1. **Bid levels** – fewer than ``small_coin_min_bid_levels`` indicates a
+           thin/stuck book.
+        2. **Bid depth** – total IDR value of all resting bids below
+           ``small_coin_min_depth_idr`` suggests negligible liquidity.
+        3. **Spread** – bid-ask spread exceeding ``small_coin_max_spread_pct``
+           signals poor execution quality.
+
+        Returns ``None`` when all active checks pass (coin is liquid and tradeable).
+        """
+        # 1. Minimum bid levels
+        min_levels = self.config.small_coin_min_bid_levels
+        if min_levels > 0 and len(bids) < min_levels:
+            return (
+                f"small_coin_thin_book {len(bids)} < {min_levels} bid levels"
+            )
+
+        # 2. Minimum IDR bid depth
+        min_depth = self.config.small_coin_min_depth_idr
+        if min_depth > 0 and top_bid > 0:
+            total_depth = 0.0
+            for bid in bids:
+                try:
+                    total_depth += float(bid[0]) * float(bid[1])
+                except (ValueError, TypeError, IndexError):
+                    pass
+            if total_depth < min_depth:
+                return (
+                    f"small_coin_illiquid depth_idr={total_depth:.0f} < {min_depth:.0f}"
+                )
+
+        # 3. Maximum spread (overrides global max_spread_pct for cheap coins)
+        spread_threshold = self.config.small_coin_max_spread_pct
+        if spread_threshold > 0 and top_bid > 0 and top_ask > top_bid:
+            spread_pct = (top_ask - top_bid) / top_bid
+            if spread_pct > spread_threshold:
+                return (
+                    f"small_coin_wide_spread {spread_pct:.4%} > {spread_threshold:.4%}"
+                )
+
+        return None  # all checks pass → allow the cheap coin
+
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         _pair = snapshot["pair"]
         decision: StrategyDecision = snapshot["decision"]
@@ -1672,26 +1738,28 @@ class Trader:
                     "portfolio": _tracker.as_dict(price),
                 }
 
-        # ── Minimum price filter ──────────────────────────────────────────────
-        # Skip buy when the coin price is too low.  Very cheap coins (e.g.
-        # DENT at 4 IDR) trade in integer steps where the minimum price
-        # increment is a large percentage move — making the position nearly
-        # impossible to exit at a reasonable profit.
+        # ── Minimum price filter (soft quality check) ────────────────────────
+        # When price is below min_buy_price_idr, evaluate orderbook quality
+        # instead of hard-skipping.  Coins with a thin/stuck book are blocked;
+        # active cheap coins with adequate depth and a tight spread are allowed.
         if self.config.min_buy_price_idr > 0 and decision.action == "buy":
             if price < self.config.min_buy_price_idr:
-                logger.info(
-                    "Price too low on %s: %.6g < %.6g IDR — skipping buy",
-                    snapshot["pair"],
-                    price,
-                    self.config.min_buy_price_idr,
+                skip_reason = self._check_small_coin_ob_quality(
+                    bids, top_bid, top_ask
                 )
-                return {
-                    "status": "skipped",
-                    "reason": (
-                        f"price_too_low {price:.6g} < {self.config.min_buy_price_idr:.6g} IDR"
-                    ),
-                    "portfolio": _tracker.as_dict(price),
-                }
+                if skip_reason:
+                    logger.info(
+                        "Cheap coin %s quality check failed (%.6g IDR < %.6g): %s — skipping buy",
+                        snapshot["pair"],
+                        price,
+                        self.config.min_buy_price_idr,
+                        skip_reason,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": skip_reason,
+                        "portfolio": _tracker.as_dict(price),
+                    }
 
         # ── Tick-move filter ──────────────────────────────────────────────────
         # Skip buy when the minimum possible price increment (tick) is a
