@@ -707,3 +707,32 @@ class MultiPositionManager:
             for p, t in self._trackers.items()
             if t.base_position > 0
         ]
+
+    def restore_from_state(
+        self, positions: Dict[str, Dict[str, object]], pool_cash: float
+    ) -> List[str]:
+        """Restore persisted positions into this manager.
+
+        Replaces any existing trackers with the ones from *positions* and sets
+        the unallocated cash pool to *pool_cash*.  Only positions with a
+        non-zero ``base_position`` are restored; stale zero-position entries are
+        skipped.
+
+        Returns the list of pair names that were successfully restored.
+        """
+        self.cash = pool_cash
+        self._trackers.clear()
+        restored: List[str] = []
+        for pair, state in positions.items():
+            base_pos = float(state.get("base_position", 0))  # type: ignore[arg-type]
+            if base_pos <= 0:
+                continue
+            tracker = PortfolioTracker(
+                initial_capital=float(state.get("cash", 0)),  # type: ignore[arg-type]
+                target_profit_pct=self._target_profit_pct,
+                max_loss_pct=self._max_loss_pct,
+            )
+            tracker.load_state(state)  # type: ignore[arg-type]
+            self._trackers[pair] = tracker
+            restored.append(pair)
+        return restored

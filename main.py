@@ -661,7 +661,11 @@ def main() -> None:
     snapshot: dict = {}  # most recent scan snapshot (used for adaptive interval)
     # Track whether a position has been entered in this session.
     # Used by TRADE_MODE=single to know when a full buy→sell cycle is complete.
-    _entered_position: bool = trader.tracker.base_position > 0
+    _entered_position: bool = (
+        len(trader.active_positions) > 0
+        if getattr(trader, "multi_manager", None) is not None
+        else trader.tracker.base_position > 0
+    )
 
     # ── Auto-resume: use the pair from saved state if we're resuming ────────
     if trader.restored_pair:
@@ -861,7 +865,11 @@ def main() -> None:
                         break
                     time.sleep(config.position_check_interval_seconds)
                     continue
-                # Multi-position with free slots: fall through to scan below.
+                # Multi-position with free slots: scan for additional pairs now.
+                logging.info(
+                    "🔍 Holding %d position(s) — scanning for new pair opportunities …",
+                    len(trader.active_positions),
+                )
 
             # ── Scan all pairs and choose the best opportunity ───────────────
             if trader.at_max_positions():

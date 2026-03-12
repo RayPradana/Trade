@@ -211,6 +211,14 @@ class Trader:
         - The saved ``dry_run`` flag matches the current config (prevents mixing
           virtual and live state after the user toggles DRY_RUN)
         - The saved position is > 0 (a position=0 file is stale and cleared)
+
+        In multi-position mode the state may contain a ``multi_positions`` dict
+        with per-pair tracker snapshots.  Those are restored into
+        :attr:`multi_manager` so that :attr:`active_positions` reflects held
+        pairs immediately on the next cycle and the main holding loop monitors
+        them correctly.  A legacy single-position state file (no
+        ``multi_positions`` key) is migrated transparently: the single entry is
+        registered in ``multi_manager`` as if it were opened there.
         """
         state = self.persistence.load()
         if state is None:
@@ -224,6 +232,68 @@ class Trader:
                 self.config.dry_run,
             )
             return
+
+        # ── Multi-position restore path ───────────────────────────────────────
+        if self.multi_manager is not None:
+            multi_positions = state.get("multi_positions")
+            pool_cash = float(state.get("multi_cash", self.multi_manager.cash))
+            pair = state.get("pair")
+
+            if multi_positions:
+                # New format: restore all per-pair positions into multi_manager.
+                restored_pairs = self.multi_manager.restore_from_state(
+                    multi_positions, pool_cash  # type: ignore[arg-type]
+                )
+                if restored_pairs:
+                    self.restored_pair = restored_pairs[0]
+                    logger.info(
+                        "🔄 Resumed %d multi-position(s): %s",
+                        len(restored_pairs),
+                        ", ".join(restored_pairs),
+                    )
+                    for p in restored_pairs:
+                        t = self.multi_manager.get_tracker(p)
+                        if t is not None:
+                            logger.info(
+                                "   ├─ %s: pos=%.8f  avg_cost=%s  pnl=%s",
+                                p,
+                                t.base_position,
+                                t.avg_cost,
+                                t.realized_pnl,
+                            )
+                    if not self.config.dry_run:
+                        self._reconcile_with_api(restored_pairs[0])
+                return
+
+            # Backward-compat: single-position save format used with multi-position
+            # mode.  Migrate the lone entry into multi_manager so it is picked up
+            # by active_positions on the next cycle.
+            portfolio = state.get("portfolio")
+            if portfolio is None:
+                return
+            saved_pos = float((portfolio.get("base_position") or 0))
+            if saved_pos <= 0:
+                self.persistence.clear()
+                return
+            primary_pair = str(pair) if pair else self.config.pair
+            self.multi_manager.restore_from_state(
+                {primary_pair: portfolio},  # type: ignore[arg-type]
+                pool_cash,
+            )
+            self.restored_pair = primary_pair
+            t = self.multi_manager.get_tracker(primary_pair)
+            logger.info(
+                "🔄 Resumed state (compat): pair=%s  pos=%.8f  avg_cost=%s  pnl=%s",
+                primary_pair,
+                t.base_position if t else 0,
+                t.avg_cost if t else 0,
+                t.realized_pnl if t else 0,
+            )
+            if not self.config.dry_run:
+                self._reconcile_with_api(primary_pair)
+            return
+
+        # ── Single-position restore path (original behaviour) ─────────────────
         portfolio = state.get("portfolio")
         if portfolio is None:
             return
@@ -341,15 +411,27 @@ class Trader:
             )
 
     def _save_state(self, pair: str) -> None:
-        """Persist the current PortfolioTracker state to disk (fire-and-forget)."""
+        """Persist the current PortfolioTracker state to disk (fire-and-forget).
+
+        In multi-position mode all active per-pair trackers are written to a
+        ``multi_positions`` dict so that :meth:`_try_restore_state` can restore
+        every open position on the next startup, not just the most recently
+        traded one.
+        """
         try:
-            self.persistence.save(
-                {
-                    "portfolio": self.tracker.to_state(),
-                    "pair": pair,
-                    "dry_run": self.config.dry_run,
+            payload: dict = {
+                "portfolio": self.tracker.to_state(),
+                "pair": pair,
+                "dry_run": self.config.dry_run,
+            }
+            if self.multi_manager is not None:
+                payload["multi_positions"] = {
+                    p: t.to_state()
+                    for p, t in self.multi_manager._trackers.items()
+                    if t.base_position > 0
                 }
-            )
+                payload["multi_cash"] = self.multi_manager.cash
+            self.persistence.save(payload)
         except Exception as exc:
             logger.warning("Failed to save state: %s", exc)
 
