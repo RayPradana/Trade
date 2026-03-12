@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from statistics import mean
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -543,3 +543,167 @@ class PortfolioTracker:
 
     def is_strategy_disabled(self, strategy: str) -> bool:
         return strategy in self._disabled_strategies
+
+
+class MultiPositionManager:
+    """Manages multiple concurrent trading positions across different pairs.
+
+    Capital model
+    -------------
+    A shared cash pool is maintained.  When a new position is opened, a slice
+    of the remaining cash is allocated to a fresh :class:`PortfolioTracker`;
+    when the position is closed the net proceeds (original slice + realised
+    PnL) flow back into the shared pool.
+
+    This allows the bot to run up to *max_positions* trades in parallel
+    across different pairs while keeping aggregate risk controls in one place.
+    """
+
+    def __init__(
+        self,
+        initial_capital: float,
+        max_positions: int,
+        target_profit_pct: float,
+        max_loss_pct: float,
+    ) -> None:
+        self.initial_capital = initial_capital
+        self.max_positions = max(1, max_positions)
+        # Unallocated cash available for new positions.
+        self.cash: float = initial_capital
+        self._target_profit_pct = target_profit_pct
+        self._max_loss_pct = max_loss_pct
+        # per-pair sub-trackers; key = lowercase pair string
+        self._trackers: Dict[str, PortfolioTracker] = {}
+        # Cumulative realised PnL from *fully closed* positions (returned to pool).
+        self._closed_pnl: float = 0.0
+
+    # ── Position lifecycle ──────────────────────────────────────────────────
+
+    def get_tracker(self, pair: str) -> Optional[PortfolioTracker]:
+        """Return the :class:`PortfolioTracker` for *pair*, or ``None``."""
+        return self._trackers.get(pair)
+
+    def has_position(self, pair: str) -> bool:
+        """``True`` when *pair* has a non-zero open position."""
+        t = self._trackers.get(pair)
+        return t is not None and t.base_position > 0
+
+    def position_count(self) -> int:
+        """Number of pairs with a non-zero open position."""
+        return sum(1 for t in self._trackers.values() if t.base_position > 0)
+
+    def can_open_position(self) -> bool:
+        """``True`` when a new position can be opened (below *max_positions* and cash > 0)."""
+        return self.position_count() < self.max_positions and self.cash > 0
+
+    @property
+    def active_positions(self) -> Dict[str, PortfolioTracker]:
+        """``{pair: tracker}`` for all pairs currently holding a non-zero position."""
+        return {p: t for p, t in self._trackers.items() if t.base_position > 0}
+
+    def allocate_capital(self, pair: str) -> PortfolioTracker:
+        """Allocate a capital slice from the cash pool and create a tracker for *pair*.
+
+        The slice is computed as ``cash / remaining_open_slots`` so that all
+        *max_positions* slots would be filled evenly if taken in sequence.
+        If a tracker already exists for *pair* it is returned unchanged (DCA /
+        add-to-position path).
+
+        :raises ValueError: When *max_positions* is already reached and *pair*
+            has no existing tracker.
+        """
+        existing = self._trackers.get(pair)
+        if existing is not None:
+            return existing
+
+        if self.position_count() >= self.max_positions:
+            raise ValueError(
+                f"max_positions ({self.max_positions}) already reached; "
+                f"cannot open new position for {pair}"
+            )
+
+        # Use total allocated tracker count (including pre-buy placeholders) to
+        # compute remaining slots fairly — prevents over-allocating capital when
+        # allocate_capital() is called before base_position > 0.
+        remaining_slots = max(1, self.max_positions - len(self._trackers))
+        capital = min(self.cash, self.cash / remaining_slots)
+        capital = max(0.0, capital)
+        self.cash -= capital
+
+        tracker = PortfolioTracker(
+            initial_capital=capital,
+            target_profit_pct=self._target_profit_pct,
+            max_loss_pct=self._max_loss_pct,
+        )
+        self._trackers[pair] = tracker
+        return tracker
+
+    def return_position_cash(self, pair: str) -> None:
+        """Return the closed position's cash to the shared pool.
+
+        Removes the tracker for *pair* and adds its remaining cash (capital
+        slice + realised PnL) back to ``self.cash``.  Safe to call when the
+        tracker does not exist.
+        """
+        tracker = self._trackers.pop(pair, None)
+        if tracker is None:
+            return
+        # tracker.cash already includes original capital slice + realised PnL
+        # (record_trade credits the cash account on sells).
+        self.cash += tracker.cash
+        self._closed_pnl += tracker.realized_pnl
+
+    # ── Aggregate statistics ────────────────────────────────────────────────
+
+    def total_realized_pnl(self) -> float:
+        """Sum of realised PnL across closed positions and still-open trackers."""
+        open_pnl = sum(t.realized_pnl for t in self._trackers.values())
+        return self._closed_pnl + open_pnl
+
+    def total_equity(self, prices: Dict[str, float]) -> float:
+        """Total portfolio equity given current *prices* for each held pair.
+
+        Includes the unallocated cash pool and the mark-to-market value of
+        every open sub-position.
+        """
+        total = self.cash
+        for pair, tracker in self._trackers.items():
+            mark = prices.get(pair) or tracker.avg_cost or 0.0
+            total += tracker.cash + tracker.base_position * mark
+        return total
+
+    def capital_per_new_position(self) -> float:
+        """Suggested IDR allocation for the *next* new position.
+
+        Divides the remaining unallocated cash evenly among all still-available
+        slots so that each subsequent position gets a proportional share.
+        """
+        remaining_slots = max(1, self.max_positions - self.position_count())
+        return self.cash / remaining_slots
+
+    def as_dict(self, prices: Dict[str, float]) -> Dict[str, object]:
+        """Serialisable summary for logging and persistence."""
+        return {
+            "cash": self.cash,
+            "equity": self.total_equity(prices),
+            "realized_pnl": self.total_realized_pnl(),
+            "position_count": self.position_count(),
+            "max_positions": self.max_positions,
+            "positions": {
+                p: {
+                    "base_position": t.base_position,
+                    "avg_cost": t.avg_cost,
+                    "cash": t.cash,
+                    "realized_pnl": t.realized_pnl,
+                }
+                for p, t in self._trackers.items()
+            },
+        }
+
+    def positions_summary(self) -> List[Tuple[str, float, float, float]]:
+        """Return ``[(pair, base_position, avg_cost, realized_pnl), …]`` for all open positions."""
+        return [
+            (p, t.base_position, t.avg_cost, t.realized_pnl)
+            for p, t in self._trackers.items()
+            if t.base_position > 0
+        ]

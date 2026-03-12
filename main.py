@@ -664,15 +664,18 @@ def main() -> None:
 
         try:
             # ── Position monitoring ──────────────────────────────────────────
-            # When the bot is already holding a position (from this run or
-            # restored via auto-resume) analyse that pair first.  Decide to
-            # exit (sell) or stay in the trade before scanning new pairs.
-            if trader.tracker.base_position > 0:
-                held_snapshot = trader.analyze_market(pair)
+            # When the bot is holding one or more positions (from this run or
+            # restored via auto-resume) analyse each held pair first.
+            # In multi-position mode all active pairs are checked in sequence;
+            # in single-position mode this iterates over at most one pair.
+            _active = list(trader.active_positions.items())
+            _still_holding = False
+            for held_pair, held_tracker in _active:
+                held_snapshot = trader.analyze_market(held_pair)
                 held_price = held_snapshot["price"]
 
                 if config.trailing_stop_pct > 0:
-                    trader.tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
+                    held_tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
 
                 # Update the trailing TP floor on every tick while the
                 # position is open.  Activating from the first cycle (not
@@ -681,73 +684,62 @@ def main() -> None:
                 # price retraces more than trailing_tp_pct from its peak,
                 # regardless of whether the fixed profit target was reached.
                 if config.trailing_tp_pct > 0:
-                    trader.tracker.activate_trailing_tp(held_price, config.trailing_tp_pct)
+                    held_tracker.activate_trailing_tp(held_price, config.trailing_tp_pct)
 
-                stop_reason = trader.tracker.stop_reason(held_price)
+                stop_reason = held_tracker.stop_reason(held_price)
                 held_decision = held_snapshot["decision"]
 
-                # ── Momentum exit (adaptive early exit) ─────────────────────
-                # Exit BEFORE the TP target when momentum weakens (imbalance
-                # drops) while the position is still profitable.  This prevents
-                # the bot from stubbornly waiting for a fixed target while the
-                # market turns bearish.
+                # ── Momentum exit (adaptive early exit) ──────────────────
                 if stop_reason is None and trader.check_momentum_exit(held_snapshot):
                     stop_reason = "momentum_exit"
 
-                # ── Partial take-profit check (level 1) ──────────────────────
-                # When PARTIAL_TP_FRACTION is set and price has reached the TP
-                # level for the first time, sell a fraction and let the rest run.
+                # ── Partial take-profit check (level 1) ───────────────────
                 if (
                     config.partial_tp_fraction > 0
-                    and not trader.tracker.partial_tp_taken
+                    and not held_tracker.partial_tp_taken
                     and held_decision.take_profit is not None
                     and held_price >= held_decision.take_profit
                 ):
-                    # Auto-shift TP down when a sell wall blocks the target
                     whale = held_snapshot.get("whale")
                     adjusted_tp = held_decision.take_profit
                     if whale and whale.detected and whale.side == "ask":
-                        # Sell wall at TP → take partial profit at current price
-                        adjusted_tp = held_price * 0.999  # slight discount to ensure fill
+                        adjusted_tp = held_price * 0.999
                         logging.info(
                             "🐋 Sell wall at TP — adjusting partial-TP target to %.2f",
                             adjusted_tp,
                         )
                     if held_price >= adjusted_tp:
                         ptp_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp_fraction)
-                        portfolio = trader.tracker.as_dict(held_price)
+                        portfolio = held_tracker.as_dict(held_price)
                         logging.info(
                             "🎯 PARTIAL-TP  %s%s%s  %.0f%% @ Rp %s",
-                            _BOLD, pair, _RESET,
+                            _BOLD, held_pair, _RESET,
                             config.partial_tp_fraction * 100,
                             f"{held_price:15,.2f}",
                         )
                         _log_portfolio(portfolio, config.initial_capital)
                         _notify(
                             config,
-                            f"🎯 PARTIAL-TP {pair} @ Rp {held_price:,.0f}\n"
+                            f"🎯 PARTIAL-TP {held_pair} @ Rp {held_price:,.0f}\n"
                             f"Fraction: {config.partial_tp_fraction:.0%}\n"
                             f"Amount: {ptp_outcome.get('amount', 0):.8f}\n"
                             f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                         )
 
-                # ── Partial take-profit check (level 2) ──────────────────────
-                # When PARTIAL_TP2_FRACTION is set and price has risen by
-                # PARTIAL_TP2_TARGET_PCT above the entry price, sell a 2nd
-                # fraction and let the rest continue running.
+                # ── Partial take-profit check (level 2) ───────────────────
                 if (
                     config.partial_tp2_fraction > 0
-                    and not trader.tracker.partial_tp2_taken
-                    and trader.tracker.avg_cost > 0
+                    and not held_tracker.partial_tp2_taken
+                    and held_tracker.avg_cost > 0
                     and config.partial_tp2_target_pct > 0
-                    and held_price >= trader.tracker.avg_cost * (1 + config.partial_tp2_target_pct)
+                    and held_price >= held_tracker.avg_cost * (1 + config.partial_tp2_target_pct)
                 ):
                     ptp2_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp2_fraction)
-                    trader.tracker.partial_tp2_taken = True
-                    portfolio = trader.tracker.as_dict(held_price)
+                    held_tracker.partial_tp2_taken = True
+                    portfolio = held_tracker.as_dict(held_price)
                     logging.info(
                         "🎯 PARTIAL-TP2  %s%s%s  %.0f%% @ Rp %s  (+%.1f%%)",
-                        _BOLD, pair, _RESET,
+                        _BOLD, held_pair, _RESET,
                         config.partial_tp2_fraction * 100,
                         f"{held_price:15,.2f}",
                         config.partial_tp2_target_pct * 100,
@@ -755,29 +747,26 @@ def main() -> None:
                     _log_portfolio(portfolio, config.initial_capital)
                     _notify(
                         config,
-                        f"🎯 PARTIAL-TP2 {pair} @ Rp {held_price:,.0f}\n"
+                        f"🎯 PARTIAL-TP2 {held_pair} @ Rp {held_price:,.0f}\n"
                         f"Fraction: {config.partial_tp2_fraction:.0%}\n"
                         f"Amount: {ptp2_outcome.get('amount', 0):.8f}\n"
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
 
-                # ── Partial take-profit check (level 3) ──────────────────────
-                # When PARTIAL_TP3_FRACTION is set and price has risen by
-                # PARTIAL_TP3_TARGET_PCT above the entry price, sell a 3rd
-                # fraction and let the remainder run.
+                # ── Partial take-profit check (level 3) ───────────────────
                 if (
                     config.partial_tp3_fraction > 0
-                    and not trader.tracker.partial_tp3_taken
-                    and trader.tracker.avg_cost > 0
+                    and not held_tracker.partial_tp3_taken
+                    and held_tracker.avg_cost > 0
                     and config.partial_tp3_target_pct > 0
-                    and held_price >= trader.tracker.avg_cost * (1 + config.partial_tp3_target_pct)
+                    and held_price >= held_tracker.avg_cost * (1 + config.partial_tp3_target_pct)
                 ):
                     ptp3_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp3_fraction)
-                    trader.tracker.partial_tp3_taken = True
-                    portfolio = trader.tracker.as_dict(held_price)
+                    held_tracker.partial_tp3_taken = True
+                    portfolio = held_tracker.as_dict(held_price)
                     logging.info(
                         "🎯 PARTIAL-TP3  %s%s%s  %.0f%% @ Rp %s  (+%.1f%%)",
-                        _BOLD, pair, _RESET,
+                        _BOLD, held_pair, _RESET,
                         config.partial_tp3_fraction * 100,
                         f"{held_price:15,.2f}",
                         config.partial_tp3_target_pct * 100,
@@ -785,33 +774,29 @@ def main() -> None:
                     _log_portfolio(portfolio, config.initial_capital)
                     _notify(
                         config,
-                        f"🎯 PARTIAL-TP3 {pair} @ Rp {held_price:,.0f}\n"
+                        f"🎯 PARTIAL-TP3 {held_pair} @ Rp {held_price:,.0f}\n"
                         f"Fraction: {config.partial_tp3_fraction:.0%}\n"
                         f"Amount: {ptp3_outcome.get('amount', 0):.8f}\n"
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
 
-                # Exit if a hard stop fired or the strategy says sell.
-                # For target_profit_reached: give dynamic TP a chance to override.
+                # ── Dynamic TP override ────────────────────────────────────
                 if stop_reason == "target_profit_reached":
                     dynamic_reason = trader.evaluate_dynamic_tp(held_snapshot)
                     if dynamic_reason is None:
-                        # Dynamic TP says hold — log and continue monitoring
-                        trailing_tp_floor = trader.tracker.trailing_tp_stop
+                        trailing_tp_floor = held_tracker.trailing_tp_stop
                         logging.info(
                             "🚀 %sDYNAMIC-TP%s  %s%s%s  · holding past TP%s",
                             _BOLD, _RESET,
-                            _BOLD, pair, _RESET,
+                            _BOLD, held_pair, _RESET,
                             f"  trailing_floor=Rp {trailing_tp_floor:,.2f}" if trailing_tp_floor else "",
                         )
-                        portfolio = trader.tracker.as_dict(held_price)
+                        portfolio = held_tracker.as_dict(held_price)
                         _log_portfolio(portfolio, config.initial_capital)
                         consecutive_errors = 0
-                        if config.run_once:
-                            break
-                        time.sleep(config.position_check_interval_seconds)
-                        continue
-                    stop_reason = dynamic_reason  # use the resolved reason for exit
+                        _still_holding = True
+                        continue  # next held pair
+                    stop_reason = dynamic_reason
 
                 should_exit = stop_reason is not None or held_decision.action == "sell"
 
@@ -820,11 +805,11 @@ def main() -> None:
                     logging.info(
                         "📤 %sEXIT%s  %s%s%s  ·  %s",
                         _BOLD, _RESET,
-                        _BOLD, pair, _RESET,
+                        _BOLD, held_pair, _RESET,
                         exit_reason,
                     )
                     force_outcome = trader.force_sell(held_snapshot)
-                    portfolio = trader.tracker.as_dict(held_price)
+                    portfolio = held_tracker.as_dict(held_price)
                     logging.info(
                         "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s",
                         _DIM, _RESET,
@@ -834,44 +819,56 @@ def main() -> None:
                     _log_portfolio(portfolio, config.initial_capital)
                     _notify(
                         config,
-                        f"📤 EXIT {pair} @ Rp {held_price:,.0f}\n"
+                        f"📤 EXIT {held_pair} @ Rp {held_price:,.0f}\n"
                         f"Reason: {exit_reason}\n"
                         f"Amount: {force_outcome.get('amount', 0):.8f}\n"
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
                     consecutive_errors = 0
-                    # single-trade mode: one complete cycle (buy → sell) is enough
                     if config.trade_mode == "single" and _entered_position:
                         logging.info("✅ %sSingle-trade cycle complete — stopping.%s", _BOLD, _RESET)
                         break
                     if config.run_once:
                         break
-                    logging.info(_separator())
-                    time.sleep(trader._effective_interval(held_snapshot))
-                    continue  # scan for next opportunity
+                else:
+                    _still_holding = True
+                    portfolio = held_tracker.as_dict(held_price)
+                    _log_holding(held_pair, held_price, portfolio, config.initial_capital)
+                    consecutive_errors = 0
 
-                # Still holding – use faster polling interval
-                portfolio = trader.tracker.as_dict(held_price)
-                _log_holding(pair, held_price, portfolio, config.initial_capital)
-                consecutive_errors = 0
+            # After monitoring all held positions:
+            # • Single-position mode: if still holding, sleep and skip scan.
+            # • Multi-position mode: if still at capacity, sleep; otherwise fall
+            #   through to scan for new opportunities.
+            if _still_holding:
+                if not config.multi_position_enabled or trader.at_max_positions():
+                    if config.run_once:
+                        break
+                    time.sleep(config.position_check_interval_seconds)
+                    continue
+                # Multi-position with free slots: fall through to scan below.
+
+            # ── Scan all pairs and choose the best opportunity ───────────────
+            if trader.at_max_positions():
+                # All position slots are full; wait before next cycle.
                 if config.run_once:
                     break
                 time.sleep(config.position_check_interval_seconds)
                 continue
-
-            # ── Scan all pairs and choose the best opportunity ───────────────
             pair, snapshot = trader.scan_and_choose()
             _log_signal(snapshot)
             outcome = trader.maybe_execute(snapshot)
             _log_outcome(outcome)
             # Immediately compute trailing stops after a buy so the portfolio
             # display shows trail/trail-TP values from the very first cycle.
-            if outcome.get("action") == "buy" and trader.tracker.base_position > 0:
-                if config.trailing_stop_pct > 0:
-                    trader.tracker.update_trailing_stop(snapshot["price"], config.trailing_stop_pct)
-                if config.trailing_tp_pct > 0:
-                    trader.tracker.activate_trailing_tp(snapshot["price"], config.trailing_tp_pct)
-            portfolio = trader.tracker.as_dict(snapshot["price"])
+            if outcome.get("action") == "buy":
+                _bought_tracker = trader._active_tracker(snapshot["pair"])
+                if _bought_tracker.base_position > 0:
+                    if config.trailing_stop_pct > 0:
+                        _bought_tracker.update_trailing_stop(snapshot["price"], config.trailing_stop_pct)
+                    if config.trailing_tp_pct > 0:
+                        _bought_tracker.activate_trailing_tp(snapshot["price"], config.trailing_tp_pct)
+            portfolio = trader._active_tracker(snapshot["pair"]).as_dict(snapshot["price"])
             _log_portfolio(portfolio, config.initial_capital)
 
             # Telegram notification for actionable outcomes
@@ -891,7 +888,7 @@ def main() -> None:
             scan_cycles += 1
 
             # Mark that we've entered a position (for single-trade mode)
-            if outcome.get("action") == "buy" and trader.tracker.base_position > 0:
+            if outcome.get("action") == "buy" and trader._active_tracker(snapshot["pair"]).base_position > 0:
                 _entered_position = True
 
             # ── Stop condition: liquidate remaining position and rotate ───────
@@ -900,7 +897,8 @@ def main() -> None:
                     "🛑 %sSTOP%s  %s  — liquidating and rotating …",
                     _BOLD, _RESET, outcome.get("reason", ""),
                 )
-                if trader.tracker.base_position > 0:
+                _stop_pair = snapshot["pair"]
+                if trader._active_tracker(_stop_pair).base_position > 0:
                     force_outcome = trader.force_sell(snapshot)
                     logging.info(
                         "   📤 Force-sold : %s%.8f%s coin  ·  Rp %s",
@@ -908,7 +906,7 @@ def main() -> None:
                         f"{force_outcome.get('price', 0):15,.2f}",
                     )
                 # Re-compute portfolio after any liquidation
-                portfolio = trader.tracker.as_dict(snapshot["price"])
+                portfolio = trader._active_tracker(_stop_pair).as_dict(snapshot["price"])
                 logging.info(
                     "   📊 %sRotation%s : pnl=%s  equity=Rp %s  "
                     "trades=%d  win=%.0f%%",

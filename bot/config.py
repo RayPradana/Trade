@@ -377,6 +377,22 @@ class BotConfig:
     # 0 = never refresh (one-time fetch on startup).
     pair_min_order_cache_enabled: bool = True
     pair_min_order_refresh_cycles: int = 0  # 0 = fetch once, never refresh
+    # ── Private API response caches ───────────────────────────────────────────
+    # TTL-based in-memory caches for expensive private REST endpoints that are
+    # polled repeatedly during normal operation.  Caching reduces unnecessary
+    # API requests and protects against Indodax rate limits (HTTP 429).
+    #
+    # account_info_cache_ttl:
+    #   Seconds to cache the response of ``getInfo`` (balance / account details).
+    #   The balance is refreshed at most once per this interval; stale data is
+    #   served for any call within the TTL window.  0 = disabled (always live).
+    #   Default: 30 seconds.
+    #
+    # open_orders_cache_ttl:
+    #   Seconds to cache the response of ``openOrders`` per pair.
+    #   0 = disabled (always live).  Default: 15 seconds.
+    account_info_cache_ttl: float = 30.0
+    open_orders_cache_ttl: float = 15.0
     # ── Time-based exit (anti-stagnation) ─────────────────────────────────────
     # Force-sell a position that has been open longer than this many seconds
     # without reaching the profit threshold below.  Prevents capital from being
@@ -395,6 +411,20 @@ class BotConfig:
     #   Default: 0.01.
     max_hold_seconds: float = 0.0
     max_hold_profit_pct: float = 0.01
+    # ── Multi-position / parallel trading ─────────────────────────────────────
+    # Allow the bot to hold up to *multi_position_max* open positions across
+    # different pairs simultaneously.  Capital is split evenly among all open
+    # slots; each position manages its own PortfolioTracker.
+    #
+    # multi_position_enabled:
+    #   When True the bot can open up to multi_position_max trades in parallel.
+    #   False = classic single-position mode (default).
+    #
+    # multi_position_max:
+    #   Maximum number of simultaneous open positions.  E.g. 3 = at most three
+    #   different pairs can be held at the same time.  Default: 3.
+    multi_position_enabled: bool = False
+    multi_position_max: int = 3
     # ── Orderbook imbalance position-size boost ────────────────────────────────
     # Multiply the computed position size by ob_imbalance_size_multiplier when
     # the order-book imbalance exceeds ob_imbalance_boost_threshold.  This lets
@@ -621,6 +651,8 @@ class BotConfig:
             rug_pull_min_trades_24h=int(os.getenv("RUG_PULL_MIN_TRADES_24H", "0")),
             pair_min_order_cache_enabled=os.getenv("PAIR_MIN_ORDER_CACHE_ENABLED", "true").lower() in {"1", "true", "yes"},
             pair_min_order_refresh_cycles=int(os.getenv("PAIR_MIN_ORDER_REFRESH_CYCLES", "0")),
+            account_info_cache_ttl=float(os.getenv("ACCOUNT_INFO_CACHE_TTL", "30")),
+            open_orders_cache_ttl=float(os.getenv("OPEN_ORDERS_CACHE_TTL", "15")),
             confidence_position_sizing_enabled=os.getenv("CONFIDENCE_POSITION_SIZING_ENABLED", "false").lower() in {"1", "true", "yes"},
             confidence_tier_skip=float(os.getenv("CONFIDENCE_TIER_SKIP", "0.40")),
             confidence_tier_low=float(os.getenv("CONFIDENCE_TIER_LOW", "0.50")),
@@ -632,6 +664,8 @@ class BotConfig:
             confidence_tier_max_pct=float(os.getenv("CONFIDENCE_TIER_MAX_PCT", "0.25")),
             max_hold_seconds=float(os.getenv("MAX_HOLD_SECONDS", "0")),
             max_hold_profit_pct=float(os.getenv("MAX_HOLD_PROFIT_PCT", "0.01")),
+            multi_position_enabled=os.getenv("MULTI_POSITION_ENABLED", "false").lower() in {"1", "true", "yes"},
+            multi_position_max=int(os.getenv("MULTI_POSITION_MAX", "3")),
             ob_imbalance_boost_threshold=float(os.getenv("OB_IMBALANCE_BOOST_THRESHOLD", "0")),
             ob_imbalance_size_multiplier=float(os.getenv("OB_IMBALANCE_SIZE_MULTIPLIER", "2.0")),
             ob_imbalance_min_entry=float(os.getenv("OB_IMBALANCE_MIN_ENTRY", "0")),
@@ -832,10 +866,16 @@ class BotConfig:
             raise ValueError("RUG_PULL_MIN_TRADES_24H must be non-negative")
         if self.pair_min_order_refresh_cycles < 0:
             raise ValueError("PAIR_MIN_ORDER_REFRESH_CYCLES must be non-negative")
+        if self.account_info_cache_ttl < 0:
+            raise ValueError("ACCOUNT_INFO_CACHE_TTL must be non-negative")
+        if self.open_orders_cache_ttl < 0:
+            raise ValueError("OPEN_ORDERS_CACHE_TTL must be non-negative")
         if self.max_hold_seconds < 0:
             raise ValueError("MAX_HOLD_SECONDS must be non-negative")
         if self.max_hold_profit_pct < 0:
             raise ValueError("MAX_HOLD_PROFIT_PCT must be non-negative")
+        if self.multi_position_max < 1:
+            raise ValueError("MULTI_POSITION_MAX must be >= 1")
         if self.ob_imbalance_boost_threshold < 0 or self.ob_imbalance_boost_threshold > 1:
             raise ValueError("OB_IMBALANCE_BOOST_THRESHOLD must be in [0, 1]")
         if self.ob_imbalance_size_multiplier <= 0:

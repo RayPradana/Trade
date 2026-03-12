@@ -33,6 +33,24 @@ class MainErrorHandlingTests(unittest.TestCase):
                     max_loss_pct=0.1,
                 )
 
+            @property
+            def active_positions(self):
+                if self.tracker.base_position > 0:
+                    return {"btc_idr": self.tracker}
+                return {}
+
+            def at_max_positions(self):
+                return self.tracker.base_position > 0
+
+            def _active_tracker(self, pair):
+                return self.tracker
+
+            def check_momentum_exit(self, snapshot):
+                return False
+
+            def evaluate_dynamic_tp(self, snapshot):
+                return "target_profit_reached"
+
             def scan_and_choose(self):
                 if scan_raises is not None:
                     raise scan_raises
@@ -95,6 +113,22 @@ class MainErrorHandlingTests(unittest.TestCase):
                     max_loss_pct=0.1,
                 )
 
+            @property
+            def active_positions(self):
+                return {}
+
+            def at_max_positions(self):
+                return False
+
+            def _active_tracker(self, pair):
+                return self.tracker
+
+            def check_momentum_exit(self, snapshot):
+                return False
+
+            def evaluate_dynamic_tp(self, snapshot):
+                return "target_profit_reached"
+
             def scan_and_choose(self):
                 call_count["n"] += 1
                 if call_count["n"] > 1:
@@ -148,6 +182,24 @@ class MainErrorHandlingTests(unittest.TestCase):
                     max_loss_pct=0.1,
                 )
                 self.tracker.record_trade("buy", 100.0, 1.0)
+
+            @property
+            def active_positions(self):
+                if self.tracker.base_position > 0:
+                    return {"btc_idr": self.tracker}
+                return {}
+
+            def at_max_positions(self):
+                return self.tracker.base_position > 0
+
+            def _active_tracker(self, pair):
+                return self.tracker
+
+            def check_momentum_exit(self, snapshot):
+                return False
+
+            def evaluate_dynamic_tp(self, snapshot):
+                return "target_profit_reached"
 
             def analyze_market(self, pair=None):
                 return {
@@ -203,6 +255,24 @@ class MainErrorHandlingTests(unittest.TestCase):
                 )
                 # Pre-load an open position
                 self.tracker.record_trade("buy", 100.0, 1.0)
+
+            @property
+            def active_positions(self):
+                if self.tracker.base_position > 0:
+                    return {"btc_idr": self.tracker}
+                return {}
+
+            def at_max_positions(self):
+                return self.tracker.base_position > 0
+
+            def _active_tracker(self, pair):
+                return self.tracker
+
+            def check_momentum_exit(self, snapshot):
+                return False
+
+            def evaluate_dynamic_tp(self, snapshot):
+                return "target_profit_reached"
 
             def analyze_market(self, pair=None):
                 return {

@@ -47,6 +47,47 @@ class IndodaxClient:
         #   values are dicts with "min_coin" (min base currency amount)
         #   and "min_idr" (min IDR value).
         self._pair_min_order: Dict[str, Dict[str, float]] = {}
+        # ── Private API response caches ───────────────────────────────────────
+        # TTL-based in-memory caches for expensive private REST endpoints.
+        # Each entry is (cached_value, expiry_timestamp).
+        self._account_info_cache_ttl: float = 30.0
+        self._account_info_cached: Optional[Dict[str, Any]] = None
+        self._account_info_expires: float = 0.0
+        self._open_orders_cache_ttl: float = 15.0
+        # per-pair cache: {pair: (data, expiry)}
+        self._open_orders_cache: Dict[str, tuple] = {}
+
+    def configure_caches(
+        self,
+        account_info_ttl: float = 30.0,
+        open_orders_ttl: float = 15.0,
+    ) -> None:
+        """Configure TTL (seconds) for private API response caches.
+
+        Call after construction to override the defaults.  Pass ``0`` to
+        disable a specific cache (always fetch live data).
+
+        :param account_info_ttl: TTL for :meth:`get_account_info` responses.
+        :param open_orders_ttl:  TTL for :meth:`open_orders` responses per pair.
+        """
+        self._account_info_cache_ttl = max(0.0, account_info_ttl)
+        self._open_orders_cache_ttl = max(0.0, open_orders_ttl)
+
+    def invalidate_account_info_cache(self) -> None:
+        """Force the next :meth:`get_account_info` call to fetch live data."""
+        self._account_info_expires = 0.0
+        self._account_info_cached = None
+
+    def invalidate_open_orders_cache(self, pair: Optional[str] = None) -> None:
+        """Force the next :meth:`open_orders` call to fetch live data.
+
+        :param pair: Invalidate only this pair's cache.  Pass ``None`` to
+                     invalidate all cached open-order responses.
+        """
+        if pair is None:
+            self._open_orders_cache.clear()
+        else:
+            self._open_orders_cache.pop(pair, None)
 
     # -------------------- public API -------------------- #
     def get_pairs(self) -> List[Dict[str, Any]]:
@@ -142,9 +183,42 @@ class IndodaxClient:
 
     # -------------------- private API -------------------- #
     def get_account_info(self) -> Dict[str, Any]:
+        """Return account info, using a TTL cache to reduce API requests.
+
+        The response is cached for :attr:`_account_info_cache_ttl` seconds.
+        Cache is bypassed when ``_account_info_cache_ttl <= 0``.
+        After an order is placed the cache should be invalidated via
+        :meth:`invalidate_account_info_cache` so the next balance check
+        reflects the updated state.
+        """
+        if self._account_info_cache_ttl > 0:
+            now = time.monotonic()
+            if self._account_info_cached is not None and now < self._account_info_expires:
+                logger.debug("account_info cache hit (expires in %.1fs)", self._account_info_expires - now)
+                return self._account_info_cached
+            result = self._post_private("getInfo")
+            self._account_info_cached = result
+            self._account_info_expires = time.monotonic() + self._account_info_cache_ttl
+            return result
         return self._post_private("getInfo")
 
     def open_orders(self, pair: str) -> Dict[str, Any]:
+        """Return open orders for *pair*, using a per-pair TTL cache.
+
+        Cached for :attr:`_open_orders_cache_ttl` seconds per pair.
+        Bypass when ``_open_orders_cache_ttl <= 0``.
+        """
+        if self._open_orders_cache_ttl > 0:
+            now = time.monotonic()
+            cached = self._open_orders_cache.get(pair)
+            if cached is not None:
+                data, expiry = cached
+                if now < expiry:
+                    logger.debug("open_orders cache hit for %s (expires in %.1fs)", pair, expiry - now)
+                    return data
+            result = self._post_private("openOrders", {"pair": pair})
+            self._open_orders_cache[pair] = (result, time.monotonic() + self._open_orders_cache_ttl)
+            return result
         return self._post_private("openOrders", {"pair": pair})
 
     def trade_history(self, pair: str, count: int = 50) -> Dict[str, Any]:

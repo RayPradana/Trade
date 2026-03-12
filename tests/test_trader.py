@@ -3397,3 +3397,242 @@ class PartialTp2And3TrackingTest(unittest.TestCase):
         restored.load_state(state)
         self.assertTrue(restored.partial_tp2_taken)
         self.assertTrue(restored.partial_tp3_taken)
+
+
+class MultiPositionManagerTest(unittest.TestCase):
+    """Tests for MultiPositionManager in tracking.py."""
+
+    def _make_manager(self, capital=3_000_000.0, max_pos=3):
+        from bot.tracking import MultiPositionManager
+        return MultiPositionManager(
+            initial_capital=capital,
+            max_positions=max_pos,
+            target_profit_pct=0.2,
+            max_loss_pct=0.1,
+        )
+
+    def test_initial_state(self):
+        mgr = self._make_manager(3_000_000.0, 3)
+        self.assertEqual(mgr.cash, 3_000_000.0)
+        self.assertEqual(mgr.position_count(), 0)
+        self.assertTrue(mgr.can_open_position())
+
+    def test_allocate_capital_splits_cash_evenly(self):
+        mgr = self._make_manager(3_000_000.0, 3)
+        t1 = mgr.allocate_capital("btc_idr")
+        # First slot: 3M/3 = 1M
+        self.assertAlmostEqual(t1.cash, 1_000_000.0)
+        self.assertAlmostEqual(mgr.cash, 2_000_000.0)
+
+        t2 = mgr.allocate_capital("eth_idr")
+        # Second slot: 2M/2 = 1M
+        self.assertAlmostEqual(t2.cash, 1_000_000.0)
+        self.assertAlmostEqual(mgr.cash, 1_000_000.0)
+
+    def test_has_position_false_before_buy(self):
+        mgr = self._make_manager()
+        mgr.allocate_capital("btc_idr")
+        self.assertFalse(mgr.has_position("btc_idr"))
+
+    def test_has_position_true_after_buy(self):
+        mgr = self._make_manager()
+        t = mgr.allocate_capital("btc_idr")
+        t.record_trade("buy", 500_000.0, 1.0)
+        self.assertTrue(mgr.has_position("btc_idr"))
+
+    def test_at_max_positions(self):
+        mgr = self._make_manager(2_000_000.0, 2)
+        t1 = mgr.allocate_capital("btc_idr")
+        t1.record_trade("buy", 500_000.0, 1.0)
+        t2 = mgr.allocate_capital("eth_idr")
+        t2.record_trade("buy", 300_000.0, 1.0)
+        self.assertFalse(mgr.can_open_position())
+        self.assertEqual(mgr.position_count(), 2)
+
+    def test_return_position_cash_restores_pool(self):
+        mgr = self._make_manager(3_000_000.0, 3)
+        t = mgr.allocate_capital("btc_idr")
+        t.record_trade("buy", 500_000.0, 2.0)   # cost = 1M
+        t.record_trade("sell", 550_000.0, 2.0)  # proceeds = 1.1M (+0.1M profit)
+        mgr.return_position_cash("btc_idr")
+        # Pool receives tracker.cash = initial_slice + profit
+        self.assertAlmostEqual(mgr.cash, 3_000_000.0 + 100_000.0, delta=1.0)
+
+    def test_active_positions_only_returns_held(self):
+        mgr = self._make_manager()
+        t1 = mgr.allocate_capital("btc_idr")  # no buy recorded
+        t2 = mgr.allocate_capital("eth_idr")
+        t2.record_trade("buy", 300_000.0, 1.0)
+        active = mgr.active_positions
+        self.assertNotIn("btc_idr", active)
+        self.assertIn("eth_idr", active)
+
+    def test_duplicate_allocate_returns_existing_tracker(self):
+        mgr = self._make_manager()
+        t1 = mgr.allocate_capital("btc_idr")
+        t2 = mgr.allocate_capital("btc_idr")
+        self.assertIs(t1, t2)
+
+    def test_total_equity_sums_pool_and_positions(self):
+        mgr = self._make_manager(3_000_000.0, 3)
+        t = mgr.allocate_capital("btc_idr")
+        t.record_trade("buy", 1_000_000.0, 1.0)
+        # pool = 3M - 1M = 2M, tracker.cash = 0, position = 1 BTC at 1.2M
+        equity = mgr.total_equity({"btc_idr": 1_200_000.0})
+        self.assertAlmostEqual(equity, 2_000_000.0 + 1_200_000.0, delta=1.0)
+
+
+class MultiPositionTraderTest(unittest.TestCase):
+    """Tests for Trader multi-position routing via maybe_execute and force_sell."""
+
+    class _StubClient:
+        """Minimal stub that provides all methods called by maybe_execute."""
+
+        _pair_min_order: Dict[str, Any] = {}
+
+        def get_depth(self, pair: str, count: int = 5) -> Dict[str, Any]:
+            # Return empty depth so maybe_execute falls back to snapshot price,
+            # preventing slippage guards from triggering.
+            return {"buy": [], "sell": []}
+
+        def get_summaries(self) -> dict:
+            return {}
+
+        def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+            return {"min_coin": 0.0, "min_idr": 0.0}
+
+        def load_pair_min_orders(self) -> None:
+            pass
+
+    def _make_trader(self, max_pos=3):
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            multi_position_enabled=True,
+            multi_position_max=max_pos,
+            initial_capital=3_000_000.0,
+            min_order_idr=10_000.0,
+            pair_cooldown_seconds=0,
+            trailing_stop_pct=0.0,
+            trailing_tp_pct=0.0,
+        )
+        trader = Trader(config, client=self._StubClient())
+        return trader
+
+    def _buy_snapshot(self, pair="btc_idr", price=1_000_000.0, amount=1.0):
+        return {
+            "pair": pair,
+            "price": price,
+            "decision": StrategyDecision(
+                action="buy",
+                amount=amount,
+                confidence=0.9,
+                reason="test",
+                mode="test",
+                target_price=price,
+                stop_loss=None,
+                take_profit=None,
+            ),
+            "orderbook": None,
+            "volatility": None,
+            "indicators": None,
+            "trend": None,
+        }
+
+    def _sell_snapshot(self, pair="btc_idr", price=1_100_000.0, amount=1.0):
+        return {
+            "pair": pair,
+            "price": price,
+            "decision": StrategyDecision(
+                action="sell",
+                amount=amount,
+                confidence=0.9,
+                reason="test",
+                mode="test",
+                target_price=price,
+                stop_loss=None,
+                take_profit=None,
+            ),
+            "orderbook": None,
+            "volatility": None,
+            "indicators": None,
+            "trend": None,
+        }
+
+    def test_multi_position_enabled_creates_manager(self):
+        trader = self._make_trader()
+        self.assertIsNotNone(trader.multi_manager)
+
+    def test_buy_creates_per_pair_tracker(self):
+        trader = self._make_trader()
+        outcome = trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        self.assertIn(outcome["status"], ("simulated", "placed"))
+        self.assertTrue(trader.multi_manager.has_position("btc_idr"))
+
+    def test_two_buys_on_different_pairs(self):
+        trader = self._make_trader(max_pos=3)
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        trader.maybe_execute(self._buy_snapshot("eth_idr", 500_000.0, 1.0))
+        self.assertEqual(trader.multi_manager.position_count(), 2)
+
+    def test_max_positions_blocks_third_buy(self):
+        trader = self._make_trader(max_pos=2)
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        trader.maybe_execute(self._buy_snapshot("eth_idr", 500_000.0, 1.0))
+        outcome = trader.maybe_execute(self._buy_snapshot("xrp_idr", 100_000.0, 1.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("max_open_positions", outcome["reason"])
+
+    def test_at_max_positions_reflects_multi_manager(self):
+        trader = self._make_trader(max_pos=2)
+        self.assertFalse(trader.at_max_positions())
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        self.assertFalse(trader.at_max_positions())
+        trader.maybe_execute(self._buy_snapshot("eth_idr", 500_000.0, 1.0))
+        self.assertTrue(trader.at_max_positions())
+
+    def test_sell_returns_cash_to_pool(self):
+        trader = self._make_trader(max_pos=2)
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        initial_cash = trader.multi_manager.cash
+        trader.maybe_execute(self._sell_snapshot("btc_idr", 1_100_000.0, 1.0))
+        # Position should be closed; cash should increase
+        self.assertFalse(trader.multi_manager.has_position("btc_idr"))
+        self.assertGreater(trader.multi_manager.cash, initial_cash)
+
+    def test_force_sell_returns_cash_to_pool(self):
+        trader = self._make_trader(max_pos=2)
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        snap = self._sell_snapshot("btc_idr", 1_050_000.0, 1.0)
+        trader.force_sell(snap)
+        self.assertFalse(trader.multi_manager.has_position("btc_idr"))
+
+    def test_active_positions_reflects_holdings(self):
+        trader = self._make_trader(max_pos=3)
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        trader.maybe_execute(self._buy_snapshot("eth_idr", 500_000.0, 1.0))
+        active = trader.active_positions
+        self.assertIn("btc_idr", active)
+        self.assertIn("eth_idr", active)
+        self.assertEqual(len(active), 2)
+
+    def test_per_pair_trackers_are_independent(self):
+        trader = self._make_trader(max_pos=3)
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        trader.maybe_execute(self._buy_snapshot("eth_idr", 500_000.0, 2.0))
+        btc_tracker = trader.multi_manager.get_tracker("btc_idr")
+        eth_tracker = trader.multi_manager.get_tracker("eth_idr")
+        self.assertIsNot(btc_tracker, eth_tracker)
+        # avg_cost is filled at reference_price (top ask ≈ snapshot price)
+        self.assertGreater(btc_tracker.avg_cost, 0)
+        self.assertGreater(eth_tracker.avg_cost, 0)
+        self.assertNotAlmostEqual(btc_tracker.avg_cost, eth_tracker.avg_cost, delta=100_000)
+
+    def test_single_position_mode_unchanged(self):
+        """Ensure single-position mode behavior is unaffected."""
+        config = BotConfig(api_key=None, dry_run=True, initial_capital=1_000_000.0)
+        trader = Trader(config)
+        self.assertIsNone(trader.multi_manager)
+        trader.tracker.record_trade("buy", 500_000.0, 1.0)
+        self.assertEqual(len(trader.active_positions), 1)
+        self.assertTrue(trader.at_max_positions())

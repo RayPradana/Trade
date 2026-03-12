@@ -38,7 +38,7 @@ from .realtime import MultiPairFeed, RealtimeFeed
 from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, adaptive_max_positions, adaptive_risk_per_trade, make_trade_decision
-from .tracking import PortfolioTracker
+from .tracking import MultiPositionManager, PortfolioTracker
 from .journal import TradeJournal
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,13 @@ class Trader:
             order_min_interval=config.order_min_interval,
             enable_queue=config.order_queue_enabled,
         )
+        # Apply private API response cache TTLs from config (no-op for stub clients).
+        _configure_caches = getattr(self.client, "configure_caches", None)
+        if callable(_configure_caches):
+            _configure_caches(
+                account_info_ttl=config.account_info_cache_ttl,
+                open_orders_ttl=config.open_orders_cache_ttl,
+            )
         self._all_pairs: Optional[List[str]] = None
         self._scan_offset: int = 0  # rotating window index for pairs_per_cycle
         self._multi_feed: Optional[MultiPairFeed] = None
@@ -80,6 +87,15 @@ class Trader:
             target_profit_pct=config.target_profit_pct,
             max_loss_pct=config.max_loss_pct,
         )
+        # ── Multi-position manager ────────────────────────────────────────────
+        self.multi_manager: Optional[MultiPositionManager] = None
+        if config.multi_position_enabled:
+            self.multi_manager = MultiPositionManager(
+                initial_capital=config.initial_capital,
+                max_positions=config.multi_position_max,
+                target_profit_pct=config.target_profit_pct,
+                max_loss_pct=config.max_loss_pct,
+            )
         # ── Auto-resume: persistence and state recovery ──────────────────────
         self.persistence = StatePersistence(config.state_path)
         self.restored_pair: Optional[str] = None  # set when state is loaded from disk
@@ -108,6 +124,58 @@ class Trader:
         # Populated by _ensure_pair_min_order_cache().  Tracks how many scan
         # cycles have elapsed since the last cache refresh.
         self._pair_min_order_cache_cycles: int = 0
+
+    # ── Multi-position helpers ─────────────────────────────────────────────
+
+    def _active_tracker(self, pair: str) -> PortfolioTracker:
+        """Return the :class:`PortfolioTracker` that owns *pair*'s position.
+
+        In **single-position mode** (``multi_manager is None``) this always
+        returns ``self.tracker``.
+
+        In **multi-position mode** it returns the pair-specific sub-tracker
+        from :attr:`multi_manager` when one exists, otherwise returns a
+        lightweight empty tracker (``base_position=0``) so that position-based
+        guards (stop-loss, time-exit, etc.) do not fire on pairs that have not
+        been entered yet.
+        """
+        if self.multi_manager is not None:
+            t = self.multi_manager.get_tracker(pair)
+            if t is not None:
+                return t
+            # Return a zero-position placeholder so guards don't misfiring.
+            # Capital is allocated only when the BUY actually executes.
+            return PortfolioTracker(
+                initial_capital=0.0,
+                target_profit_pct=0.0,
+                max_loss_pct=0.0,
+            )
+        return self.tracker
+
+    @property
+    def active_positions(self) -> Dict[str, PortfolioTracker]:
+        """Return ``{pair: tracker}`` for all currently held positions.
+
+        In single-position mode returns the primary pair if held, otherwise
+        an empty dict.  In multi-position mode delegates to
+        :attr:`MultiPositionManager.active_positions`.
+        """
+        if self.multi_manager is not None:
+            return self.multi_manager.active_positions
+        if self.tracker.base_position > 0:
+            return {self.config.pair: self.tracker}
+        return {}
+
+    def at_max_positions(self) -> bool:
+        """``True`` when no additional positions can be opened.
+
+        In single-position mode this is ``True`` when one position is already
+        held (the classic "one trade at a time" behaviour).  In multi-position
+        mode it checks against :attr:`~MultiPositionManager.max_positions`.
+        """
+        if self.multi_manager is not None:
+            return not self.multi_manager.can_open_position()
+        return self.tracker.base_position > 0
 
     # ------------------------------------------------------------------
     # Auto-resume helpers
@@ -296,7 +364,13 @@ class Trader:
         """Save state if still in a position, or clear it if the position is closed."""
         if self.config.pair_cooldown_seconds > 0:
             self._pair_last_trade[pair] = time.time()
-        if self.tracker.base_position <= 0:
+        if self.multi_manager is not None:
+            # Multi-position: save while any position remains; clear when all closed.
+            if self.multi_manager.position_count() > 0:
+                self._save_state(pair)
+            else:
+                self._clear_state()
+        elif self.tracker.base_position <= 0:
             self._clear_state()
         else:
             self._save_state(pair)
@@ -1010,28 +1084,33 @@ class Trader:
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        _pair = snapshot["pair"]
         decision: StrategyDecision = snapshot["decision"]
         price = snapshot["price"]
+        # Route to the per-pair tracker in multi-position mode; otherwise use
+        # self.tracker (classic single-position behaviour).
+        _tracker = self._active_tracker(_pair)
 
         # Circuit breaker
         if self.config.circuit_breaker_max_errors > 0 and time.time() < self._circuit_breaker_until:
-            return {"status": "circuit_breaker", "reason": "circuit_breaker_active", "portfolio": self.tracker.as_dict(price)}
+            return {"status": "circuit_breaker", "reason": "circuit_breaker_active", "portfolio": _tracker.as_dict(price)}
 
         # Volatility cooldown
         if time.time() < self._volatility_cooldown_until:
-            return {"status": "volatility_cooldown", "reason": "volatility_cooldown_active", "portfolio": self.tracker.as_dict(price)}
+            return {"status": "volatility_cooldown", "reason": "volatility_cooldown_active", "portfolio": _tracker.as_dict(price)}
 
         # Update volatility cooldown state
         self._check_volatility_cooldown(price, snapshot["pair"])
 
         # Update trailing stop before checking stop conditions
         if self.config.trailing_stop_pct > 0:
-            self.tracker.update_trailing_stop(price, self.config.trailing_stop_pct)
+            _tracker.update_trailing_stop(price, self.config.trailing_stop_pct)
 
-        stop_reason = self.tracker.stop_reason(price)
+        # Stop conditions are only meaningful when a position is actually held.
+        stop_reason = _tracker.stop_reason(price) if _tracker.base_position > 0 else None
         if stop_reason:
-            logger.info("Stop triggered (%s) equity=%s", stop_reason, self.tracker.as_dict(price))
-            outcome = {"status": "stopped", "reason": stop_reason, "portfolio": self.tracker.as_dict(price)}
+            logger.info("Stop triggered (%s) equity=%s", stop_reason, _tracker.as_dict(price))
+            outcome = {"status": "stopped", "reason": stop_reason, "portfolio": _tracker.as_dict(price)}
             return outcome
 
         # ── Time-based exit (anti-stagnation for illiquid coins) ─────────────
@@ -1040,12 +1119,12 @@ class Trader:
         # prevents capital from being tied up in slow/illiquid pairs.
         if (
             self.config.max_hold_seconds > 0
-            and self.tracker.base_position > 0
-            and self.tracker.avg_cost > 0
+            and _tracker.base_position > 0
+            and _tracker.avg_cost > 0
         ):
-            hold_secs = self.tracker.position_hold_seconds
+            hold_secs = _tracker.position_hold_seconds
             if hold_secs >= self.config.max_hold_seconds:
-                unrealised_pct = (price - self.tracker.avg_cost) / self.tracker.avg_cost
+                unrealised_pct = (price - _tracker.avg_cost) / _tracker.avg_cost
                 if unrealised_pct < self.config.max_hold_profit_pct:
                     logger.info(
                         "Time-based exit: held %.0fs ≥ %.0fs, profit=%.2f%% < %.2f%% — force selling",
@@ -1064,7 +1143,7 @@ class Trader:
 
         # ── Daily loss cap ────────────────────────────────────────────────────
         if self.config.max_daily_loss_pct > 0 and decision.action == "buy":
-            daily_loss_pct = self.tracker.daily_loss_pct(price)
+            daily_loss_pct = _tracker.daily_loss_pct(price)
             if daily_loss_pct >= self.config.max_daily_loss_pct:
                 logger.warning(
                     "Daily loss cap reached: %.2f%% ≥ %.2f%% — skipping buy",
@@ -1074,13 +1153,13 @@ class Trader:
                 return {
                     "status": "skipped",
                     "reason": f"daily_loss_cap {daily_loss_pct:.2%} ≥ {self.config.max_daily_loss_pct:.2%}",
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Per-coin exposure cap ─────────────────────────────────────────────
         if self.config.max_exposure_per_coin_pct > 0 and decision.action == "buy":
-            current_equity = self.tracker.snapshot(price).equity
-            current_exposure = self.tracker.base_position * price
+            current_equity = _tracker.snapshot(price).equity
+            current_exposure = _tracker.base_position * price
             exposure_pct = current_exposure / current_equity if current_equity > 0 else 0.0
             if exposure_pct >= self.config.max_exposure_per_coin_pct:
                 logger.info(
@@ -1094,13 +1173,13 @@ class Trader:
                     "reason": (
                         f"exposure_cap {exposure_pct:.2%} ≥ {self.config.max_exposure_per_coin_pct:.2%}"
                     ),
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Portfolio-wide risk cap ───────────────────────────────────────────
         if self.config.max_portfolio_risk_pct > 0 and decision.action == "buy":
-            current_equity = self.tracker.snapshot(price).equity
-            total_position_value = self.tracker.base_position * price
+            current_equity = _tracker.snapshot(price).equity
+            total_position_value = _tracker.base_position * price
             portfolio_risk_pct = total_position_value / current_equity if current_equity > 0 else 0.0
             if portfolio_risk_pct >= self.config.max_portfolio_risk_pct:
                 logger.info(
@@ -1111,12 +1190,12 @@ class Trader:
                 return {
                     "status": "skipped",
                     "reason": f"portfolio_risk_cap {portfolio_risk_pct:.2%} ≥ {self.config.max_portfolio_risk_pct:.2%}",
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Profit-buffer drawdown guard ──────────────────────────────────────
         if self.config.profit_buffer_drawdown_pct > 0 and decision.action == "buy":
-            pb_drawdown = self.tracker.profit_buffer_drawdown_pct()
+            pb_drawdown = _tracker.profit_buffer_drawdown_pct()
             if pb_drawdown >= self.config.profit_buffer_drawdown_pct:
                 logger.warning(
                     "Profit-buffer drawdown guard: buffer dropped %.1f%% from peak (limit=%.1f%%) — skipping buy",
@@ -1126,86 +1205,97 @@ class Trader:
                 return {
                     "status": "skipped",
                     "reason": f"profit_buffer_drawdown {pb_drawdown:.2%} ≥ {self.config.profit_buffer_drawdown_pct:.2%}",
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Re-entry cooldown / dip check ─────────────────────────────────────
         if decision.action == "buy" and (
             self.config.re_entry_cooldown_seconds > 0 or self.config.re_entry_dip_pct > 0
         ):
-            if not self.tracker.re_entry_allowed(
+            if not _tracker.re_entry_allowed(
                 price,
                 cooldown_seconds=self.config.re_entry_cooldown_seconds,
                 dip_pct=self.config.re_entry_dip_pct,
             ):
                 logger.info(
                     "Re-entry blocked: cooldown or dip condition not met (last_sell=%.2f, now=%.2f)",
-                    self.tracker.last_sell_price,
+                    _tracker.last_sell_price,
                     price,
                 )
                 return {
                     "status": "skipped",
                     "reason": "re_entry_condition_not_met",
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # Consecutive loss protection
         if self.config.max_consecutive_losses > 0 and decision.action == "buy":
-            if self.tracker.loss_streak >= self.config.max_consecutive_losses:
-                return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": self.tracker.as_dict(price)}
+            if _tracker.loss_streak >= self.config.max_consecutive_losses:
+                return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": _tracker.as_dict(price)}
 
         # ── Per-pair trade cooldown ───────────────────────────────────────────
         if self.config.pair_cooldown_seconds > 0 and decision.action == "buy":
-            pair = snapshot["pair"]
-            last_trade = self._pair_last_trade.get(pair, 0.0)
+            last_trade = self._pair_last_trade.get(_pair, 0.0)
             elapsed = time.time() - last_trade
             if elapsed < self.config.pair_cooldown_seconds:
                 remaining = self.config.pair_cooldown_seconds - elapsed
                 logger.info(
                     "Pair cooldown active for %s — %.0fs remaining",
-                    pair, remaining,
+                    _pair, remaining,
                 )
                 return {
                     "status": "skipped",
                     "reason": f"pair_cooldown remaining={remaining:.0f}s",
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
-        # Max open positions check (static or adaptive)
+        # ── Max open positions check ──────────────────────────────────────────
+        # In multi-position mode: reject BUY when the position limit is reached.
+        # In single-position mode: use the adaptive-sizing max-position guard.
         if decision.action == "buy":
-            equity = self.tracker.effective_capital()
-            eff_max_pos = adaptive_max_positions(equity, self.config)
-            if eff_max_pos > 0 and self.tracker.base_position > 0:
-                # Count current open position (this bot tracks one position at a time,
-                # but when eff_max_pos == 1 it means no concurrent positions allowed
-                # while one is already open).
-                if eff_max_pos <= 1:
+            if self.multi_manager is not None:
+                if self.at_max_positions():
                     logger.info(
-                        "Max open positions reached (%d) — skipping buy", eff_max_pos
+                        "Max open positions reached (%d) — skipping buy on %s",
+                        self.config.multi_position_max,
+                        _pair,
                     )
                     return {
                         "status": "skipped",
-                        "reason": f"max_open_positions={eff_max_pos}",
-                        "portfolio": self.tracker.as_dict(price),
+                        "reason": f"max_open_positions={self.config.multi_position_max}",
+                        "portfolio": _tracker.as_dict(price),
                     }
+            else:
+                equity = _tracker.effective_capital()
+                eff_max_pos = adaptive_max_positions(equity, self.config)
+                if eff_max_pos > 0 and _tracker.base_position > 0:
+                    if eff_max_pos <= 1:
+                        logger.info(
+                            "Max open positions reached (%d) — skipping buy", eff_max_pos
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": f"max_open_positions={eff_max_pos}",
+                            "portfolio": _tracker.as_dict(price),
+                        }
 
         # Flash dump protection
         if self.config.flash_dump_pct > 0 and decision.action == "buy":
             pair_history = self._price_history.get(snapshot["pair"], [])
             dump = detect_flash_dump(pair_history, self.config.flash_dump_lookback_seconds, self.config.flash_dump_pct)
             if dump.detected:
-                return {"status": "skipped", "reason": f"flash_dump drop={dump.drop_pct:.2%}", "portfolio": self.tracker.as_dict(price)}
+                return {"status": "skipped", "reason": f"flash_dump drop={dump.drop_pct:.2%}", "portfolio": _tracker.as_dict(price)}
 
         # Strategy disabled check
-        if decision.action == "buy" and self.tracker.is_strategy_disabled(decision.mode):
-            return {"status": "skipped", "reason": "strategy_disabled", "portfolio": self.tracker.as_dict(price)}
+        if decision.action == "buy" and _tracker.is_strategy_disabled(decision.mode):
+            return {"status": "skipped", "reason": "strategy_disabled", "portfolio": _tracker.as_dict(price)}
 
         if self.config.grid_enabled and snapshot.get("grid_plan"):
             return self._execute_grid(snapshot)
 
         if decision.action == "hold":
-            logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, self.tracker.as_dict(price))
-            outcome = {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
+            logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, _tracker.as_dict(price))
+            outcome = {"status": "hold", "reason": decision.reason, "portfolio": _tracker.as_dict(price)}
             return outcome
 
         # When confidence-based position sizing is active, honour the tier_skip
@@ -1227,7 +1317,7 @@ class Trader:
             outcome = {
                 "status": "skipped",
                 "reason": f"confidence {decision.confidence} below threshold {_effective_min_conf}",
-                "portfolio": self.tracker.as_dict(price),
+                "portfolio": _tracker.as_dict(price),
             }
             return outcome
 
@@ -1265,7 +1355,7 @@ class Trader:
                     "reason": (
                         f"spread_too_wide {live_spread_pct:.4%} ≥ {self.config.max_spread_pct:.4%}"
                     ),
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Minimum price filter ──────────────────────────────────────────────
@@ -1286,7 +1376,7 @@ class Trader:
                     "reason": (
                         f"price_too_low {price:.6g} < {self.config.min_buy_price_idr:.6g} IDR"
                     ),
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Tick-move filter ──────────────────────────────────────────────────
@@ -1320,7 +1410,7 @@ class Trader:
                     "reason": (
                         f"tick_too_large {tick_pct:.4%} > {self.config.max_tick_move_pct:.4%}"
                     ),
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # Spread anomaly detection
@@ -1334,7 +1424,7 @@ class Trader:
             recent_spreads = self._spread_history[pair_key][:-1]  # exclude current
             anomaly = detect_spread_anomaly(live_spread_pct, recent_spreads, self.config.spread_anomaly_multiplier)
             if anomaly.detected:
-                return {"status": "skipped", "reason": f"spread_anomaly ratio={anomaly.ratio:.2f}x", "portfolio": self.tracker.as_dict(price)}
+                return {"status": "skipped", "reason": f"spread_anomaly ratio={anomaly.ratio:.2f}x", "portfolio": _tracker.as_dict(price)}
 
         # ── Sell-wall / orderbook wall guard ─────────────────────────────────
         # Skip buy when aggregate ask-side volume dominates bid-side volume by
@@ -1364,7 +1454,7 @@ class Trader:
                     "reason": (
                         f"sell_wall ask/bid={ask_vol / bid_vol:.2f}× ≥ {self.config.orderbook_wall_threshold:.1f}×"
                     ),
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         # ── Pump protection ───────────────────────────────────────────────────
@@ -1388,7 +1478,7 @@ class Trader:
                     f"pump_detected rise={rise:.2%} ≥ {self.config.pump_protection_pct:.2%} "
                     f"in {self.config.pump_lookback_seconds:.0f}s"
                 ),
-                "portfolio": self.tracker.as_dict(price),
+                "portfolio": _tracker.as_dict(price),
             }
 
         # ── Anti-fake-pump detection (spike → dump within ~20 s) ─────────────
@@ -1413,7 +1503,7 @@ class Trader:
                     f"fake_pump_detected reversal={reversal:.2%} ≥ "
                     f"{self.config.fake_pump_reversal_pct:.2%} after spike"
                 ),
-                "portfolio": self.tracker.as_dict(price),
+                "portfolio": _tracker.as_dict(price),
             }
 
         # ── Minimum liquidity depth check ─────────────────────────────────────
@@ -1434,7 +1524,7 @@ class Trader:
                 return {
                     "status": "skipped",
                     "reason": f"thin_market depth Rp{total_depth:.0f} < Rp{self.config.min_liquidity_depth_idr:.0f}",
-                    "portfolio": self.tracker.as_dict(price),
+                    "portfolio": _tracker.as_dict(price),
                 }
 
         if decision.action == "buy" and reference_price > allowed_max:
@@ -1442,7 +1532,7 @@ class Trader:
             outcome = {
                 "status": "skipped",
                 "reason": "slippage too high for buy",
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             return outcome
         if decision.action == "sell" and reference_price < allowed_min:
@@ -1450,18 +1540,24 @@ class Trader:
             outcome = {
                 "status": "skipped",
                 "reason": "slippage too high for sell",
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             return outcome
 
         # capital and position guards (risk management)
         effective_amount = decision.amount
         if decision.action == "buy":
-            max_affordable = max(0.0, self.tracker.cash / reference_price)
+            # In multi-position mode the tracker for a new pair is a zero-cash
+            # placeholder; use the multi_manager's prospective allocation instead.
+            if self.multi_manager is not None and not self.multi_manager.has_position(_pair):
+                available_cash = self.multi_manager.capital_per_new_position()
+            else:
+                available_cash = _tracker.cash
+            max_affordable = max(0.0, available_cash / reference_price)
             effective_amount = min(decision.amount, max_affordable)
             # Log adaptive sizing tier when it's active
             if self.config.adaptive_sizing_enabled:
-                equity = self.tracker.effective_capital()
+                equity = _tracker.effective_capital() or available_cash
                 eff_risk = adaptive_risk_per_trade(equity, self.config)
                 eff_max = adaptive_max_positions(equity, self.config)
                 logger.debug(
@@ -1469,7 +1565,7 @@ class Trader:
                     equity, eff_risk * 100, eff_max,
                 )
         elif decision.action == "sell":
-            max_sellable = max(0.0, self.tracker.base_position)
+            max_sellable = max(0.0, _tracker.base_position)
             effective_amount = min(decision.amount, max_sellable)
 
         if effective_amount <= 0:
@@ -1477,7 +1573,7 @@ class Trader:
             outcome = {
                 "status": "skipped",
                 "reason": "insufficient balance or position",
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             return outcome
 
@@ -1501,15 +1597,27 @@ class Trader:
                     f"order_below_minimum Rp{total_order_value_idr:.0f} "
                     f"< Rp{self.config.min_order_idr:.0f}"
                 ),
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
 
         staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
 
         if not self._validate_balance(snapshot["pair"], decision.action, effective_amount, reference_price):
-            return {"status": "skipped", "reason": "balance_check_failed", "portfolio": self.tracker.as_dict(price)}
+            return {"status": "skipped", "reason": "balance_check_failed", "portfolio": _tracker.as_dict(price)}
 
-        _pre_trade_avg_cost = self.tracker.avg_cost
+        # ── Multi-position: allocate capital for new BUY before execution ─────
+        # Up to this point _tracker was a zero-cash placeholder; create the real
+        # per-pair tracker now so record_trade() has a properly funded account.
+        if decision.action == "buy" and self.multi_manager is not None:
+            if not self.multi_manager.has_position(_pair):
+                _tracker = self.multi_manager.allocate_capital(_pair)
+                # Tighten effective_amount against the newly allocated cash
+                max_affordable = max(0.0, _tracker.cash / reference_price)
+                effective_amount = min(effective_amount, max_affordable)
+                # Re-derive staged after adjustment
+                staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
+
+        _pre_trade_avg_cost = _tracker.avg_cost
 
         executed_steps: List[Dict[str, Any]] = []
         remaining_amount = effective_amount
@@ -1528,12 +1636,15 @@ class Trader:
                     )
                     continue
                 logger.info("DRY-RUN %s %s @ %s (staged)", decision.action, step_amount, reference_price)
-                self.tracker.record_trade(decision.action, reference_price, step_amount)
+                _tracker.record_trade(decision.action, reference_price, step_amount)
                 remaining_amount -= step_amount
                 executed_steps.append({"amount": step_amount, "price": reference_price})
             # Guard: if every staged step was below min_order, nothing was bought.
             # Return skipped so the caller never logs a false "PLACED" / "✅".
             if not executed_steps:
+                # Roll back allocated capital in multi-position mode (nothing was bought).
+                if decision.action == "buy" and self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(_pair)
                 logger.info(
                     "All staged steps below min Rp%.0f — skipping %s on %s",
                     self.config.min_order_idr,
@@ -1543,8 +1654,11 @@ class Trader:
                 return {
                     "status": "skipped",
                     "reason": f"all_steps_below_min_order (min=Rp{self.config.min_order_idr:.0f})",
-                    "portfolio": self.tracker.as_dict(reference_price),
+                    "portfolio": _tracker.as_dict(reference_price),
                 }
+            # Multi-position: return cash to pool after a full sell-close.
+            if decision.action == "sell" and self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(_pair)
             outcome = {
                 "status": "simulated",
                 "action": decision.action,
@@ -1556,7 +1670,7 @@ class Trader:
                 "take_profit": decision.take_profit,
                 "confidence": decision.confidence,
                 "reason": decision.reason,
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             self._persist_after_trade(snapshot["pair"])
             # Journal logging
@@ -1577,8 +1691,8 @@ class Trader:
                     strategy=decision.mode,
                     confidence=decision.confidence,
                     reason=decision.reason,
-                    avg_cost=self.tracker.avg_cost,
-                    equity=self.tracker.snapshot(reference_price).equity,
+                    avg_cost=_tracker.avg_cost,
+                    equity=_tracker.snapshot(reference_price).equity,
                 )
             self._consecutive_errors = 0
             return outcome
@@ -1604,13 +1718,15 @@ class Trader:
             try:
                 order_resp = self.client.create_order(snapshot["pair"], decision.action, reference_price, step_amount)
                 self._consecutive_errors = 0
+                # Invalidate balance cache so next getInfo reflects the new order.
+                getattr(self.client, "invalidate_account_info_cache", lambda: None)()
             except Exception as exc:
                 self._consecutive_errors += 1
                 if self.config.circuit_breaker_max_errors > 0 and self._consecutive_errors >= self.config.circuit_breaker_max_errors:
                     self._circuit_breaker_until = time.time() + self.config.circuit_breaker_pause_seconds
                     logger.warning("Circuit breaker triggered after %d errors: %s", self._consecutive_errors, exc)
                 raise
-            self.tracker.record_trade(decision.action, reference_price, step_amount)
+            _tracker.record_trade(decision.action, reference_price, step_amount)
             remaining_amount -= step_amount
             executed_steps.append({"amount": step_amount, "price": reference_price, "order": order_resp})
             logger.info(
@@ -1622,6 +1738,8 @@ class Trader:
             )
         # Guard: if every staged step was below min_order, nothing was placed.
         if not executed_steps:
+            if decision.action == "buy" and self.multi_manager is not None:
+                self.multi_manager.return_position_cash(_pair)
             logger.info(
                 "All staged steps below min Rp%.0f — skipping %s on %s",
                 self.config.min_order_idr,
@@ -1631,8 +1749,11 @@ class Trader:
             return {
                 "status": "skipped",
                 "reason": f"all_steps_below_min_order (min=Rp{self.config.min_order_idr:.0f})",
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
+        # Multi-position: return cash to pool after a full sell-close (live path).
+        if decision.action == "sell" and self.multi_manager is not None and _tracker.base_position <= 0:
+            self.multi_manager.return_position_cash(_pair)
         outcome = {
             "status": "placed",
             "action": decision.action,
@@ -1640,7 +1761,7 @@ class Trader:
             "amount": sum(step["amount"] for step in executed_steps),
             "executed_steps": executed_steps,
             "mode": decision.mode,
-            "portfolio": self.tracker.as_dict(reference_price),
+            "portfolio": _tracker.as_dict(reference_price),
         }
         self._persist_after_trade(snapshot["pair"])
         # Journal logging
@@ -1661,15 +1782,15 @@ class Trader:
                 strategy=decision.mode,
                 confidence=decision.confidence,
                 reason=decision.reason,
-                avg_cost=self.tracker.avg_cost,
-                equity=self.tracker.snapshot(reference_price).equity,
+                avg_cost=_tracker.avg_cost,
+                equity=_tracker.snapshot(reference_price).equity,
             )
         # Strategy auto-disable after sell
         if decision.action == "sell" and self.config.strategy_auto_disable_losses > 0:
-            strat_data = self.tracker._strategy_stats.get(decision.mode, {})
+            strat_data = _tracker._strategy_stats.get(decision.mode, {})
             losses_count = strat_data.get("consecutive_losses", 0)
             if losses_count >= self.config.strategy_auto_disable_losses:
-                self.tracker.disable_strategy(decision.mode)
+                _tracker.disable_strategy(decision.mode)
                 logger.warning("Strategy %s auto-disabled after %d consecutive losses", decision.mode, losses_count)
         return outcome
 
@@ -1728,7 +1849,8 @@ class Trader:
         """
         price = snapshot["price"]
         pair = snapshot["pair"]
-        total_position = self.tracker.base_position
+        _tracker = self._active_tracker(pair)
+        total_position = _tracker.base_position
 
         if total_position <= 0:
             return {"status": "no_position", "pair": pair, "price": price}
@@ -1752,8 +1874,8 @@ class Trader:
                 "DRY-RUN partial-TP sell %.8f (%.0f%%) %s @ %s",
                 amount, fraction * 100, pair, reference_price,
             )
-            self.tracker.record_trade("sell", reference_price, amount)
-            self.tracker.partial_tp_taken = True
+            _tracker.record_trade("sell", reference_price, amount)
+            _tracker.partial_tp_taken = True
             outcome: Dict[str, Any] = {
                 "status": "partial_tp",
                 "action": "sell",
@@ -1761,7 +1883,7 @@ class Trader:
                 "price": reference_price,
                 "amount": amount,
                 "fraction": fraction,
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             self._persist_after_trade(pair)
             return outcome
@@ -1770,8 +1892,8 @@ class Trader:
             raise ValueError("API credentials required for live trading")
 
         order_resp = self.client.create_order(pair, "sell", reference_price, amount)
-        self.tracker.record_trade("sell", reference_price, amount)
-        self.tracker.partial_tp_taken = True
+        _tracker.record_trade("sell", reference_price, amount)
+        _tracker.partial_tp_taken = True
         outcome = {
             "status": "partial_tp",
             "action": "sell",
@@ -1780,7 +1902,7 @@ class Trader:
             "amount": amount,
             "fraction": fraction,
             "order": order_resp,
-            "portfolio": self.tracker.as_dict(reference_price),
+            "portfolio": _tracker.as_dict(reference_price),
         }
         self._persist_after_trade(pair)
         return outcome
@@ -1821,11 +1943,12 @@ class Trader:
 
         price = snapshot.get("price", 0.0)
         orderbook = snapshot.get("orderbook")
-        if not price or self.tracker.avg_cost == 0:
+        _tracker = self._active_tracker(snapshot.get("pair", self.config.pair))
+        if not price or _tracker.avg_cost == 0:
             return False
 
         # Require minimum unrealised profit before triggering
-        unrealised_pct = (price - self.tracker.avg_cost) / self.tracker.avg_cost
+        unrealised_pct = (price - _tracker.avg_cost) / _tracker.avg_cost
         if unrealised_pct < config.momentum_exit_min_profit_pct:
             return False
 
@@ -1891,6 +2014,7 @@ class Trader:
         """
         config = self.config
         price = snapshot["price"]
+        _tracker = self._active_tracker(snapshot["pair"])
 
         # If neither feature is configured → standard TP behaviour (close now)
         dynamic_tp_enabled = (
@@ -1904,8 +2028,8 @@ class Trader:
 
         # If trailing TP is already active and price fell through the floor → close
         if (
-            self.tracker.trailing_tp_stop is not None
-            and price <= self.tracker.trailing_tp_stop
+            _tracker.trailing_tp_stop is not None
+            and price <= _tracker.trailing_tp_stop
         ):
             return "trailing_tp_triggered"
 
@@ -1922,10 +2046,10 @@ class Trader:
 
         # Conditions still bullish — activate / advance the trailing TP floor
         if config.trailing_tp_pct > 0:
-            self.tracker.activate_trailing_tp(price, config.trailing_tp_pct)
+            _tracker.activate_trailing_tp(price, config.trailing_tp_pct)
             logger.debug(
                 "Dynamic TP: trailing floor updated to %.2f (price=%.2f)",
-                self.tracker.trailing_tp_stop or 0.0,
+                _tracker.trailing_tp_stop or 0.0,
                 price,
             )
 
@@ -1942,7 +2066,8 @@ class Trader:
         """
         price = snapshot["price"]
         pair = snapshot["pair"]
-        amount = self.tracker.base_position
+        _tracker = self._active_tracker(pair)
+        amount = _tracker.base_position
 
         if amount <= 0:
             return {"status": "no_position", "pair": pair, "price": price}
@@ -1960,14 +2085,16 @@ class Trader:
 
         if self.config.dry_run:
             logger.info("DRY-RUN force-sell %.8f %s @ %s", amount, pair, reference_price)
-            self.tracker.record_trade("sell", reference_price, amount)
+            _tracker.record_trade("sell", reference_price, amount)
+            if self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(pair)
             outcome: Dict[str, Any] = {
                 "status": "force_sold",
                 "action": "sell",
                 "pair": pair,
                 "price": reference_price,
                 "amount": amount,
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             self._persist_after_trade(pair)
             return outcome
@@ -2018,13 +2145,15 @@ class Trader:
                 if actual_balance <= 0:
                     # No coins available — the buy was never filled.  Roll back
                     # the phantom position so the tracker reflects reality.
-                    self.tracker.cancel_pending_buy()
+                    _tracker.cancel_pending_buy()
+                    if self.multi_manager is not None:
+                        self.multi_manager.return_position_cash(pair)
                     outcome: Dict[str, Any] = {
                         "status": "no_position",
                         "pair": pair,
                         "price": reference_price,
                         "amount": 0.0,
-                        "portfolio": self.tracker.as_dict(reference_price),
+                        "portfolio": _tracker.as_dict(reference_price),
                     }
                     self._persist_after_trade(pair)
                     return outcome
@@ -2064,13 +2193,15 @@ class Trader:
                 min_coin,
                 effective_min_idr,
             )
-            self.tracker.cancel_pending_buy()
+            _tracker.cancel_pending_buy()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
             outcome: Dict[str, Any] = {
                 "status": "dust_cleared",
                 "pair": pair,
                 "price": reference_price,
                 "amount": amount,
-                "portfolio": self.tracker.as_dict(reference_price),
+                "portfolio": _tracker.as_dict(reference_price),
             }
             self._persist_after_trade(pair)
             return outcome
@@ -2109,19 +2240,27 @@ class Trader:
                     cached = _cache.setdefault(pair.lower(), {})
                     if parsed_min > cached.get("min_coin", 0.0):
                         cached["min_coin"] = parsed_min
-                self.tracker.cancel_pending_buy()
+                _tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
                 outcome = {
                     "status": "dust_cleared",
                     "pair": pair,
                     "price": reference_price,
                     "amount": amount,
-                    "portfolio": self.tracker.as_dict(reference_price),
+                    "portfolio": _tracker.as_dict(reference_price),
                 }
                 self._persist_after_trade(pair)
                 return outcome
             raise
 
-        self.tracker.record_trade("sell", reference_price, amount)
+        _tracker.record_trade("sell", reference_price, amount)
+        if self.multi_manager is not None and _tracker.base_position <= 0:
+            self.multi_manager.return_position_cash(pair)
+        # Invalidate balance cache so next getInfo reflects the sell proceeds.
+        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+        # Invalidate open-orders cache for this pair; the order is now closed.
+        getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
         outcome = {
             "status": "force_sold",
             "action": "sell",
@@ -2129,7 +2268,7 @@ class Trader:
             "price": reference_price,
             "amount": amount,
             "order": order_resp,
-            "portfolio": self.tracker.as_dict(reference_price),
+            "portfolio": _tracker.as_dict(reference_price),
         }
         self._persist_after_trade(pair)
         return outcome
@@ -2305,6 +2444,11 @@ class Trader:
         for scan_idx, pair in enumerate(pairs):
             if self.config.scan_request_delay > 0:
                 time.sleep(self.config.scan_request_delay)
+            # Multi-position: skip pairs where we already hold a position.
+            # Those are monitored separately in the main holding loop.
+            if self.multi_manager is not None and self.multi_manager.has_position(pair):
+                skipped_pairs.append(pair)
+                continue
             # Use the multi-pair feed's cached ticker to skip the per-pair REST
             # ticker call entirely.  When the feed is seeded but this specific
             # pair has no cached data (absent from /api/summaries — typically
@@ -2354,7 +2498,7 @@ class Trader:
             # Without one, it would be immediately skipped in maybe_execute, so
             # treat it as "hold" here so the scanner continues looking for BUY
             # opportunities on other pairs instead of returning early.
-            if decision.action == "sell" and self.tracker.base_position <= 0:
+            if decision.action == "sell" and self._active_tracker(pair).base_position <= 0:
                 score = self._score_snapshot(snapshot)
                 if score > best_hold_score:
                     best_hold_score = score
