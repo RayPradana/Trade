@@ -2352,9 +2352,6 @@ class Trader:
         raise last_exc
 
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
-        # ── Per-pair minimum order cache ─────────────────────────────────────
-        self._ensure_pair_min_order_cache()
-
         if self._all_pairs is None:
             try:
                 pairs_data = self.client.get_pairs()
@@ -2365,10 +2362,27 @@ class Trader:
                     elif "ticker_id" in p:
                         names.append(p["ticker_id"])
                 self._all_pairs = [n.lower() for n in names if n]
+                # Populate the per-pair min-order cache from the already-fetched
+                # pairs data so we avoid a second /api/pairs request.  This
+                # prevents the duplicate REST call that previously triggered 429
+                # errors on the first cycle (one from _ensure_pair_min_order_cache
+                # and one here).
+                if self.config.pair_min_order_cache_enabled and hasattr(self.client, "load_pair_min_orders"):
+                    try:
+                        self.client.load_pair_min_orders(pairs_data)
+                        self._pair_min_order_cache_cycles = 0
+                    except Exception as exc:  # pragma: no cover
+                        logger.debug("Failed to populate min order cache from pairs data: %s", exc)
             # pragma: no cover - guard for pair listing/parsing failures
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 logger.warning("Failed to load pairs; fallback to default %s", exc)
                 self._all_pairs = [self.config.pair]
+
+        # ── Per-pair minimum order cache ─────────────────────────────────────
+        # On the first cycle this is a no-op when the cache was populated above
+        # from the same /api/pairs response.  On subsequent cycles it handles
+        # periodic refresh according to pair_min_order_refresh_cycles.
+        self._ensure_pair_min_order_cache()
 
         all_pairs = self._all_pairs or [self.config.pair]
 

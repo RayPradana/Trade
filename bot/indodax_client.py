@@ -93,7 +93,7 @@ class IndodaxClient:
     def get_pairs(self) -> List[Dict[str, Any]]:
         return self._get("/api/pairs")
 
-    def load_pair_min_orders(self) -> None:
+    def load_pair_min_orders(self, pairs_info: Optional[List[Dict[str, Any]]] = None) -> None:
         """Fetch exchange pair list and cache per-pair minimum order sizes.
 
         The Indodax ``/api/pairs`` endpoint returns a list of pair objects,
@@ -102,13 +102,20 @@ class IndodaxClient:
         populates :attr:`_pair_min_order` for quick lookup before order
         placement so that "Minimum order" errors are prevented proactively.
 
+        :param pairs_info: Optional pre-fetched ``/api/pairs`` response data.
+            When provided the cache is populated from this list *without*
+            making an additional REST call.  Pass the data that was already
+            fetched for another purpose (e.g. building the watchlist) to avoid
+            a duplicate ``/api/pairs`` request and reduce 429 risk.
+
         Safe to call multiple times; the cache is fully replaced on each call.
         """
-        try:
-            pairs_info = self.get_pairs()
-        except Exception as exc:
-            logger.warning("load_pair_min_orders: failed to fetch /api/pairs: %s", exc)
-            return
+        if pairs_info is None:
+            try:
+                pairs_info = self.get_pairs()
+            except Exception as exc:
+                logger.warning("load_pair_min_orders: failed to fetch /api/pairs: %s", exc)
+                return
         if not isinstance(pairs_info, list):
             logger.warning("load_pair_min_orders: unexpected response format")
             return

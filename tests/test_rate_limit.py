@@ -151,3 +151,168 @@ class IndodaxClientCacheTests(unittest.TestCase):
         client.open_orders("btc_idr")
         client.open_orders("btc_idr")
         self.assertEqual(len(calls), 2)
+
+
+class LoadPairMinOrdersFromDataTests(unittest.TestCase):
+    """Tests for load_pair_min_orders() with pre-fetched pairs data."""
+
+    def _make_pairs_data(self):
+        return [
+            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
+            {"id": "ethidr", "trade_min_base_currency": "0.001", "trade_min_traded_currency": "5000"},
+        ]
+
+    def test_load_from_data_skips_rest_call(self):
+        """Passing pairs_info avoids an /api/pairs REST call."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        client.session = None  # Would explode if used
+        client.base_url = "https://indodax.com"
+        client.timeout = 10
+
+        get_pairs_called = []
+
+        def _no_rest(*args, **kwargs):  # pragma: no cover
+            get_pairs_called.append(True)
+            raise RuntimeError("REST call should not happen")
+
+        client.get_pairs = _no_rest
+
+        client.load_pair_min_orders(self._make_pairs_data())
+
+        self.assertEqual(get_pairs_called, [], "get_pairs() must not be called when data is provided")
+        self.assertIn("btcidr", client._pair_min_order)
+        self.assertAlmostEqual(client._pair_min_order["btcidr"]["min_coin"], 0.0001)
+        self.assertIn("ethidr", client._pair_min_order)
+
+    def test_load_from_data_populates_cache_correctly(self):
+        """Pre-fetched data is parsed identically to a live /api/pairs call."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        client.session = None
+        client.base_url = "https://indodax.com"
+        client.timeout = 10
+
+        pairs_data = self._make_pairs_data()
+        client.load_pair_min_orders(pairs_data)
+
+        self.assertEqual(len(client._pair_min_order), 2)
+        self.assertAlmostEqual(client._pair_min_order["ethidr"]["min_idr"], 5000.0)
+
+    def test_load_without_args_still_calls_rest(self):
+        """Calling load_pair_min_orders() without args still fetches /api/pairs."""
+        from bot.indodax_client import IndodaxClient
+
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+
+        rest_calls = []
+
+        def _mock_get_pairs():
+            rest_calls.append(True)
+            return self._make_pairs_data()
+
+        client.get_pairs = _mock_get_pairs
+        client.load_pair_min_orders()
+
+        self.assertEqual(len(rest_calls), 1)
+        self.assertIn("btcidr", client._pair_min_order)
+
+
+class NoDuplicatePairsCallTest(unittest.TestCase):
+    """scan_and_choose() must not call /api/pairs twice on the first cycle."""
+
+    def setUp(self):
+        import logging
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        import logging
+        logging.disable(logging.NOTSET)
+
+    def test_get_pairs_called_once_on_first_scan(self):
+        """On the first scan_and_choose() call, /api/pairs must be fetched only once."""
+        from bot.config import BotConfig
+        from bot.trader import Trader
+        from bot.strategies import StrategyDecision
+
+        pairs_data = [
+            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
+            {"id": "ethidr", "trade_min_base_currency": "0.001", "trade_min_traded_currency": "5000"},
+        ]
+        get_pairs_call_count = []
+
+        class _Client:
+            _pair_min_order = {}
+            load_min_order_calls = []
+
+            def get_pairs(self):
+                get_pairs_call_count.append(1)
+                # Return data with both "name" field (for _all_pairs) and
+                # min-order fields (for the cache).
+                return [
+                    {"name": "btc_idr", "id": "btcidr",
+                     "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
+                    {"name": "eth_idr", "id": "ethidr",
+                     "trade_min_base_currency": "0.001", "trade_min_traded_currency": "5000"},
+                ]
+
+            def get_summaries(self):
+                return {}
+
+            def load_pair_min_orders(self, pairs_info=None):
+                _Client.load_min_order_calls.append(pairs_info is not None)
+                # Populate the cache so _ensure_pair_min_order_cache is a no-op
+                for p in (pairs_info or []):
+                    pair_id = (p.get("id") or "").lower()
+                    self._pair_min_order[pair_id] = {"min_coin": 0.0, "min_idr": 0.0}
+
+        config = BotConfig(
+            api_key=None,
+            pair="btc_idr",
+            pair_min_order_cache_enabled=True,
+        )
+
+        snapshot = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.5,
+                reason="test",
+                target_price=100.0,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+
+        client_instance = _Client()
+
+        class _Trader(Trader):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False):
+                return snapshot
+
+        trader = _Trader(config, client=client_instance)
+        trader.scan_and_choose()
+
+        self.assertEqual(sum(get_pairs_call_count), 1,
+                         "get_pairs() should be called exactly once on the first cycle")
+        # Also verify load_pair_min_orders was called with pre-fetched data
+        self.assertTrue(
+            _Client.load_min_order_calls,
+            "load_pair_min_orders() should have been called with pre-fetched data",
+        )
+        self.assertTrue(
+            _Client.load_min_order_calls[0],
+            "load_pair_min_orders() should receive the pre-fetched pairs_data (not None)",
+        )
