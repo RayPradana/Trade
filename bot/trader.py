@@ -1532,9 +1532,7 @@ class Trader:
         treated as "unknown" rather than blocking by default.
         """
         min_trades = self.config.small_coin_min_trades_24h
-        if min_trades <= 0:
-            return None
-        if trades_24h <= 0:
+        if min_trades <= 0 or trades_24h <= 0:
             # Trade count missing/unknown — do not block solely on absence.
             return None
         if trades_24h < min_trades:
