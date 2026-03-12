@@ -1529,7 +1529,8 @@ class Trader:
         """Return skip reason for cheap coins with insufficient reported trades.
 
         Indodax summaries often omit ``trade_count``; a missing/zero value is
-        treated as "unknown" rather than blocking by default.
+        treated as "unknown" rather than blocking by default.  A non-positive
+        configured threshold also disables this check.
         """
         min_trades = self.config.small_coin_min_trades_24h
         if min_trades <= 0 or trades_24h <= 0:
