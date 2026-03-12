@@ -561,3 +561,84 @@ class LoggingFormatSpecifierTest(unittest.TestCase):
             "Invalid '%-style with comma' format specifiers found in logging calls:\n"
             + "\n".join(f"  {v!r}" for v in violations),
         )
+
+
+class LogSignalIndicatorDisplayTest(unittest.TestCase):
+    """_log_signal() must show 'N/A' when indicators are absent or all-zero."""
+
+    def setUp(self):
+        logging.disable(logging.NOTSET)
+
+    def tearDown(self):
+        logging.disable(logging.CRITICAL)
+
+    def _make_snapshot(self, indicators, insufficient_data=False):
+        from bot.strategies import StrategyDecision
+        decision = StrategyDecision(
+            mode="day_trading", action="hold", confidence=0.5,
+            reason="test", target_price=100.0, amount=0.0,
+            stop_loss=None, take_profit=None,
+        )
+        return {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": indicators,
+            "decision": decision,
+            "insufficient_data": insufficient_data,
+        }
+
+    def _indic_line(self, cm_output):
+        for msg in cm_output:
+            if "indic" in msg:
+                return msg
+        return None
+
+    def test_indicators_none_shows_na(self):
+        """When indicators is None, display 'N/A (insufficient candle data)'."""
+        snapshot = self._make_snapshot(indicators=None)
+        with self.assertLogs(level="INFO") as cm:
+            main._log_signal(snapshot)
+        msg = self._indic_line(cm.output)
+        self.assertIsNotNone(msg, "expected an 'indic' log line")
+        self.assertIn("N/A", msg)
+
+    def test_indicators_all_zero_bb_shows_na(self):
+        """When BB bands are all zero (no candle data), display N/A."""
+        from bot.analysis import MomentumIndicators
+        ind = MomentumIndicators(rsi=50.0, macd=0.0, macd_signal=0.0,
+                                 macd_hist=0.0, bb_upper=0.0, bb_mid=0.0, bb_lower=0.0)
+        snapshot = self._make_snapshot(indicators=ind)
+        with self.assertLogs(level="INFO") as cm:
+            main._log_signal(snapshot)
+        msg = self._indic_line(cm.output)
+        self.assertIsNotNone(msg, "expected an 'indic' log line")
+        self.assertIn("N/A", msg)
+
+    def test_insufficient_data_flag_shows_na(self):
+        """When insufficient_data=True, display N/A even if indicators present."""
+        from bot.analysis import MomentumIndicators
+        ind = MomentumIndicators(rsi=55.0, macd=0.001, macd_signal=0.0,
+                                 macd_hist=0.0, bb_upper=110.0, bb_mid=100.0, bb_lower=90.0)
+        snapshot = self._make_snapshot(indicators=ind, insufficient_data=True)
+        with self.assertLogs(level="INFO") as cm:
+            main._log_signal(snapshot)
+        msg = self._indic_line(cm.output)
+        self.assertIsNotNone(msg, "expected an 'indic' log line")
+        self.assertIn("N/A", msg)
+
+    def test_valid_indicators_show_rsi_macd_bb(self):
+        """When valid indicators present, display RSI/MACD/BB values."""
+        from bot.analysis import MomentumIndicators
+        ind = MomentumIndicators(rsi=55.0, macd=0.001, macd_signal=0.0,
+                                 macd_hist=0.0, bb_upper=110.0, bb_mid=100.0, bb_lower=90.0)
+        snapshot = self._make_snapshot(indicators=ind, insufficient_data=False)
+        with self.assertLogs(level="INFO") as cm:
+            main._log_signal(snapshot)
+        msg = self._indic_line(cm.output)
+        self.assertIsNotNone(msg, "expected an 'indic' log line")
+        self.assertIn("RSI=", msg)
+        self.assertIn("MACD=", msg)
+        self.assertIn("BB[", msg)

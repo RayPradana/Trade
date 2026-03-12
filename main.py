@@ -395,7 +395,15 @@ def _log_signal(snapshot: dict) -> None:
     )
 
     # ── Technical indicators ─────────────────────────────────────────────
-    if ind:
+    insufficient = snapshot.get("insufficient_data", False)
+    # Show "N/A" when indicators are absent or snapshot lacks candle data.
+    # A MomentumIndicators with all-zero BB bands indicates no usable candles.
+    _ind_missing = (
+        ind is None
+        or insufficient
+        or (ind.bb_upper == 0.0 and ind.bb_mid == 0.0 and ind.bb_lower == 0.0)
+    )
+    if ind and not _ind_missing:
         rsi_color  = (_GREEN if 40 < ind.rsi < 60
                       else _RED if ind.rsi >= 70 or ind.rsi <= 30 else _YELLOW)
         macd_color = _GREEN if ind.macd > 0 else _RED
@@ -412,7 +420,7 @@ def _log_signal(snapshot: dict) -> None:
             _RED, bb_hi, _RESET,
         )
     else:
-        logging.info("   %s└─%s indic   : —", _DIM, _RESET)
+        logging.info("   %s└─%s indic   : N/A (insufficient candle data)", _DIM, _RESET)
 
 
 # ── Order result display ─────────────────────────────────────────────────

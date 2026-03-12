@@ -44,7 +44,7 @@ class BotConfig:
     grid_spacing_pct: float = 0.004  # 0.4% spacing
     grid_order_size: Optional[float] = None
     order_queue_enabled: bool = True
-    order_min_interval: float = 1.5  # seconds between order requests; higher reduces 429 risk
+    order_min_interval: float = 2.0  # seconds between order requests; higher reduces 429 risk
     scan_request_delay: float = 0.2  # seconds to wait before each per-pair API call during scanning
     trade_count: int = 1000  # recent trades to fetch per pair when building candles from trades
     min_candles: int = 20  # minimum candle count required for reliable indicator computation
@@ -561,7 +561,7 @@ class BotConfig:
             grid_spacing_pct=float(os.getenv("GRID_SPACING_PCT", "0.004")),
             grid_order_size=float(os.getenv("GRID_ORDER_SIZE")) if os.getenv("GRID_ORDER_SIZE") else None,
             order_queue_enabled=os.getenv("ORDER_QUEUE_ENABLED", "true").lower() in {"1", "true", "yes"},
-            order_min_interval=float(os.getenv("ORDER_MIN_INTERVAL", "1.5")),
+            order_min_interval=float(os.getenv("ORDER_MIN_INTERVAL", "2.0")),
             scan_request_delay=float(os.getenv("SCAN_REQUEST_DELAY", "0.2")),
             trade_count=int(os.getenv("TRADE_COUNT", "1000")),
             min_candles=int(os.getenv("MIN_CANDLES", "20")),
