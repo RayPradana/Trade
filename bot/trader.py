@@ -323,6 +323,8 @@ class Trader:
         events = state.get("whale_events")
         if isinstance(events, list):
             self._whale_events = deque(events[-_WHALE_EVENT_MAX:], maxlen=_WHALE_EVENT_MAX)
+        else:
+            self._whale_events = deque(maxlen=_WHALE_EVENT_MAX)
 
     def _try_restore_state(self) -> None:
         """Load persisted state on startup and restore PortfolioTracker.
