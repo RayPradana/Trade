@@ -2934,6 +2934,42 @@ class Trader:
             if prefetched_ticker is None and feed_seeded:
                 skipped_pairs.append(pair)
                 continue
+            # ── Pre-scan cheap coin filter ────────────────────────────────────
+            # For coins priced below min_buy_price_idr, check real-time WS
+            # orderbook quality before running the full analysis.  Sepi/stuck
+            # coins (thin book, wide spread, too few levels) are dropped from
+            # the scan entirely so they never appear in the best-hold result.
+            # Only applied when WS depth data is already available for the pair.
+            if self.config.min_buy_price_idr > 0 and prefetched_ticker is not None:
+                try:
+                    _last_price = float(
+                        prefetched_ticker.get("last")
+                        or prefetched_ticker.get("last_price")
+                        or 0
+                    )
+                    if 0 < _last_price < self.config.min_buy_price_idr:
+                        _ws_depth = self._multi_feed.get_depth(pair)
+                        if _ws_depth is not None:
+                            _bids = _ws_depth.get("buy", [])
+                            _asks = _ws_depth.get("sell", [])
+                            _top_bid = float(_bids[0][0]) if _bids else 0.0
+                            _top_ask = float(_asks[0][0]) if _asks else 0.0
+                            _skip_reason = self._check_small_coin_ob_quality(
+                                _bids, _top_bid, _top_ask
+                            )
+                            if _skip_reason:
+                                logger.debug(
+                                    "Pre-scan: skipping sepi/stuck cheap coin %s "
+                                    "(price=%.6g IDR < %.6g): %s",
+                                    pair,
+                                    _last_price,
+                                    self.config.min_buy_price_idr,
+                                    _skip_reason,
+                                )
+                                skipped_pairs.append(pair)
+                                continue
+                except (ValueError, TypeError):
+                    pass  # price missing → keep pair and let full analysis decide
             # When WebSocket ticker data is available, the skip_depth / skip_trades
             # flags suppress per-pair REST calls during the scan loop.
             # analyze_market() now uses real-time WS depth and trades from

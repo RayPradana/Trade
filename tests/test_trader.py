@@ -1769,9 +1769,10 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         self.assertIn("small_coin_thin_book", outcome["reason"])
 
     def test_cheap_coin_good_ob_allowed(self):
-        """Cheap coin with sufficient bid levels and tight spread must NOT be blocked."""
-        # 5 bid levels → passes default small_coin_min_bid_levels=3
-        bids = [["4.0", "200"], ["3.9", "300"], ["3.8", "500"], ["3.7", "400"], ["3.6", "600"]]
+        """Cheap coin with sufficient bid levels, depth and tight spread must NOT be blocked."""
+        # 5 bid levels with realistic volumes → total depth ~175K IDR > 50K default
+        # depth = 4.0*10000 + 3.9*12000 + 3.8*8000 + 3.7*9000 + 3.6*7000 ≈ 175K IDR
+        bids = [["4.0", "10000"], ["3.9", "12000"], ["3.8", "8000"], ["3.7", "9000"], ["3.6", "7000"]]
         asks = [["4.01", "100"]]
         trader = self._trader(min_price=10.0, coin_price=4.0, bids=bids, asks=asks)
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
@@ -1780,13 +1781,14 @@ class MinBuyPriceFilterTest(unittest.TestCase):
 
     def test_cheap_coin_illiquid_depth_skipped(self):
         """Buy must be skipped when total IDR bid depth is below small_coin_min_depth_idr."""
-        # 5 bid levels but tiny depth: 5 × 4 × 1 = 20 IDR total
+        # 5 bid levels but tiny depth: total ~10 IDR
         bids = [["4", "1"], ["3", "1"], ["2", "1"], ["1", "1"], ["0.5", "1"]]
         asks = [["5", "1"]]
         trader = self._trader(
             min_price=100.0, coin_price=4.0, bids=bids, asks=asks,
             small_coin_min_bid_levels=0,  # disable level check
             small_coin_min_depth_idr=1_000_000.0,  # require 1M IDR
+            small_coin_max_spread_pct=0,  # disable spread check so depth check runs
         )
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
         self.assertEqual(outcome["status"], "skipped")
@@ -1795,11 +1797,12 @@ class MinBuyPriceFilterTest(unittest.TestCase):
     def test_cheap_coin_wide_spread_skipped(self):
         """Buy must be skipped when bid-ask spread exceeds small_coin_max_spread_pct."""
         # bid=4, ask=6 → spread = 2/4 = 50% > 10% threshold
-        bids = [["4", "100"], ["3.5", "200"], ["3", "300"], ["2.5", "400"], ["2", "500"]]
+        bids = [["4", "100000"], ["3.5", "200000"], ["3", "300000"], ["2.5", "400000"], ["2", "500000"]]
         asks = [["6", "50"]]
         trader = self._trader(
             min_price=100.0, coin_price=4.0, bids=bids, asks=asks,
             small_coin_min_bid_levels=0,  # disable level check
+            small_coin_min_depth_idr=0,   # disable depth check so spread check runs
             small_coin_max_spread_pct=0.10,  # max 10% spread
         )
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
@@ -1830,6 +1833,149 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         trader.tracker.record_trade("buy", 4.0, 1000.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0, action="sell"))
         self.assertNotIn("small_coin", outcome.get("reason", ""))
+
+
+class PreScanCheapCoinFilterTest(unittest.TestCase):
+    """Tests for the pre-scan cheap coin filter in scan_and_choose().
+
+    Cheap coins (price < min_buy_price_idr) with thin/inactive orderbooks must
+    be skipped during scanning so they never appear as 'best hold' candidates.
+    """
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_sepi_cheap_coin_skipped_before_analysis(self):
+        """A cheap coin with a thin WS orderbook must be skipped before full analysis.
+
+        The pre-scan filter checks the real-time WS depth data.  When the
+        orderbook fails quality checks (fewer than min bid levels), the pair is
+        skipped without calling analyze_market.
+        """
+        from bot.realtime import MultiPairFeed
+
+        analyzed_pairs: list[str] = []
+
+        class ScanClient:
+            def get_pairs(self) -> list[dict]:
+                return [{"name": "meme_idr"}, {"name": "btc_idr"}]
+
+            def get_summaries(self) -> dict:
+                return {
+                    "tickers": {
+                        "memeidr": {"last": "10", "high": "11", "low": "10"},
+                        "btcidr": {"last": "1000000000", "high": "1100000000", "low": "900000000"},
+                    }
+                }
+
+        config = BotConfig(
+            api_key=None,
+            min_buy_price_idr=100.0,   # meme_idr (10 IDR) is below threshold
+            small_coin_min_bid_levels=3,  # require at least 3 bid levels
+            small_coin_min_depth_idr=50000.0,
+            small_coin_max_spread_pct=0.05,
+            dry_run=True,
+        )
+
+        class ScanTrader(Trader):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False):
+                analyzed_pairs.append(pair)
+                return {
+                    "pair": pair, "price": 1000000000.0, "trend": None,
+                    "orderbook": None, "volatility": None, "levels": None, "indicators": None,
+                    "decision": StrategyDecision(
+                        mode="scalping", action="hold", confidence=0.0, reason="wait",
+                        target_price=1000000000, amount=0, stop_loss=0, take_profit=0,
+                    ),
+                }
+
+        trader = ScanTrader(config, client=ScanClient())
+
+        # Seed the multi-pair feed so it is "seeded" and provides prefetched tickers
+        trader._multi_feed = MultiPairFeed(
+            pairs=["meme_idr", "btc_idr"],
+            client=ScanClient(),
+            websocket_enabled=False,
+        )
+        # Inject ticker data directly into the feed cache
+        trader._multi_feed._apply_ws_message_for_pair("meme_idr", {"last": "10", "high": "11", "low": "10"})
+        trader._multi_feed._apply_ws_message_for_pair("btc_idr", {"last": "1000000000", "high": "1100000000"})
+        trader._all_pairs = ["meme_idr", "btc_idr"]
+
+        # Inject thin orderbook for meme_idr (only 1 bid level → thin book)
+        with trader._multi_feed._lock:
+            trader._multi_feed._depth_cache["meme_idr"] = {
+                "buy": [["10", "100"]],  # only 1 bid level < 3 required
+                "sell": [["11", "50"]],
+            }
+
+        trader.scan_and_choose()
+
+        # meme_idr must have been skipped by the pre-scan filter (not analyzed)
+        self.assertNotIn("meme_idr", analyzed_pairs)
+        # btc_idr (above threshold) must still be analyzed normally
+        self.assertIn("btc_idr", analyzed_pairs)
+
+    def test_active_cheap_coin_not_skipped(self):
+        """A cheap coin with a healthy WS orderbook must NOT be filtered out pre-scan."""
+        from bot.realtime import MultiPairFeed
+
+        analyzed_pairs: list[str] = []
+
+        class ScanClient:
+            def get_pairs(self) -> list[dict]:
+                return [{"name": "shib_idr"}]
+
+            def get_summaries(self) -> dict:
+                return {"tickers": {"shibidr": {"last": "50", "high": "55", "low": "48"}}}
+
+        config = BotConfig(
+            api_key=None,
+            min_buy_price_idr=100.0,
+            small_coin_min_bid_levels=3,
+            small_coin_min_depth_idr=50000.0,
+            small_coin_max_spread_pct=0.05,
+            dry_run=True,
+        )
+
+        class ScanTrader(Trader):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False):
+                analyzed_pairs.append(pair)
+                return {
+                    "pair": pair, "price": 50.0, "trend": None,
+                    "orderbook": None, "volatility": None, "levels": None, "indicators": None,
+                    "decision": StrategyDecision(
+                        mode="scalping", action="hold", confidence=0.0, reason="wait",
+                        target_price=50, amount=0, stop_loss=0, take_profit=0,
+                    ),
+                }
+
+        trader = ScanTrader(config, client=ScanClient())
+        trader._multi_feed = MultiPairFeed(
+            pairs=["shib_idr"],
+            client=ScanClient(),
+            websocket_enabled=False,
+        )
+        trader._multi_feed._apply_ws_message_for_pair("shib_idr", {"last": "50", "high": "55"})
+        trader._all_pairs = ["shib_idr"]
+
+        # Inject a healthy orderbook with 5 levels and >50K IDR depth, tight spread
+        with trader._multi_feed._lock:
+            trader._multi_feed._depth_cache["shib_idr"] = {
+                "buy": [
+                    ["50", "10000"], ["49.5", "12000"], ["49", "8000"],
+                    ["48.5", "9000"], ["48", "7000"],
+                ],  # total depth ~2.3M IDR > 50K, 5 levels ≥ 3
+                "sell": [["50.5", "5000"]],  # spread = 0.5/50 = 1% < 5%
+            }
+
+        trader.scan_and_choose()
+
+        # shib_idr has good OB → must be analyzed (not pre-filtered)
+        self.assertIn("shib_idr", analyzed_pairs)
 
 
 class TickMoveFilterTest(unittest.TestCase):

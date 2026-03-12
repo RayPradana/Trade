@@ -279,13 +279,14 @@ class BotConfig:
     small_coin_min_bid_levels: int = 3
     # Minimum total IDR value of all resting bid orders for cheap coins.
     # Computed as sum(price × coin_volume) across all bid levels in the book.
+    # E.g. 50000.0 = require at least 50K IDR of resting bid liquidity.
     # 0 = disabled.
-    small_coin_min_depth_idr: float = 0.0
+    small_coin_min_depth_idr: float = 50000.0
     # Maximum bid-ask spread (as a fraction of best-bid price) for cheap coins.
-    # E.g. 0.10 = skip if spread > 10%.  A coin at 4 IDR with ask=5 has a 25%
+    # E.g. 0.05 = skip if spread > 5%.  A coin at 10 IDR with ask=11 has a 10%
     # spread and would be rejected.  Overrides the global max_spread_pct for
     # coins below min_buy_price_idr when > 0.  0 = disabled.
-    small_coin_max_spread_pct: float = 0.0
+    small_coin_max_spread_pct: float = 0.05
     # ── Tick-move filter ──────────────────────────────────────────────────────
     # Skip any buy when the minimum possible price increment (tick) represents
     # a fraction of the current price that exceeds this threshold.
@@ -676,8 +677,8 @@ class BotConfig:
             max_spread_pct=_env_float("MAX_SPREAD_PCT", "0"),
             min_buy_price_idr=_env_float("MIN_BUY_PRICE_IDR", "100"),
             small_coin_min_bid_levels=_env_int("SMALL_COIN_MIN_BID_LEVELS", "3"),
-            small_coin_min_depth_idr=_env_float("SMALL_COIN_MIN_DEPTH_IDR", "0"),
-            small_coin_max_spread_pct=_env_float("SMALL_COIN_MAX_SPREAD_PCT", "0"),
+            small_coin_min_depth_idr=_env_float("SMALL_COIN_MIN_DEPTH_IDR", "50000"),
+            small_coin_max_spread_pct=_env_float("SMALL_COIN_MAX_SPREAD_PCT", "0.05"),
             max_tick_move_pct=_env_float("MAX_TICK_MOVE_PCT", "0"),
             see_enabled=os.getenv("SEE_ENABLED", "false").lower() in {"1", "true", "yes"},
             see_volume_surge_ratio=_env_float("SEE_VOLUME_SURGE_RATIO", "2.0"),
