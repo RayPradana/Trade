@@ -612,6 +612,18 @@ class Trader:
                     pass
         return 0.0
 
+    def _extract_trade_count_24h(self, ticker: Dict[str, Any]) -> int:
+        """Extract 24-h trade count from a raw ticker dict."""
+        src = ticker.get("ticker", ticker)
+        for key in ("trade_count", "count", "trades_24h"):
+            val = src.get(key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
     def _fetch_candles(
         self,
         pair: str,
@@ -1306,6 +1318,7 @@ class Trader:
                     "levels": _rug_levels,
                     "indicators": _rug_indicators,
                     "volume_24h_idr": self._extract_volume_idr(ticker),
+                    "trades_24h": self._extract_trade_count_24h(ticker),
                 }
 
         insufficient_data = len(candles) < self.config.min_candles
@@ -1325,6 +1338,7 @@ class Trader:
         # Record price in the per-pair pump-protection rolling buffer.
         self._record_price(pair, price)
         indicators: MomentumIndicators = derive_indicators(candles)
+        trades_24h = self._extract_trade_count_24h(ticker)
 
         # ── Multi-timeframe analysis ─────────────────────────────────────────
         mtf: Optional[MultiTimeframeResult] = None
@@ -1457,6 +1471,7 @@ class Trader:
             "smart_entry": smart_entry,
             "trade_flow": trade_flow,
             "volume_24h_idr": self._extract_volume_idr(ticker),
+            "trades_24h": trades_24h,
         }
 
     def _check_small_coin_ob_quality(
@@ -1815,6 +1830,44 @@ class Trader:
                     return {
                         "status": "skipped",
                         "reason": skip_reason,
+                        "portfolio": _tracker.as_dict(price),
+                    }
+                # Quiet/dead coin guard: require minimum 24-h volume/trade count
+                vol_24h_idr = float(snapshot.get("volume_24h_idr") or 0.0)
+                trades_24h = int(snapshot.get("trades_24h") or 0)
+                if (
+                    self.config.small_coin_min_volume_24h_idr > 0
+                    and vol_24h_idr < self.config.small_coin_min_volume_24h_idr
+                ):
+                    logger.info(
+                        "Cheap coin %s blocked by low 24h volume: %.0f < %.0f",
+                        snapshot["pair"],
+                        vol_24h_idr,
+                        self.config.small_coin_min_volume_24h_idr,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            f"small_coin_low_volume {vol_24h_idr:.0f} < {self.config.small_coin_min_volume_24h_idr:.0f}"
+                        ),
+                        "portfolio": _tracker.as_dict(price),
+                    }
+                if (
+                    self.config.small_coin_min_trades_24h > 0
+                    and trades_24h > 0
+                    and trades_24h < self.config.small_coin_min_trades_24h
+                ):
+                    logger.info(
+                        "Cheap coin %s blocked by low trade count: %d < %d",
+                        snapshot["pair"],
+                        trades_24h,
+                        self.config.small_coin_min_trades_24h,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            f"small_coin_low_trades {trades_24h} < {self.config.small_coin_min_trades_24h}"
+                        ),
                         "portfolio": _tracker.as_dict(price),
                     }
 
@@ -2953,6 +3006,39 @@ class Trader:
                         or 0
                     )
                     if 0 < _last_price < self.config.min_buy_price_idr:
+                        _vol_24h = self._extract_volume_idr(prefetched_ticker)
+                        if (
+                            self.config.small_coin_min_volume_24h_idr > 0
+                            and _vol_24h < self.config.small_coin_min_volume_24h_idr
+                        ):
+                            logger.debug(
+                                "Pre-scan: skipping cheap low-volume coin %s "
+                                "(price=%.6g IDR < %.6g, vol24h=%.0f < %.0f)",
+                                pair,
+                                _last_price,
+                                self.config.min_buy_price_idr,
+                                _vol_24h,
+                                self.config.small_coin_min_volume_24h_idr,
+                            )
+                            skipped_pairs.append(pair)
+                            continue
+                        _trades_24h = self._extract_trade_count_24h(prefetched_ticker)
+                        if (
+                            self.config.small_coin_min_trades_24h > 0
+                            and _trades_24h > 0
+                            and _trades_24h < self.config.small_coin_min_trades_24h
+                        ):
+                            logger.debug(
+                                "Pre-scan: skipping cheap low-trade coin %s "
+                                "(price=%.6g IDR < %.6g, trades24h=%d < %d)",
+                                pair,
+                                _last_price,
+                                self.config.min_buy_price_idr,
+                                _trades_24h,
+                                self.config.small_coin_min_trades_24h,
+                            )
+                            skipped_pairs.append(pair)
+                            continue
                         _ws_depth = self._multi_feed.get_depth(pair)
                         if _ws_depth is not None:
                             _bids = _ws_depth.get("buy", [])

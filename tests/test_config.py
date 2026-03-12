@@ -77,6 +77,24 @@ class NewConfigFieldsTest(TestCase):
             with self.assertRaises(ValueError):
                 BotConfig.from_env()
 
+    def test_small_coin_volume_and_trades_defaults(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.small_coin_min_volume_24h_idr, 1_000_000.0)
+            self.assertEqual(cfg.small_coin_min_trades_24h, 50)
+
+    def test_small_coin_volume_and_trades_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(
+            __import__("os").environ,
+            {"SMALL_COIN_MIN_VOLUME_24H_IDR": "2500000", "SMALL_COIN_MIN_TRADES_24H": "75"},
+            clear=True,
+        ):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.small_coin_min_volume_24h_idr, 2_500_000.0)
+            self.assertEqual(cfg.small_coin_min_trades_24h, 75)
+
     def test_log_file_default_none(self):
         from unittest.mock import patch
         with patch.dict(__import__("os").environ, {}, clear=True):

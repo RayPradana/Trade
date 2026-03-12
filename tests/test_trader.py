@@ -1671,6 +1671,8 @@ def _make_buy_snap(price: float = 100.0, action: str = "buy") -> Dict[str, Any]:
         "volatility": None,
         "levels": None,
         "indicators": None,
+        "volume_24h_idr": 10_000_000.0,
+        "trades_24h": 1_000,
         "insufficient_data": False,
         "grid_plan": None,
         "decision": StrategyDecision(
@@ -1778,6 +1780,30 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
         self.assertNotIn("small_coin_thin_book", outcome.get("reason", ""))
         self.assertNotIn("small_coin_illiquid", outcome.get("reason", ""))
+
+    def test_cheap_coin_low_volume_blocked(self):
+        """Cheap coin with healthy OB but low 24-h volume must be blocked."""
+        bids = [["4.0", "10000"], ["3.9", "12000"], ["3.8", "8000"], ["3.7", "9000"], ["3.6", "7000"]]
+        asks = [["4.01", "100"]]
+        trader = self._trader(min_price=10.0, coin_price=4.0, bids=bids, asks=asks)
+        snap = _make_buy_snap(price=4.0)
+        snap["volume_24h_idr"] = 100_000.0  # below 1M default
+        snap["trades_24h"] = 200  # above trades threshold so only volume fails
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("small_coin_low_volume", outcome["reason"])
+
+    def test_cheap_coin_low_trades_blocked(self):
+        """Cheap coin with healthy OB but low trade count must be blocked."""
+        bids = [["4.0", "10000"], ["3.9", "12000"], ["3.8", "8000"], ["3.7", "9000"], ["3.6", "7000"]]
+        asks = [["4.01", "100"]]
+        trader = self._trader(min_price=10.0, coin_price=4.0, bids=bids, asks=asks)
+        snap = _make_buy_snap(price=4.0)
+        snap["volume_24h_idr"] = 5_000_000.0  # above default
+        snap["trades_24h"] = 10  # below 50 default
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("small_coin_low_trades", outcome["reason"])
 
     def test_cheap_coin_illiquid_depth_skipped(self):
         """Buy must be skipped when total IDR bid depth is below small_coin_min_depth_idr."""
@@ -1901,8 +1927,14 @@ class PreScanCheapCoinFilterTest(unittest.TestCase):
             websocket_enabled=False,
         )
         # Inject ticker data directly into the feed cache
-        trader._multi_feed._apply_ws_message_for_pair("meme_idr", {"last": "10", "high": "11", "low": "10"})
-        trader._multi_feed._apply_ws_message_for_pair("btc_idr", {"last": "1000000000", "high": "1100000000"})
+        trader._multi_feed._apply_ws_message_for_pair(
+            "meme_idr",
+            {"last": "10", "high": "11", "low": "10", "vol_idr": "200000", "trade_count": "10"},
+        )
+        trader._multi_feed._apply_ws_message_for_pair(
+            "btc_idr",
+            {"last": "1000000000", "high": "1100000000", "vol_idr": "5000000000", "trade_count": "5000"},
+        )
         trader._all_pairs = ["meme_idr", "btc_idr"]
 
         # Inject thin orderbook for meme_idr (only 1 bid level → thin book)
@@ -1959,7 +1991,10 @@ class PreScanCheapCoinFilterTest(unittest.TestCase):
             client=ScanClient(),
             websocket_enabled=False,
         )
-        trader._multi_feed._apply_ws_message_for_pair("shib_idr", {"last": "50", "high": "55"})
+        trader._multi_feed._apply_ws_message_for_pair(
+            "shib_idr",
+            {"last": "50", "high": "55", "vol_idr": "5000000", "trade_count": "200"},
+        )
         trader._all_pairs = ["shib_idr"]
 
         # Inject a healthy orderbook with 5 levels and >50K IDR depth, tight spread

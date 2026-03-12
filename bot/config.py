@@ -273,6 +273,12 @@ class BotConfig:
     # with a healthy book are allowed through.
     # E.g. 100.0 = apply quality checks to coins priced below 100 IDR.  0 = disabled.
     min_buy_price_idr: float = 100.0
+    # Minimum 24-h IDR volume required for cheap coins (price < min_buy_price_idr).
+    # Protects against "sepi" dead coins that rarely trade even if the orderbook
+    # looks healthy.  0 = disabled.
+    small_coin_min_volume_24h_idr: float = 1_000_000.0
+    # Minimum 24-h trade count required for cheap coins.  0 = disabled.
+    small_coin_min_trades_24h: int = 50
     # Minimum number of bid levels required in the orderbook for a coin priced
     # below min_buy_price_idr.  Fewer levels indicate a thin/illiquid book.
     # 0 = disabled (skip the level count check).
@@ -682,6 +688,8 @@ class BotConfig:
             pump_lookback_seconds=_env_float("PUMP_LOOKBACK_SECONDS", "60"),
             max_spread_pct=_env_float("MAX_SPREAD_PCT", "0"),
             min_buy_price_idr=_env_float("MIN_BUY_PRICE_IDR", "100"),
+            small_coin_min_volume_24h_idr=_env_float("SMALL_COIN_MIN_VOLUME_24H_IDR", "1000000"),
+            small_coin_min_trades_24h=_env_int("SMALL_COIN_MIN_TRADES_24H", "50"),
             small_coin_min_bid_levels=_env_int("SMALL_COIN_MIN_BID_LEVELS", "3"),
             small_coin_min_depth_idr=_env_float("SMALL_COIN_MIN_DEPTH_IDR", "50000"),
             small_coin_max_spread_pct=_env_float("SMALL_COIN_MAX_SPREAD_PCT", "0.05"),
@@ -880,6 +888,10 @@ class BotConfig:
             raise ValueError("MAX_SPREAD_PCT must be non-negative")
         if not (0 <= self.min_buy_price_idr < 1e9):
             raise ValueError("MIN_BUY_PRICE_IDR must be between 0 and 1e9")
+        if self.small_coin_min_volume_24h_idr < 0:
+            raise ValueError("SMALL_COIN_MIN_VOLUME_24H_IDR must be non-negative")
+        if self.small_coin_min_trades_24h < 0:
+            raise ValueError("SMALL_COIN_MIN_TRADES_24H must be non-negative")
         if self.small_coin_min_bid_levels < 0:
             raise ValueError("SMALL_COIN_MIN_BID_LEVELS must be non-negative")
         if self.small_coin_min_depth_idr < 0:
