@@ -1852,6 +1852,8 @@ class Trader:
                         ),
                         "portfolio": _tracker.as_dict(price),
                     }
+                # Only enforce trade-count check when the exchange reports it; some
+                # tickers omit trade_count entirely (treated as 0/unknown).
                 if (
                     self.config.small_coin_min_trades_24h > 0
                     and trades_24h > 0
@@ -3023,6 +3025,8 @@ class Trader:
                             skipped_pairs.append(pair)
                             continue
                         _trades_24h = self._extract_trade_count_24h(prefetched_ticker)
+                        # Only enforce when trade count is present (>0); summaries
+                        # that omit trade_count are treated as unknown.
                         if (
                             self.config.small_coin_min_trades_24h > 0
                             and _trades_24h > 0
