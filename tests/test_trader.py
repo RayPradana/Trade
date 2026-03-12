@@ -1338,6 +1338,79 @@ class LiquidityDepthFilterTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("thin_market", outcome["reason"])
 
+    def test_missing_depth_keys_does_not_block_trade(self):
+        """When depth API returns no buy/sell keys, trade must NOT be blocked."""
+        config = BotConfig(api_key=None, min_liquidity_depth_idr=50_000_000, dry_run=True)
+        trader = Trader(config)
+        # Simulate an API error response: no buy/sell keys at all
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"error": "pair not found"},
+        })()
+        snap = {
+            "pair": "ogn_idr",
+            "price": 532.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=532.0,
+                amount=10.0,
+                stop_loss=480.0,
+                take_profit=600.0,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be blocked for thin_market when depth is unavailable
+        self.assertNotIn("thin_market", outcome.get("reason", ""))
+
+    def test_liquidity_depth_idr_returns_none_for_empty_dict(self):
+        """_liquidity_depth_idr must return None when depth has no orderbook keys."""
+        from bot.trader import Trader
+        trader = Trader(BotConfig(api_key=None, dry_run=True))
+        self.assertIsNone(trader._liquidity_depth_idr({}, 100.0))
+        self.assertIsNone(trader._liquidity_depth_idr({"error": "not found"}, 100.0))
+        self.assertIsNone(trader._liquidity_depth_idr({"ticker": {"last": "532"}}, 100.0))
+
+    def test_liquidity_depth_idr_one_side_only_not_none(self):
+        """When only buy OR sell key exists, return a calculated total (not None)."""
+        from bot.trader import Trader
+        trader = Trader(BotConfig(api_key=None, dry_run=True))
+        # Only bids present — should compute buy-side depth, not return None
+        result = trader._liquidity_depth_idr({"buy": [["532", "100"]]}, 532.0)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 532 * 100, places=0)
+        # Only asks present — should compute ask-side depth, not return None
+        result_ask = trader._liquidity_depth_idr({"sell": [["533", "50"]]}, 532.0)
+        self.assertIsNotNone(result_ask)
+        self.assertAlmostEqual(result_ask, 533 * 50, places=0)
+
+    def test_liquidity_depth_idr_returns_zero_for_empty_lists(self):
+        """_liquidity_depth_idr returns 0 when buy/sell keys exist but are empty."""
+        from bot.trader import Trader
+        trader = Trader(BotConfig(api_key=None, dry_run=True))
+        self.assertEqual(trader._liquidity_depth_idr({"buy": [], "sell": []}, 100.0), 0.0)
+
+    def test_liquidity_depth_idr_computes_correctly(self):
+        """_liquidity_depth_idr sums price × volume for all levels."""
+        from bot.trader import Trader
+        trader = Trader(BotConfig(api_key=None, dry_run=True))
+        depth = {
+            "buy": [["532", "1000"], ["531", "500"]],
+            "sell": [["533", "800"]],
+        }
+        expected = 532 * 1000 + 531 * 500 + 533 * 800
+        self.assertAlmostEqual(
+            trader._liquidity_depth_idr(depth, 532.0), expected, places=0
+        )
+
 
 def _make_buy_snap(price: float = 100.0, action: str = "buy") -> Dict[str, Any]:
     """Helper to create a minimal buy snapshot for maybe_execute tests."""

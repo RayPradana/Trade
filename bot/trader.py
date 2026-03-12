@@ -459,12 +459,34 @@ class Trader:
         except Exception:
             return None
 
-    def _liquidity_depth_idr(self, depth: Dict[str, Any], price: float) -> float:
+    def _liquidity_depth_idr(self, depth: Dict[str, Any], price: float) -> Optional[float]:
         """Return the total IDR value of the top-N bid and ask levels.
 
         Used to filter out thin markets where the effective spread would make
-        a trade unprofitable.  Returns 0.0 on any parse error.
+        a trade unprofitable.
+
+        Returns ``None`` when the depth dict contains no orderbook keys at all
+        (e.g. the API returned an error dict or an unexpected format).  The
+        caller **must** treat ``None`` as "data unavailable" and skip the
+        liquidity check rather than blocking the trade, to avoid false positives
+        when the depth endpoint fails transiently.
+
+        Returns ``0.0`` only when the ``buy`` and ``sell`` keys exist but the
+        levels are genuinely empty (no active orders).
+
+        Returns a positive float when levels are present and parseable.
         """
+        has_buy = "buy" in depth
+        has_sell = "sell" in depth
+        if not has_buy and not has_sell:
+            # Depth response missing both orderbook keys — treat as unavailable,
+            # not as a thin market (the API may have returned an error dict).
+            logger.debug(
+                "_liquidity_depth_idr: depth response has no buy/sell keys "
+                "(keys=%s) — skipping liquidity check",
+                list(depth.keys())[:5],
+            )
+            return None
         try:
             bids = (depth.get("buy") or [])[:_EXECUTION_DEPTH_LEVELS]
             asks = (depth.get("sell") or [])[:_EXECUTION_DEPTH_LEVELS]
@@ -968,7 +990,14 @@ class Trader:
         # ── Minimum liquidity depth check ─────────────────────────────────────
         if self.config.min_liquidity_depth_idr > 0 and decision.action == "buy":
             total_depth = self._liquidity_depth_idr(depth, price)
-            if total_depth < self.config.min_liquidity_depth_idr:
+            if total_depth is None:
+                # Depth data unavailable (API error / unexpected format).
+                # Do NOT treat as thin market — skip the filter and proceed.
+                logger.warning(
+                    "Depth data unavailable for %s — skipping liquidity check",
+                    snapshot["pair"],
+                )
+            elif total_depth < self.config.min_liquidity_depth_idr:
                 logger.info(
                     "Thin market on %s: depth Rp%.0f < min Rp%.0f — skipping buy",
                     snapshot["pair"], total_depth, self.config.min_liquidity_depth_idr,
