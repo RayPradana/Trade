@@ -837,8 +837,9 @@ def detect_pump_sniper(
 ) -> PumpSniperSignal:
     """Detect rapid price + volume surge that often precedes a pump.
 
-    Compares the short-window average price/volume against a longer baseline.
-    Flags when both price and volume exceed their respective thresholds.
+    Compares the short-window average price/volume against a longer baseline
+    (up to *long_window* candles immediately before the short window).  Flags
+    when both price and volume exceed their respective thresholds.
     """
     if long_window <= short_window or short_window <= 0:
         return PumpSniperSignal(detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0)
@@ -847,7 +848,7 @@ def detect_pump_sniper(
 
     candles_list = list(candles)
     recent = candles_list[-short_window:]
-    baseline_end = max(0, len(candles_list) - short_window)
+    baseline_end = len(candles_list) - short_window
     baseline_start = max(0, baseline_end - long_window)
     baseline = candles_list[baseline_start:baseline_end]
     if not baseline or not recent:
@@ -868,7 +869,8 @@ def detect_pump_sniper(
     price_factor = price_ratio / min_price_ratio if min_price_ratio > 0 else 0.0
     vol_factor = vol_ratio / min_volume_ratio if min_volume_ratio > 0 else 0.0
     min_factor = min(price_factor, vol_factor)
-    # Normalise so factor=1 → score 0, factor=2 → score 1 (linear clamp).
+    # Normalise so min_factor=1 → score 0, min_factor=2 → score 1 (linear clamp
+    # on the weaker of price/volume surges).
     score = max(0.0, min(1.0, min_factor - 1.0))
 
     return PumpSniperSignal(
