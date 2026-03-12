@@ -134,6 +134,12 @@ class Trader:
         # Populated by _ensure_pair_min_order_cache().  Tracks how many scan
         # cycles have elapsed since the last cache refresh.
         self._pair_min_order_cache_cycles: int = 0
+        # ── Per-pair OHLC candle cache ────────────────────────────────────────
+        # Maps pair → (fetch_timestamp, candles).  Used during scan to avoid
+        # calling get_ohlc() on every cycle for every pair, which would
+        # saturate the REST rate limit.  Entries are reused until
+        # config.scan_candle_cache_seconds have elapsed.
+        self._candle_cache: Dict[str, Tuple[float, List[Any]]] = {}
 
     # ── Multi-position helpers ─────────────────────────────────────────────
 
@@ -610,13 +616,31 @@ class Trader:
         self,
         pair: str,
         trades: List[Dict[str, Any]],
+        *,
+        use_cache: bool = False,
     ) -> List[Any]:
         """Return OHLCV candles for *pair*, preferring the official OHLC endpoint.
 
         Tries ``/tradingview/history_v2`` first (reliable pre-formed candles).
         Falls back to :func:`~bot.analysis.build_candles` from raw trades when
         the OHLC endpoint is unavailable or returns no data.
+
+        When *use_cache* is ``True`` and ``config.scan_candle_cache_seconds > 0``,
+        a recently fetched result is returned from the in-memory cache without
+        hitting the REST API.  This is used during the scan loop to avoid making
+        a ``get_ohlc`` call for every pair on every cycle, which would quickly
+        exhaust the REST rate limit.
         """
+        ttl = self.config.scan_candle_cache_seconds
+        if use_cache and ttl > 0:
+            cached = self._candle_cache.get(pair)
+            if cached is not None:
+                ts, candles = cached
+                if time.time() - ts < ttl:
+                    logger.debug(
+                        "Candle cache hit for %s (age=%.0fs)", pair, time.time() - ts
+                    )
+                    return candles
         try:
             tf = interval_to_ohlc_tf(self.config.interval_seconds)
             # Request enough candles to seed all indicators (slow_window + buffer).
@@ -627,6 +651,8 @@ class Trader:
                 logger.debug(
                     "OHLC candles for %s: %d candles (tf=%s)", pair, len(candles), tf
                 )
+                if ttl > 0:
+                    self._candle_cache[pair] = (time.time(), candles)
                 return candles
         except Exception as exc:
             logger.debug(
@@ -1085,6 +1111,7 @@ class Trader:
         pair: Optional[str] = None,
         prefetched_ticker: Optional[Dict[str, Any]] = None,
         skip_depth: bool = False,
+        skip_trades: bool = False,
     ) -> Dict[str, Any]:
         pair = pair or self.config.pair
         ticker: Dict[str, Any]
@@ -1096,6 +1123,10 @@ class Trader:
         # detection, imbalance) will return neutral defaults for the scan,
         # which is acceptable because depth is only needed for the final trade
         # execution decision, not for pair selection.
+        # When ``skip_trades`` is True (also used during scanning when WebSocket
+        # ticker is available) we skip the per-pair REST /trades call and pass
+        # an empty list.  analyze_trade_flow will return a neutral result, and
+        # _fetch_candles will use the OHLC cache instead.
         _empty_depth: Dict[str, Any] = {"buy": [], "sell": []}
         # Determine the best available realtime snapshot for this pair:
         # 1. Per-pair position feed (started when a position on this pair is opened)
@@ -1115,21 +1146,30 @@ class Trader:
                 depth = _empty_depth
             else:
                 depth = _rt_snap.get("depth") or self.client.get_depth(pair, count=200)
-            trades = _rt_snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
+            if skip_trades:
+                trades = []
+            else:
+                trades = _rt_snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
         else:
             ticker = prefetched_ticker or self.client.get_ticker(pair)
             if skip_depth:
                 depth = _empty_depth
             else:
                 depth = self.client.get_depth(pair, count=200)
-            trades = self.client.get_trades(pair, count=self.config.trade_count)
+            if skip_trades:
+                trades = []
+            else:
+                trades = self.client.get_trades(pair, count=self.config.trade_count)
 
         # ── Candle data ──────────────────────────────────────────────────────
         # Prefer the official OHLCV history endpoint which returns pre-formed
         # candles and covers enough history for all indicators even for
         # high-volume pairs.  Fall back to building candles from raw trades
         # (the legacy path) when the OHLC call fails.
-        candles = self._fetch_candles(pair, trades)
+        # When skip_trades is True (scan context) enable the candle cache so
+        # repeated scan calls reuse recently fetched OHLC data instead of
+        # making a new REST request every cycle for every pair.
+        candles = self._fetch_candles(pair, trades, use_cache=skip_trades)
 
         # ── Rug-pull / dead coin filter ──────────────────────────────────────
         # Check the ticker for extreme 24-h price drops or near-zero volume

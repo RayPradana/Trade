@@ -87,6 +87,7 @@ class BotConfig:
     scan_request_delay: float = 0.2  # seconds to wait before each per-pair API call during scanning
     trade_count: int = 1000  # recent trades to fetch per pair when building candles from trades
     min_candles: int = 20  # minimum candle count required for reliable indicator computation
+    scan_candle_cache_seconds: int = 60  # seconds to reuse cached OHLC candles during scan (0 = disabled)
     websocket_enabled: bool = True
     websocket_url: Optional[str] = "wss://ws3.indodax.com/ws/"  # Indodax market-data WebSocket
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
@@ -604,6 +605,7 @@ class BotConfig:
             scan_request_delay=_env_float("SCAN_REQUEST_DELAY", "0.2"),
             trade_count=_env_int("TRADE_COUNT", "1000"),
             min_candles=_env_int("MIN_CANDLES", "20"),
+            scan_candle_cache_seconds=_env_int("SCAN_CANDLE_CACHE_SECONDS", "60"),
             websocket_enabled=websocket_enabled,
             websocket_url=os.getenv("WEBSOCKET_URL", "wss://ws3.indodax.com/ws/") or None,
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
@@ -772,6 +774,8 @@ class BotConfig:
             raise ValueError("TRADE_COUNT must be positive")
         if self.min_candles <= 0:
             raise ValueError("MIN_CANDLES must be positive")
+        if self.scan_candle_cache_seconds < 0:
+            raise ValueError("SCAN_CANDLE_CACHE_SECONDS must be non-negative")
         if self.websocket_batch_size <= 0:
             raise ValueError("WEBSOCKET_BATCH_SIZE must be positive")
         if self.pairs_per_cycle < 0:
