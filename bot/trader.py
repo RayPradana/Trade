@@ -1526,7 +1526,11 @@ class Trader:
         return None  # all checks pass → allow the cheap coin
 
     def _small_coin_trade_reason(self, trades_24h: int) -> Optional[str]:
-        """Return skip reason for cheap coins with insufficient reported trades."""
+        """Return skip reason for cheap coins with insufficient reported trades.
+
+        Indodax summaries often omit ``trade_count``; a missing/zero value is
+        treated as "unknown" rather than blocking by default.
+        """
         min_trades = self.config.small_coin_min_trades_24h
         if min_trades <= 0:
             return None

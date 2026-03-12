@@ -1787,7 +1787,7 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         asks = [["4.01", "100"]]
         trader = self._trader(min_price=10.0, coin_price=4.0, bids=bids, asks=asks)
         snap = _make_buy_snap(price=4.0)
-        snap["volume_24h_idr"] = 100_000.0  # below 1M default
+        snap["volume_24h_idr"] = 100_000.0  # below 1_000_000 default
         snap["trades_24h"] = 200  # above trades threshold so only volume fails
         outcome = trader.maybe_execute(snap)
         self.assertEqual(outcome["status"], "skipped")

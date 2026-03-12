@@ -274,7 +274,7 @@ class BotConfig:
     # E.g. 100.0 = apply quality checks to coins priced below 100 IDR.  0 = disabled.
     min_buy_price_idr: float = 100.0
     # Minimum 24-h IDR volume required for cheap coins (price < min_buy_price_idr).
-    # Protects against "sepi" (quiet/inactive) dead coins that rarely trade even
+    # Protects against quiet/inactive ("sepi") dead coins that rarely trade even
     # if the orderbook looks healthy.  0 = disabled.
     small_coin_min_volume_24h_idr: float = 1_000_000.0
     # Minimum 24-h trade count required for cheap coins.  0 = disabled.
