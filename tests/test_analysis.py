@@ -260,3 +260,155 @@ class SpoofingDetectionTest(unittest.TestCase):
         from bot.analysis import detect_spoofing
         result = detect_spoofing({"buy": [], "sell": []})
         self.assertFalse(result.detected)
+
+
+class SmartEntryEngineTests(unittest.TestCase):
+    """Tests for detect_pre_pump_signal, detect_whale_pressure,
+    detect_fake_breakout, and smart_entry_filter."""
+
+    def _make_candles(self, volumes, close_start=100.0):
+        """Build a minimal Candle list with the given volume series."""
+        from bot.analysis import Candle
+        return [
+            Candle(timestamp=i, open=close_start + i, high=close_start + i + 1,
+                   low=close_start + i - 1, close=close_start + i, volume=v)
+            for i, v in enumerate(volumes)
+        ]
+
+    def _flat_book(self, base_price, n=5, vol=10.0):
+        return [[str(base_price - i * 0.1), str(vol)] for i in range(n)]
+
+    # ── Pre-pump detection ──────────────────────────────────────────────────
+
+    def test_pre_pump_detected_on_volume_surge(self):
+        from bot.analysis import detect_pre_pump_signal
+        # baseline low volume, last 3 candles surge
+        vols = [1.0] * 10 + [5.0, 5.0, 5.0]
+        candles = self._make_candles(vols)
+        result = detect_pre_pump_signal(candles, volume_surge_ratio=2.0)
+        self.assertTrue(result.detected)
+        self.assertGreater(result.volume_surge_ratio, 2.0)
+        self.assertGreater(result.score, 0.0)
+
+    def test_pre_pump_not_detected_on_flat_volume(self):
+        from bot.analysis import detect_pre_pump_signal
+        vols = [2.0] * 13
+        candles = self._make_candles(vols)
+        result = detect_pre_pump_signal(candles, volume_surge_ratio=2.0)
+        self.assertFalse(result.detected)
+        self.assertAlmostEqual(result.volume_surge_ratio, 1.0, places=1)
+
+    def test_pre_pump_insufficient_candles(self):
+        from bot.analysis import detect_pre_pump_signal
+        # Only 4 candles available — not enough for recent_n=3 + 2 baseline
+        candles = self._make_candles([1.0, 2.0, 3.0, 4.0])
+        result = detect_pre_pump_signal(candles, volume_surge_ratio=2.0)
+        self.assertFalse(result.detected)
+        self.assertEqual(result.volume_surge_ratio, 0.0)
+
+    def test_pre_pump_score_saturates_at_one(self):
+        from bot.analysis import detect_pre_pump_signal
+        # Very large volume surge should not produce score > 1.0
+        vols = [1.0] * 10 + [1000.0, 1000.0, 1000.0]
+        candles = self._make_candles(vols)
+        result = detect_pre_pump_signal(candles, volume_surge_ratio=2.0)
+        self.assertLessEqual(result.score, 1.0)
+
+    # ── Whale pressure ─────────────────────────────────────────────────────
+
+    def test_whale_pressure_detected_buy_side(self):
+        from bot.analysis import detect_whale_pressure
+        # Large bid wall → net buying pressure
+        bids = self._flat_book(100.0, n=5)
+        bids.append(["99.0", "500.0"])   # massive bid level
+        asks = self._flat_book(101.0, n=5)
+        depth = {"buy": bids, "sell": asks}
+        result = detect_whale_pressure(depth, pressure_threshold=2.0)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.side, "buy")
+        self.assertGreater(result.pressure, 0)
+
+    def test_whale_pressure_detected_sell_side(self):
+        from bot.analysis import detect_whale_pressure
+        bids = self._flat_book(100.0, n=5)
+        asks = self._flat_book(101.0, n=5)
+        asks.append(["110.0", "500.0"])   # massive ask wall
+        depth = {"buy": bids, "sell": asks}
+        result = detect_whale_pressure(depth, pressure_threshold=2.0)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.side, "sell")
+        self.assertLess(result.pressure, 0)
+
+    def test_whale_pressure_not_detected_flat_book(self):
+        from bot.analysis import detect_whale_pressure
+        bids = self._flat_book(100.0, n=5)
+        asks = self._flat_book(101.0, n=5)
+        depth = {"buy": bids, "sell": asks}
+        result = detect_whale_pressure(depth, pressure_threshold=2.0)
+        self.assertFalse(result.detected)
+
+    def test_whale_pressure_empty_book(self):
+        from bot.analysis import detect_whale_pressure
+        result = detect_whale_pressure({"buy": [], "sell": []})
+        self.assertFalse(result.detected)
+        self.assertIsNone(result.side)
+
+    # ── Fake breakout detection ─────────────────────────────────────────────
+
+    def test_fake_breakout_detected_thin_volume(self):
+        from bot.analysis import detect_fake_breakout, SupportResistance
+        # Current price above resistance, but very thin volume
+        vols = [10.0] * 9 + [1.0]   # last candle has 10% of average
+        candles = self._make_candles(vols, close_start=100.0)
+        levels = SupportResistance(support=90.0, resistance=105.0, lookback=10)
+        result = detect_fake_breakout(candles, current_price=110.0, levels=levels)
+        self.assertTrue(result.breakout_present)
+        self.assertTrue(result.detected)
+        self.assertLess(result.volume_ratio, 0.7)
+        self.assertGreater(result.score, 0.0)
+
+    def test_fake_breakout_not_detected_with_volume(self):
+        from bot.analysis import detect_fake_breakout, SupportResistance
+        # Breakout present AND confirmed by volume surge
+        vols = [10.0] * 9 + [20.0]   # last candle has 2× average
+        candles = self._make_candles(vols, close_start=100.0)
+        levels = SupportResistance(support=90.0, resistance=105.0, lookback=10)
+        result = detect_fake_breakout(candles, current_price=110.0, levels=levels)
+        self.assertTrue(result.breakout_present)
+        self.assertFalse(result.detected)   # volume confirms → not fake
+        self.assertGreater(result.volume_ratio, 1.0)
+
+    def test_no_breakout_below_resistance(self):
+        from bot.analysis import detect_fake_breakout, SupportResistance
+        vols = [10.0] * 10
+        candles = self._make_candles(vols, close_start=100.0)
+        levels = SupportResistance(support=90.0, resistance=115.0, lookback=10)
+        result = detect_fake_breakout(candles, current_price=110.0, levels=levels)
+        self.assertFalse(result.breakout_present)
+        self.assertFalse(result.detected)
+
+    def test_fake_breakout_no_levels(self):
+        from bot.analysis import detect_fake_breakout
+        vols = [10.0] * 10
+        candles = self._make_candles(vols, close_start=100.0)
+        result = detect_fake_breakout(candles, current_price=110.0, levels=None)
+        self.assertFalse(result.breakout_present)
+        self.assertFalse(result.detected)
+
+    # ── smart_entry_filter wrapper ──────────────────────────────────────────
+
+    def test_smart_entry_filter_returns_all_components(self):
+        from bot.analysis import smart_entry_filter, SupportResistance
+        vols = [10.0] * 10 + [30.0, 30.0, 30.0]
+        candles = self._make_candles(vols, close_start=100.0)
+        bids = self._flat_book(100.0, n=5)
+        bids.append(["99.0", "500.0"])
+        depth = {"buy": bids, "sell": self._flat_book(101.0, n=5)}
+        levels = SupportResistance(support=90.0, resistance=105.0, lookback=10)
+        result = smart_entry_filter(candles, depth, current_price=102.0, levels=levels)
+        # All three sub-results should be present
+        self.assertIsNotNone(result.pre_pump)
+        self.assertIsNotNone(result.whale_pressure)
+        self.assertIsNotNone(result.fake_breakout)
+        # Volume surge in last 3 candles → pre-pump should be detected
+        self.assertTrue(result.pre_pump.detected)

@@ -17,8 +17,10 @@ from .analysis import (
     detect_whale_activity,
     interval_to_ohlc_tf,
     multi_timeframe_confirm,
+    smart_entry_filter,
     MomentumIndicators,
     MultiTimeframeResult,
+    SmartEntryResult,
     SpoofingResult,
     WhaleActivity,
     support_resistance,
@@ -61,9 +63,11 @@ class Trader:
         self._multi_feed: Optional[MultiPairFeed] = None
         self._scan_cycle_count: int = 0  # total completed full-scan cycles (for dynamic refresh)
         # ── Pump-protection price history ────────────────────────────────────
-        # Circular buffer of (unix_timestamp, price) tuples.  Only populated
-        # when pump_protection_pct > 0 to avoid overhead when the feature is off.
-        self._price_history: List[Tuple[float, float]] = []
+        # Per-pair dict of (unix_timestamp, price) buffers.  Keyed by pair name
+        # so that prices from different pairs are never compared against each
+        # other (which would produce nonsensical percentage rises like 46M%).
+        # Only populated when pump_protection_pct > 0.
+        self._price_history: Dict[str, List[Tuple[float, float]]] = {}
         self.tracker = PortfolioTracker(
             initial_capital=config.initial_capital,
             target_profit_pct=config.target_profit_pct,
@@ -289,8 +293,13 @@ class Trader:
                     pass
         return 0.0
 
-    def _record_price(self, price: float) -> None:
-        """Append *(now, price)* to the pump-detection history buffer.
+    def _record_price(self, pair: str, price: float) -> None:
+        """Append *(now, price)* to the per-pair pump-detection history buffer.
+
+        Each pair maintains its own independent price buffer so that prices
+        from different pairs (e.g. BTC/IDR at ~1.5B IDR vs a 100-IDR altcoin)
+        are **never** compared against each other, which would produce wildly
+        incorrect rise percentages.
 
         Old entries outside the lookback window are pruned to keep the buffer
         small.  This method is a no-op when pump protection is disabled.
@@ -298,23 +307,28 @@ class Trader:
         if self.config.pump_protection_pct <= 0:
             return
         now = time.time()
-        self._price_history.append((now, price))
+        buf = self._price_history.setdefault(pair, [])
+        buf.append((now, price))
         # Prune entries older than the lookback window (keep a small tail buffer
         # so the oldest sample inside the window is always available)
         cutoff = now - self.config.pump_lookback_seconds
-        while len(self._price_history) > 1 and self._price_history[0][0] < cutoff:
-            self._price_history.pop(0)
+        while len(buf) > 1 and buf[0][0] < cutoff:
+            buf.pop(0)
 
-    def _is_pumped(self, current_price: float) -> bool:
-        """Return *True* when price has risen above the pump threshold.
+    def _is_pumped(self, pair: str, current_price: float) -> bool:
+        """Return *True* when *pair*'s price has risen above the pump threshold.
 
-        Compares *current_price* to the oldest recorded price inside the
-        ``pump_lookback_seconds`` window.  Returns ``False`` when pump
-        protection is disabled or when there is insufficient price history.
+        Compares *current_price* to the oldest recorded price for *pair* inside
+        the ``pump_lookback_seconds`` window.  Returns ``False`` when pump
+        protection is disabled or when there is insufficient price history for
+        the pair.
         """
-        if self.config.pump_protection_pct <= 0 or not self._price_history:
+        if self.config.pump_protection_pct <= 0:
             return False
-        oldest_price = self._price_history[0][1]
+        buf = self._price_history.get(pair)
+        if not buf:
+            return False
+        oldest_price = buf[0][1]
         if oldest_price <= 0:
             return False
         rise = (current_price - oldest_price) / oldest_price
@@ -572,8 +586,8 @@ class Trader:
         vol = analyze_volatility(candles)
         levels = support_resistance(candles)
         price = self._extract_price(ticker)
-        # Record price in the pump-protection rolling buffer.
-        self._record_price(price)
+        # Record price in the per-pair pump-protection rolling buffer.
+        self._record_price(pair, price)
         indicators: MomentumIndicators = derive_indicators(candles)
 
         # ── Multi-timeframe analysis ─────────────────────────────────────────
@@ -612,6 +626,34 @@ class Trader:
         # note stored in the snapshot and applied in _score_snapshot.
         reference_trend = self._get_reference_pair_trend(pair)
 
+        # ── Smart Entry Engine ────────────────────────────────────────────────
+        smart_entry: Optional[SmartEntryResult] = None
+        if self.config.see_enabled:
+            smart_entry = smart_entry_filter(
+                candles,
+                depth,
+                price,
+                levels,
+                volume_surge_ratio=self.config.see_volume_surge_ratio,
+                whale_pressure_min=self.config.see_whale_pressure_min,
+                breakout_volume_min=self.config.see_breakout_volume_min,
+            )
+            if smart_entry.pre_pump.detected:
+                logger.debug(
+                    "SEE pre-pump on %s: surge_ratio=%.2f score=%.2f",
+                    pair, smart_entry.pre_pump.volume_surge_ratio, smart_entry.pre_pump.score,
+                )
+            if smart_entry.whale_pressure.detected:
+                logger.debug(
+                    "SEE whale pressure on %s: side=%s pressure=%.2f",
+                    pair, smart_entry.whale_pressure.side, smart_entry.whale_pressure.pressure,
+                )
+            if smart_entry.fake_breakout.detected:
+                logger.debug(
+                    "SEE fake breakout on %s: vol_ratio=%.2f score=%.2f",
+                    pair, smart_entry.fake_breakout.volume_ratio, smart_entry.fake_breakout.score,
+                )
+
         grid_plan: Optional[GridPlan] = None
         decision: StrategyDecision
         if self.config.grid_enabled:
@@ -632,6 +674,7 @@ class Trader:
                 trend, orderbook, vol, price, self.config, levels, indicators,
                 mtf=mtf, whale=whale, spoofing=spoofing,
                 effective_capital=self.tracker.effective_capital(),
+                smart_entry=smart_entry,
             )
             # Apply correlated-pair confidence boost when reference trend aligns
             if reference_trend == "up" and decision.action == "buy":
@@ -656,6 +699,7 @@ class Trader:
             "whale": whale,
             "spoofing": spoofing,
             "reference_trend": reference_trend,
+            "smart_entry": smart_entry,
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -838,8 +882,10 @@ class Trader:
         # Skip entry when price has spiked by more than pump_protection_pct
         # within the last pump_lookback_seconds.  Prevents FOMO buying after
         # a sharp pump that is likely to retrace.
-        if decision.action == "buy" and self._is_pumped(price):
-            oldest_price = self._price_history[0][1] if self._price_history else price
+        current_pair = snapshot["pair"]
+        if decision.action == "buy" and self._is_pumped(current_pair, price):
+            pair_buf = self._price_history.get(current_pair, [])
+            oldest_price = pair_buf[0][1] if pair_buf else price
             rise = (price - oldest_price) / oldest_price if oldest_price > 0 else 0.0
             logger.info(
                 "Pump detected on %s: price rose %.2f%% in ≤%.0fs — skipping buy",

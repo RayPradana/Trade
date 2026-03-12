@@ -8,6 +8,7 @@ from .analysis import (
     MomentumIndicators,
     MultiTimeframeResult,
     OrderbookInsight,
+    SmartEntryResult,
     SpoofingResult,
     SupportResistance,
     TrendResult,
@@ -138,6 +139,7 @@ def make_trade_decision(
     whale: Optional[WhaleActivity] = None,
     spoofing: Optional[SpoofingResult] = None,
     effective_capital: Optional[float] = None,
+    smart_entry: Optional[SmartEntryResult] = None,
 ) -> StrategyDecision:
     """Produce a :class:`StrategyDecision` incorporating all available signals.
 
@@ -175,6 +177,10 @@ def make_trade_decision(
         ``config.initial_capital`` as the capital base.  Pass
         ``tracker.effective_capital()`` to enable compounding: each profitable
         trade cycle increases the size of the next position proportionally.
+    smart_entry:
+        Result from the Smart Entry Engine.  When provided, confidence is
+        adjusted by pre-pump signals (+), whale pressure (+/-), and fake
+        breakout risk (-).
     """
     mode = select_strategy(trend, orderbook, vol)
     conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
@@ -258,9 +264,34 @@ def make_trade_decision(
         conf *= 0.75
         spoof_note = f"spoofing_{spoofing.side}_{spoofing.distance_pct:.2%}"
 
+    # ── Smart Entry Engine confidence adjustments ─────────────────────────────
+    see_note = ""
+    if smart_entry is not None:
+        # 1. Pre-pump signal: early volume accumulation → bonus on buy
+        if smart_entry.pre_pump.detected and action == "buy":
+            boost = round(0.06 * smart_entry.pre_pump.score, 4)
+            conf = min(1.0, conf + boost)
+            see_note = "see_pre_pump"
+        # 2. Whale pressure: net bid/ask imbalance confirms or opposes action
+        if smart_entry.whale_pressure.detected:
+            if (action == "buy" and smart_entry.whale_pressure.side == "buy") or (
+                action == "sell" and smart_entry.whale_pressure.side == "sell"
+            ):
+                conf = min(1.0, conf + 0.05)
+                see_note += ("_" if see_note else "") + "see_whale_confirm"
+            elif (action == "buy" and smart_entry.whale_pressure.side == "sell") or (
+                action == "sell" and smart_entry.whale_pressure.side == "buy"
+            ):
+                conf *= 0.85
+                see_note += ("_" if see_note else "") + "see_whale_oppose"
+        # 3. Fake breakout: thin volume above resistance → penalise buy
+        if smart_entry.fake_breakout.detected and action == "buy":
+            conf *= 1.0 - 0.4 * smart_entry.fake_breakout.score
+            see_note += ("_" if see_note else "") + "see_fake_breakout"
+
     conf = round(max(0.0, min(1.0, conf)), 3)
 
-    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note) if n)
+    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note) if n)
     reason = (
         f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
         f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} "

@@ -515,6 +515,87 @@ _SPOOF_MIN_DISTANCE_PCT = 0.03   # 3% away from top of book
 _SPOOF_MIN_LEVELS = 3
 
 
+# ---------------------------------------------------------------------------
+# Smart Entry Engine — dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PrePumpSignal:
+    """Early volume-accumulation signal that may precede a pump.
+
+    ``detected`` is ``True`` when recent candle volume surges above the
+    baseline by at least the configured ratio.
+
+    ``volume_surge_ratio`` is recent_avg_volume / baseline_avg_volume.
+
+    ``score`` is a 0..1 normalised signal strength (1 = very strong surge).
+    """
+
+    detected: bool
+    volume_surge_ratio: float
+    score: float
+
+
+@dataclass
+class WhalePressure:
+    """Net directional pressure from whale-sized orders in the order book.
+
+    Unlike :class:`WhaleActivity` (which finds the largest individual wall),
+    this dataclass captures the *net difference* between the bid-side and
+    ask-side whale ratio, indicating whether smart money is predominantly
+    buying or selling.
+
+    ``detected`` is ``True`` when ``abs(pressure) >= threshold``.
+
+    ``side`` is ``"buy"`` (net bid dominance) or ``"sell"`` (net ask
+    dominance), or ``None`` when nothing significant is detected.
+
+    ``pressure`` is bid_ratio − ask_ratio (positive = buy pressure).
+    """
+
+    detected: bool
+    side: Optional[str]
+    pressure: float
+
+
+@dataclass
+class FakeBreakoutRisk:
+    """Volume-confirmation check for price breakouts above resistance.
+
+    A genuine breakout should be accompanied by above-average volume.
+    When price is above resistance but volume is thin, the move is likely
+    to retrace (fake breakout).
+
+    ``breakout_present`` is ``True`` when current price > resistance.
+
+    ``detected`` is ``True`` when a breakout is present but volume is
+    below the configured minimum ratio.
+
+    ``volume_ratio`` is recent_volume / average_volume.
+
+    ``score`` is the 0..1 risk level (1 = very high fake-breakout risk).
+    """
+
+    breakout_present: bool
+    detected: bool
+    volume_ratio: float
+    score: float
+
+
+@dataclass
+class SmartEntryResult:
+    """Combined result of all Smart Entry Engine checks.
+
+    Aggregates :class:`PrePumpSignal`, :class:`WhalePressure`, and
+    :class:`FakeBreakoutRisk` into a single object passed to
+    ``make_trade_decision`` for confidence adjustment.
+    """
+
+    pre_pump: PrePumpSignal
+    whale_pressure: WhalePressure
+    fake_breakout: FakeBreakoutRisk
+
+
 def detect_spoofing(
     depth: Dict[str, object],
     volume_multiplier: float = _SPOOF_VOLUME_MULTIPLIER,
@@ -575,4 +656,199 @@ def detect_spoofing(
         detected=detected,
         side=best_side if detected else None,
         distance_pct=best_distance,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Smart Entry Engine — detection functions
+# ---------------------------------------------------------------------------
+
+# Number of recent candles used by default when checking for a volume surge.
+_SEE_RECENT_CANDLES = 3
+
+
+def detect_pre_pump_signal(
+    candles: Sequence[Candle],
+    volume_surge_ratio: float = 2.0,
+    recent_n: int = _SEE_RECENT_CANDLES,
+) -> PrePumpSignal:
+    """Detect early volume accumulation that may precede a pump.
+
+    Compares the average volume of the most recent *recent_n* candles against
+    the baseline (all older candles).  A ratio >= *volume_surge_ratio* flags a
+    potential pre-pump accumulation phase.
+
+    :param candles: Ordered candle sequence (oldest → newest).
+    :param volume_surge_ratio: Threshold ratio (recent avg / baseline avg).
+        Default 2.0 — recent candles must carry 2× the baseline volume.
+    :param recent_n: Number of trailing candles treated as "recent".
+    :returns: :class:`PrePumpSignal` with detection result and score.
+    """
+    if len(candles) < recent_n + 2:
+        return PrePumpSignal(detected=False, volume_surge_ratio=0.0, score=0.0)
+
+    baseline_candles = list(candles)[:-recent_n]
+    recent_candles_list = list(candles)[-recent_n:]
+
+    baseline_vols = [c.volume for c in baseline_candles if c.volume > 0]
+    recent_vols = [c.volume for c in recent_candles_list if c.volume > 0]
+
+    if not baseline_vols or not recent_vols:
+        return PrePumpSignal(detected=False, volume_surge_ratio=0.0, score=0.0)
+
+    baseline_avg = mean(baseline_vols)
+    recent_avg = mean(recent_vols)
+
+    if baseline_avg <= 0:
+        return PrePumpSignal(detected=False, volume_surge_ratio=0.0, score=0.0)
+
+    surge = recent_avg / baseline_avg
+    detected = surge >= volume_surge_ratio
+    # Normalise: 0 at ratio=1, saturates at 1 when ratio = 2 × threshold
+    score = min(1.0, max(0.0, (surge - 1.0) / max(volume_surge_ratio - 1.0, 1e-6)))
+    return PrePumpSignal(
+        detected=detected,
+        volume_surge_ratio=round(surge, 4),
+        score=round(score, 4),
+    )
+
+
+def detect_whale_pressure(
+    depth: Dict[str, object],
+    pressure_threshold: float = 2.0,
+    top_n: int = 20,
+) -> WhalePressure:
+    """Detect net directional pressure from whale-sized orders.
+
+    Unlike :func:`detect_whale_activity` (which finds the single largest
+    wall), this function computes the *difference* between the bid-side and
+    ask-side whale ratios to determine whether smart money is net-buying or
+    net-selling.
+
+    A positive ``pressure`` means the bid side has a comparatively larger
+    anomaly (net buying pressure); a negative value means the opposite.
+    When ``abs(pressure) >= pressure_threshold`` the signal is detected.
+
+    :param depth: Raw depth dict with ``"buy"`` / ``"sell"`` lists of
+        ``[price, volume]`` pairs.
+    :param pressure_threshold: Minimum ``|bid_ratio - ask_ratio|`` to flag.
+    :param top_n: Number of order-book levels to inspect per side.
+    :returns: :class:`WhalePressure` result.
+    """
+    bids = (depth.get("buy") or [])[:top_n]
+    asks = (depth.get("sell") or [])[:top_n]
+
+    def _max_ratio(levels: list) -> float:
+        if len(levels) < _WHALE_MIN_LEVELS:
+            return 1.0
+        try:
+            volumes = [float(lvl[1]) for lvl in levels]
+        except (IndexError, TypeError, ValueError):
+            return 1.0
+        avg = mean(volumes)
+        if avg <= 0:
+            return 1.0
+        return max(volumes) / avg
+
+    bid_ratio = _max_ratio(list(bids))
+    ask_ratio = _max_ratio(list(asks))
+    pressure = bid_ratio - ask_ratio
+    detected = abs(pressure) >= pressure_threshold
+    side: Optional[str] = None
+    if detected:
+        side = "buy" if pressure > 0 else "sell"
+    return WhalePressure(
+        detected=detected,
+        side=side,
+        pressure=round(pressure, 4),
+    )
+
+
+def detect_fake_breakout(
+    candles: Sequence[Candle],
+    current_price: float,
+    levels: Optional[SupportResistance],
+    min_volume_ratio: float = 0.7,
+) -> FakeBreakoutRisk:
+    """Assess the risk that a breakout above resistance is not volume-confirmed.
+
+    A genuine breakout should be accompanied by above-average volume.  When
+    price is above the resistance level but the most recent candle's volume is
+    below *min_volume_ratio* × the historical average, the breakout is flagged
+    as potentially fake (likely to retrace).
+
+    :param candles: Candle sequence (oldest → newest).
+    :param current_price: Latest trade price.
+    :param levels: Support / resistance derived from the candle series.
+    :param min_volume_ratio: Minimum (recent_vol / avg_vol) to confirm a real
+        breakout.  Default 0.7 (at least 70 % of average volume required).
+    :returns: :class:`FakeBreakoutRisk` result.
+    """
+    no_risk = FakeBreakoutRisk(
+        breakout_present=False, detected=False, volume_ratio=1.0, score=0.0
+    )
+
+    if not candles or levels is None:
+        return no_risk
+
+    resistance = levels.resistance
+    if not resistance or current_price <= resistance:
+        return no_risk
+
+    # Price is above resistance — check whether volume confirms the move.
+    volumes = [c.volume for c in candles if c.volume > 0]
+    if len(volumes) < 2:
+        return FakeBreakoutRisk(
+            breakout_present=True, detected=False, volume_ratio=1.0, score=0.0
+        )
+
+    avg_vol = mean(volumes[:-1])  # exclude last candle from baseline
+    recent_vol = volumes[-1]
+
+    if avg_vol <= 0:
+        return FakeBreakoutRisk(
+            breakout_present=True, detected=False, volume_ratio=1.0, score=0.0
+        )
+
+    volume_ratio = recent_vol / avg_vol
+    detected = volume_ratio < min_volume_ratio
+    # Risk score: 1 when volume_ratio ≈ 0, 0 when volume_ratio ≥ 1.
+    score = min(1.0, max(0.0, 1.0 - volume_ratio))
+    return FakeBreakoutRisk(
+        breakout_present=True,
+        detected=detected,
+        volume_ratio=round(volume_ratio, 4),
+        score=round(score, 4),
+    )
+
+
+def smart_entry_filter(
+    candles: Sequence[Candle],
+    depth: Dict[str, object],
+    current_price: float,
+    levels: Optional[SupportResistance],
+    volume_surge_ratio: float = 2.0,
+    whale_pressure_min: float = 2.0,
+    breakout_volume_min: float = 0.7,
+) -> SmartEntryResult:
+    """Run all Smart Entry Engine checks and return a combined result.
+
+    Convenience wrapper that calls :func:`detect_pre_pump_signal`,
+    :func:`detect_whale_pressure`, and :func:`detect_fake_breakout` with the
+    provided parameters and bundles the results into a
+    :class:`SmartEntryResult`.
+
+    :param candles: Primary candle series (oldest → newest).
+    :param depth: Current order-book depth dict.
+    :param current_price: Latest trade price.
+    :param levels: Support / resistance levels.
+    :param volume_surge_ratio: Passed to :func:`detect_pre_pump_signal`.
+    :param whale_pressure_min: Passed to :func:`detect_whale_pressure`.
+    :param breakout_volume_min: Passed to :func:`detect_fake_breakout`.
+    :returns: :class:`SmartEntryResult`.
+    """
+    return SmartEntryResult(
+        pre_pump=detect_pre_pump_signal(candles, volume_surge_ratio),
+        whale_pressure=detect_whale_pressure(depth, whale_pressure_min),
+        fake_breakout=detect_fake_breakout(candles, current_price, levels, breakout_volume_min),
     )

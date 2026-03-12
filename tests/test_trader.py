@@ -1490,41 +1490,42 @@ class PumpProtectionTest(unittest.TestCase):
 
     def test_is_pumped_returns_false_with_no_history(self):
         trader = self._trader()
-        self.assertFalse(trader._is_pumped(200.0))
+        self.assertFalse(trader._is_pumped("btc_idr", 200.0))
 
     def test_is_pumped_returns_false_when_disabled(self):
         trader = self._trader(pump_pct=0.0)
-        trader._price_history = [(0.0, 100.0)]
-        self.assertFalse(trader._is_pumped(200.0))
+        trader._price_history = {"btc_idr": [(0.0, 100.0)]}
+        self.assertFalse(trader._is_pumped("btc_idr", 200.0))
 
     def test_is_pumped_true_on_large_rise(self):
         trader = self._trader(pump_pct=0.05)
-        trader._price_history = [(0.0, 100.0)]  # inject old price manually
-        self.assertTrue(trader._is_pumped(106.0))   # +6% > 5% threshold
+        trader._price_history = {"btc_idr": [(0.0, 100.0)]}  # inject old price manually
+        self.assertTrue(trader._is_pumped("btc_idr", 106.0))   # +6% > 5% threshold
 
     def test_is_pumped_false_on_small_rise(self):
         trader = self._trader(pump_pct=0.05)
-        trader._price_history = [(0.0, 100.0)]
-        self.assertFalse(trader._is_pumped(104.0))  # +4% < 5% threshold
+        trader._price_history = {"btc_idr": [(0.0, 100.0)]}
+        self.assertFalse(trader._is_pumped("btc_idr", 104.0))  # +4% < 5% threshold
 
     def test_record_price_populates_history(self):
         trader = self._trader(pump_pct=0.05)
-        self.assertEqual(trader._price_history, [])
-        trader._record_price(100.0)
-        self.assertEqual(len(trader._price_history), 1)
-        self.assertAlmostEqual(trader._price_history[0][1], 100.0)
+        self.assertEqual(trader._price_history, {})
+        trader._record_price("btc_idr", 100.0)
+        self.assertIn("btc_idr", trader._price_history)
+        self.assertEqual(len(trader._price_history["btc_idr"]), 1)
+        self.assertAlmostEqual(trader._price_history["btc_idr"][0][1], 100.0)
 
     def test_record_price_noop_when_disabled(self):
         trader = self._trader(pump_pct=0.0)
-        trader._record_price(100.0)
-        self.assertEqual(trader._price_history, [])
+        trader._record_price("btc_idr", 100.0)
+        self.assertEqual(trader._price_history, {})
 
     def test_pump_blocks_buy_in_maybe_execute(self):
         """A pumped price should cause maybe_execute to skip the buy."""
         trader = self._trader(pump_pct=0.05)
         # Inject a historic price well below the current price to simulate pump
         import time as _time
-        trader._price_history = [(_time.time() - 30, 80.0)]  # 30s ago @ 80
+        trader._price_history = {"btc_idr": [(_time.time() - 30, 80.0)]}  # 30s ago @ 80
         outcome = trader.maybe_execute(_make_buy_snap(price=100.0))  # +25% pump
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("pump_detected", outcome["reason"])
@@ -1533,10 +1534,19 @@ class PumpProtectionTest(unittest.TestCase):
         """Pump protection only applies to buy orders."""
         import time as _time
         trader = self._trader(pump_pct=0.05)
-        trader._price_history = [(_time.time() - 30, 80.0)]
+        trader._price_history = {"btc_idr": [(_time.time() - 30, 80.0)]}
         trader.tracker.record_trade("buy", 80.0, 0.1)
         outcome = trader.maybe_execute(_make_buy_snap(price=100.0, action="sell"))
         self.assertNotIn("pump_detected", outcome.get("reason", ""))
+
+    def test_pump_history_isolated_per_pair(self):
+        """Prices from different pairs must not cross-contaminate the pump check."""
+        import time as _time
+        trader = self._trader(pump_pct=0.05)
+        # Inject a very low price for a different pair — must not affect btc_idr check
+        trader._price_history = {"eth_idr": [(_time.time() - 10, 1.0)]}
+        # btc_idr has no history → should not be flagged as pumped
+        self.assertFalse(trader._is_pumped("btc_idr", 1_500_000_000.0))
 
 
 class EvaluateDynamicTpTest(unittest.TestCase):

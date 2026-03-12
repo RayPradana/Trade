@@ -181,6 +181,22 @@ class BotConfig:
     # fraction of the best bid price.
     # E.g. 0.002 = skip when spread > 0.2%.  0 = disabled (default).
     max_spread_pct: float = 0.0
+    # ── Smart Entry Engine (SEE) ──────────────────────────────────────────────
+    # Three-part entry quality filter:
+    #   1. Pre-pump detection — flags early volume accumulation before a pump.
+    #   2. Whale pressure reading — net bid/ask whale ratio for direction bias.
+    #   3. Fake breakout guard — requires volume to confirm a resistance break.
+    # When see_enabled=True, signals boost or penalise confidence before trades.
+    see_enabled: bool = False
+    # Volume surge ratio: recent_avg / baseline_avg must exceed this to detect
+    # a pre-pump accumulation phase.  E.g. 2.0 = 2× average baseline volume.
+    see_volume_surge_ratio: float = 2.0
+    # Minimum net whale pressure ratio (bid_whale_ratio − ask_whale_ratio) to
+    # classify as significant directional whale activity.
+    see_whale_pressure_min: float = 2.0
+    # Minimum (recent_vol / avg_vol) ratio to treat a resistance breakout as
+    # volume-confirmed and genuine.  E.g. 0.7 = 70% of average volume needed.
+    see_breakout_volume_min: float = 0.7
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -263,6 +279,10 @@ class BotConfig:
             pump_protection_pct=float(os.getenv("PUMP_PROTECTION_PCT", "0")),
             pump_lookback_seconds=float(os.getenv("PUMP_LOOKBACK_SECONDS", "60")),
             max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0")),
+            see_enabled=os.getenv("SEE_ENABLED", "false").lower() in {"1", "true", "yes"},
+            see_volume_surge_ratio=float(os.getenv("SEE_VOLUME_SURGE_RATIO", "2.0")),
+            see_whale_pressure_min=float(os.getenv("SEE_WHALE_PRESSURE_MIN", "2.0")),
+            see_breakout_volume_min=float(os.getenv("SEE_BREAKOUT_VOLUME_MIN", "0.7")),
         )
         cfg._validate()
         return cfg
@@ -355,5 +375,11 @@ class BotConfig:
             raise ValueError("PUMP_LOOKBACK_SECONDS must be positive")
         if self.max_spread_pct < 0:
             raise ValueError("MAX_SPREAD_PCT must be non-negative")
+        if self.see_volume_surge_ratio <= 0:
+            raise ValueError("SEE_VOLUME_SURGE_RATIO must be positive")
+        if self.see_whale_pressure_min < 0:
+            raise ValueError("SEE_WHALE_PRESSURE_MIN must be non-negative")
+        if not (0.0 <= self.see_breakout_volume_min <= 1.0):
+            raise ValueError("SEE_BREAKOUT_VOLUME_MIN must be between 0 and 1")
         if not self.dry_run and not self.api_key:
             self.require_auth()
