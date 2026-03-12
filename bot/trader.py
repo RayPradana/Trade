@@ -1943,7 +1943,7 @@ class Trader:
                     tick_pct = (top_bid - second_bid) / top_bid
             if tick_pct is None and top_ask > top_bid:
                 tick_pct = (top_ask - top_bid) / top_bid
-            # When the book is flat (e.g. 4 → 4) we still want to approximate
+            # When the book is flat (e.g. 4 to 4) we still want to approximate
             # the discrete tick.  Use a 1-unit tick relative to the best bid to
             # catch tiny integer-priced coins that require outsized moves.
             if tick_pct is None and top_bid > 0:
