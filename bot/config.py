@@ -205,6 +205,22 @@ class BotConfig:
     # fraction of the best bid price.
     # E.g. 0.002 = skip when spread > 0.2%.  0 = disabled (default).
     max_spread_pct: float = 0.0
+    # ── Minimum price filter ──────────────────────────────────────────────────
+    # Skip any buy when the current coin price is below this IDR amount.
+    # Prevents entry into very cheap coins (e.g. DENT at 4 IDR) where the
+    # minimum price increment represents a disproportionately large move.
+    # E.g. 10.0 = skip coins priced below 10 IDR.  0 = disabled (default).
+    min_buy_price_idr: float = 0.0
+    # ── Tick-move filter ──────────────────────────────────────────────────────
+    # Skip any buy when the minimum possible price increment (tick) represents
+    # a fraction of the current price that exceeds this threshold.
+    # Derived from the gap between the best and second-best bid in the
+    # orderbook; falls back to the bid-ask spread when only one bid level
+    # exists.
+    # E.g. 0.08 = skip if the smallest tick is > 8% of the price.
+    # A coin at 4 IDR where 4→5 = 25% would be skipped when set to 0.08.
+    # 0 = disabled (default).
+    max_tick_move_pct: float = 0.0
     # ── Smart Entry Engine (SEE) ──────────────────────────────────────────────
     # Three-part entry quality filter:
     #   1. Pre-pump detection — flags early volume accumulation before a pump.
@@ -457,6 +473,8 @@ class BotConfig:
             pump_protection_pct=float(os.getenv("PUMP_PROTECTION_PCT", "0")),
             pump_lookback_seconds=float(os.getenv("PUMP_LOOKBACK_SECONDS", "60")),
             max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0")),
+            min_buy_price_idr=float(os.getenv("MIN_BUY_PRICE_IDR", "0")),
+            max_tick_move_pct=float(os.getenv("MAX_TICK_MOVE_PCT", "0")),
             see_enabled=os.getenv("SEE_ENABLED", "false").lower() in {"1", "true", "yes"},
             see_volume_surge_ratio=float(os.getenv("SEE_VOLUME_SURGE_RATIO", "2.0")),
             see_whale_pressure_min=float(os.getenv("SEE_WHALE_PRESSURE_MIN", "2.0")),
@@ -603,6 +621,10 @@ class BotConfig:
             raise ValueError("PUMP_LOOKBACK_SECONDS must be positive")
         if self.max_spread_pct < 0:
             raise ValueError("MAX_SPREAD_PCT must be non-negative")
+        if self.min_buy_price_idr < 0:
+            raise ValueError("MIN_BUY_PRICE_IDR must be non-negative")
+        if self.max_tick_move_pct < 0:
+            raise ValueError("MAX_TICK_MOVE_PCT must be non-negative")
         if self.see_volume_surge_ratio <= 0:
             raise ValueError("SEE_VOLUME_SURGE_RATIO must be positive")
         if self.see_whale_pressure_min < 0:

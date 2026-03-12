@@ -1733,6 +1733,124 @@ class SpreadFilterTest(unittest.TestCase):
         self.assertNotIn("spread_too_wide", outcome.get("reason", ""))
 
 
+class MinBuyPriceFilterTest(unittest.TestCase):
+    """Tests for MIN_BUY_PRICE_IDR filter in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader(self, min_price: float, coin_price: float) -> Trader:
+        config = BotConfig(api_key=None, min_buy_price_idr=min_price, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [[str(coin_price), "100"]],
+                "sell": [[str(coin_price * 1.001), "100"]],
+            },
+        })()
+        return trader
+
+    def test_cheap_coin_skipped(self):
+        """Buy must be skipped when price is below min_buy_price_idr."""
+        # DENT-like: 4 IDR < 10 IDR threshold
+        trader = self._trader(min_price=10.0, coin_price=4.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("price_too_low", outcome["reason"])
+
+    def test_price_exactly_at_threshold_allowed(self):
+        """Coin priced exactly at the threshold must NOT be blocked."""
+        trader = self._trader(min_price=10.0, coin_price=10.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=10.0))
+        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+
+    def test_price_above_threshold_allowed(self):
+        """Coin priced above the threshold must NOT be blocked."""
+        trader = self._trader(min_price=10.0, coin_price=50.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=50.0))
+        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+
+    def test_filter_disabled_when_zero(self):
+        """When min_buy_price_idr=0 the filter must be disabled."""
+        trader = self._trader(min_price=0.0, coin_price=1.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=1.0))
+        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+
+    def test_sell_not_blocked_by_price_filter(self):
+        """Min-price filter must only apply to buy signals, not sells."""
+        trader = self._trader(min_price=10.0, coin_price=4.0)
+        trader.tracker.record_trade("buy", 4.0, 1000.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0, action="sell"))
+        self.assertNotIn("price_too_low", outcome.get("reason", ""))
+
+
+class TickMoveFilterTest(unittest.TestCase):
+    """Tests for MAX_TICK_MOVE_PCT filter in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _trader(self, max_tick: float, bids: list, asks: list, price: float) -> Trader:
+        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
+        })()
+        return trader
+
+    def test_large_tick_skips_buy(self):
+        """Buy must be skipped when tick (4→5 IDR = 25%) exceeds max_tick_move_pct."""
+        # Two bid levels 5 and 4 → tick = 1/5 = 20% > 8% limit
+        bids = [["5", "100"], ["4", "200"]]
+        asks = [["6", "50"]]
+        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=5.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=5.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("tick_too_large", outcome["reason"])
+
+    def test_small_tick_allows_buy(self):
+        """Buy must proceed when tick is within the max_tick_move_pct limit."""
+        # Two bid levels 100 and 99.5 → tick = 0.5/100 = 0.5% < 8% limit
+        bids = [["100", "500"], ["99.5", "500"]]
+        asks = [["100.1", "200"]]
+        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=100.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
+        self.assertNotIn("tick_too_large", outcome.get("reason", ""))
+
+    def test_tick_fallback_to_spread(self):
+        """When only one bid level exists, tick is estimated from bid-ask spread."""
+        # Only one bid; ask=6, bid=4 → spread fallback = 2/4 = 50% > 8%
+        bids = [["4", "100"]]
+        asks = [["6", "50"]]
+        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=4.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("tick_too_large", outcome["reason"])
+
+    def test_filter_disabled_when_zero(self):
+        """When max_tick_move_pct=0 the tick filter must be disabled."""
+        bids = [["5", "100"], ["4", "200"]]
+        asks = [["6", "50"]]
+        trader = self._trader(max_tick=0.0, bids=bids, asks=asks, price=5.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=5.0))
+        self.assertNotIn("tick_too_large", outcome.get("reason", ""))
+
+    def test_sell_not_blocked_by_tick_filter(self):
+        """Tick filter must only apply to buy signals, not sells."""
+        bids = [["5", "100"], ["4", "200"]]
+        asks = [["6", "50"]]
+        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=5.0)
+        trader.tracker.record_trade("buy", 5.0, 100.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=5.0, action="sell"))
+        self.assertNotIn("tick_too_large", outcome.get("reason", ""))
+
+
 class SellWallGuardTest(unittest.TestCase):
     """Tests for ORDERBOOK_WALL_THRESHOLD sell-wall guard in maybe_execute."""
 

@@ -1154,6 +1154,58 @@ class Trader:
                     "portfolio": self.tracker.as_dict(price),
                 }
 
+        # ── Minimum price filter ──────────────────────────────────────────────
+        # Skip buy when the coin price is too low.  Very cheap coins (e.g.
+        # DENT at 4 IDR) trade in integer steps where the minimum price
+        # increment is a large percentage move — making the position nearly
+        # impossible to exit at a reasonable profit.
+        if self.config.min_buy_price_idr > 0 and decision.action == "buy":
+            if price < self.config.min_buy_price_idr:
+                logger.info(
+                    "Price too low on %s: %.6g < %.6g IDR — skipping buy",
+                    snapshot["pair"],
+                    price,
+                    self.config.min_buy_price_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"price_too_low {price:.6g} < {self.config.min_buy_price_idr:.6g} IDR"
+                    ),
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
+        # ── Tick-move filter ──────────────────────────────────────────────────
+        # Skip buy when the minimum possible price increment (tick) is a
+        # disproportionately large fraction of the current price.  This
+        # catches illiquid integer-priced coins (e.g. 4→5 IDR = 25%) where
+        # a profitable exit requires the price to make an unusually large jump.
+        # The tick is estimated from the gap between the best and second-best
+        # bid in the orderbook; the bid-ask spread is used as a lower-bound
+        # fallback when only one bid level is available.
+        if self.config.max_tick_move_pct > 0 and decision.action == "buy" and top_bid > 0:
+            tick_pct: Optional[float] = None
+            if len(bids) >= 2:
+                second_bid = float(bids[1][0])
+                if 0 < second_bid < top_bid:
+                    tick_pct = (top_bid - second_bid) / top_bid
+            if tick_pct is None and top_ask > top_bid:
+                tick_pct = (top_ask - top_bid) / top_bid
+            if tick_pct is not None and tick_pct > self.config.max_tick_move_pct:
+                logger.info(
+                    "Tick too large on %s: %.4f%% > %.4f%% — skipping buy",
+                    snapshot["pair"],
+                    tick_pct * 100,
+                    self.config.max_tick_move_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"tick_too_large {tick_pct:.4%} > {self.config.max_tick_move_pct:.4%}"
+                    ),
+                    "portfolio": self.tracker.as_dict(price),
+                }
+
         # Spread anomaly detection
         if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
             live_spread_pct = (top_ask - top_bid) / top_bid
