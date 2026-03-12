@@ -697,17 +697,29 @@ class FakeBreakoutRisk:
 
 
 @dataclass
+class EarlyBreakoutSignal:
+    """Signal that price is pressing near resistance with strong volume."""
+
+    detected: bool
+    proximity_pct: float
+    volume_ratio: float
+    score: float
+
+
+@dataclass
 class SmartEntryResult:
     """Combined result of all Smart Entry Engine checks.
 
     Aggregates :class:`PrePumpSignal`, :class:`PumpSniperSignal`,
-    :class:`WhalePressure`, and :class:`FakeBreakoutRisk` into a single object
-    passed to ``make_trade_decision`` for confidence adjustment.
+    :class:`WhalePressure`, :class:`EarlyBreakoutSignal`, and
+    :class:`FakeBreakoutRisk` into a single object passed to
+    ``make_trade_decision`` for confidence adjustment.
     """
 
     pre_pump: PrePumpSignal
     pump_sniper: PumpSniperSignal
     whale_pressure: WhalePressure
+    early_breakout: EarlyBreakoutSignal
     fake_breakout: FakeBreakoutRisk
 
 
@@ -990,6 +1002,47 @@ def detect_fake_breakout(
     )
 
 
+def detect_early_breakout(
+    candles: Sequence[Candle],
+    current_price: float,
+    levels: Optional[SupportResistance],
+    proximity_pct: float = 0.005,
+    min_volume_ratio: float = 1.2,
+) -> EarlyBreakoutSignal:
+    """Detect an early breakout setup: price pressing near resistance with volume.
+
+    Detects when the current price is within ``proximity_pct`` of resistance and
+    recent volume exceeds ``min_volume_ratio`` × the historical average.
+    """
+    if not candles or levels is None or not levels.resistance or proximity_pct < 0:
+        return EarlyBreakoutSignal(False, 0.0, 1.0, 0.0)
+
+    resistance = levels.resistance
+    # Require price to be just below or at resistance (but not yet a breakout)
+    if current_price >= resistance or current_price < resistance * (1 - proximity_pct):
+        return EarlyBreakoutSignal(False, proximity_pct, 1.0, 0.0)
+
+    volumes = [c.volume for c in candles if c.volume > 0]
+    if len(volumes) < 2:
+        return EarlyBreakoutSignal(False, proximity_pct, 1.0, 0.0)
+
+    avg_vol = mean(volumes[:-1])  # exclude latest candle
+    recent_vol = volumes[-1]
+    if avg_vol <= 0:
+        return EarlyBreakoutSignal(False, proximity_pct, 1.0, 0.0)
+
+    volume_ratio = recent_vol / avg_vol
+    detected = volume_ratio >= min_volume_ratio
+    # Score grows with volume above threshold, capped at 1
+    score = min(1.0, max(0.0, volume_ratio - min_volume_ratio))
+    return EarlyBreakoutSignal(
+        detected=detected,
+        proximity_pct=proximity_pct,
+        volume_ratio=round(volume_ratio, 4),
+        score=round(score, 4),
+    )
+
+
 def smart_entry_filter(
     candles: Sequence[Candle],
     depth: Dict[str, object],
@@ -1003,6 +1056,8 @@ def smart_entry_filter(
     pump_sniper_long: int = 12,
     whale_pressure_min: float = 2.0,
     breakout_volume_min: float = 0.7,
+    early_breakout_proximity_pct: float = 0.005,
+    early_breakout_min_volume_ratio: float = 1.2,
 ) -> SmartEntryResult:
     """Run all Smart Entry Engine checks and return a combined result.
 
@@ -1023,6 +1078,8 @@ def smart_entry_filter(
     :param pump_sniper_short: Passed to :func:`detect_pump_sniper`.
     :param pump_sniper_long: Passed to :func:`detect_pump_sniper`.
     :param breakout_volume_min: Passed to :func:`detect_fake_breakout`.
+    :param early_breakout_proximity_pct: Passed to :func:`detect_early_breakout`.
+    :param early_breakout_min_volume_ratio: Passed to :func:`detect_early_breakout`.
     :returns: :class:`SmartEntryResult`.
     """
     pump_signal = detect_pump_sniper(
@@ -1039,6 +1096,13 @@ def smart_entry_filter(
         pre_pump=detect_pre_pump_signal(candles, volume_surge_ratio),
         pump_sniper=pump_signal,
         whale_pressure=detect_whale_pressure(depth, whale_pressure_min),
+        early_breakout=detect_early_breakout(
+            candles,
+            current_price,
+            levels,
+            proximity_pct=early_breakout_proximity_pct,
+            min_volume_ratio=early_breakout_min_volume_ratio,
+        ),
         fake_breakout=detect_fake_breakout(candles, current_price, levels, breakout_volume_min),
     )
 

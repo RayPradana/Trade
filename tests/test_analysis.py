@@ -499,6 +499,29 @@ class SmartEntryEngineTests(unittest.TestCase):
         self.assertFalse(result.breakout_present)
         self.assertFalse(result.detected)
 
+    # ── Early breakout detection ────────────────────────────────────────────
+
+    def test_early_breakout_detected_near_resistance_with_volume(self):
+        from bot.analysis import detect_early_breakout, SupportResistance
+        vols = [10.0] * 10 + [25.0]
+        candles = self._make_candles(vols, close_start=100.0)
+        levels = SupportResistance(support=90.0, resistance=110.0, lookback=10)
+        # price just below resistance (within 0.5%) and volume 2.5x avg
+        result = detect_early_breakout(
+            candles, current_price=109.6, levels=levels, proximity_pct=0.005, min_volume_ratio=1.2
+        )
+        self.assertTrue(result.detected)
+        self.assertGreater(result.volume_ratio, 1.0)
+
+    def test_early_breakout_not_detected_far_below_resistance(self):
+        from bot.analysis import detect_early_breakout, SupportResistance
+        candles = self._make_candles([10.0] * 5, close_start=100.0)
+        levels = SupportResistance(support=90.0, resistance=110.0, lookback=10)
+        result = detect_early_breakout(
+            candles, current_price=100.0, levels=levels, proximity_pct=0.01, min_volume_ratio=1.2
+        )
+        self.assertFalse(result.detected)
+
     # ── smart_entry_filter wrapper ──────────────────────────────────────────
 
     def test_smart_entry_filter_returns_all_components(self):
@@ -510,9 +533,10 @@ class SmartEntryEngineTests(unittest.TestCase):
         depth = {"buy": bids, "sell": self._flat_book(101.0, n=5)}
         levels = SupportResistance(support=90.0, resistance=105.0, lookback=10)
         result = smart_entry_filter(candles, depth, current_price=102.0, levels=levels)
-        # All three sub-results should be present
+        # All sub-results should be present
         self.assertIsNotNone(result.pre_pump)
         self.assertIsNotNone(result.whale_pressure)
+        self.assertIsNotNone(result.early_breakout)
         self.assertIsNotNone(result.fake_breakout)
         # Volume surge in last 3 candles → pre-pump should be detected
         self.assertTrue(result.pre_pump.detected)

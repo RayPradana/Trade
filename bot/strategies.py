@@ -559,6 +559,10 @@ def make_trade_decision(
         if smart_entry.fake_breakout.detected and action == "buy":
             conf *= 1.0 - 0.4 * smart_entry.fake_breakout.score
             see_note += ("_" if see_note else "") + "see_fake_breakout"
+        # 4. Early breakout: price pressing resistance with strong volume → boost buy
+        if getattr(smart_entry, "early_breakout", None) and smart_entry.early_breakout.detected and action == "buy":
+            conf = min(1.0, conf + 0.04 * smart_entry.early_breakout.score)
+            see_note += ("_" if see_note else "") + "see_early_breakout"
 
     # ── Liquidity Sweep signal ────────────────────────────────────────────────
     sweep_note = ""

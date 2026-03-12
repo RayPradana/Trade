@@ -1392,6 +1392,8 @@ class Trader:
                 pump_sniper_long=self.config.see_pump_sniper_long,
                 whale_pressure_min=self.config.see_whale_pressure_min,
                 breakout_volume_min=self.config.see_breakout_volume_min,
+                early_breakout_proximity_pct=self.config.early_breakout_proximity_pct,
+                early_breakout_min_volume_ratio=self.config.early_breakout_min_volume_ratio,
             )
             if smart_entry.pre_pump.detected:
                 logger.debug(
@@ -1407,6 +1409,11 @@ class Trader:
                 logger.debug(
                     "SEE fake breakout on %s: vol_ratio=%.2f score=%.2f",
                     pair, smart_entry.fake_breakout.volume_ratio, smart_entry.fake_breakout.score,
+                )
+            if smart_entry.early_breakout.detected:
+                logger.debug(
+                    "SEE early breakout on %s: vol_ratio=%.2f score=%.2f",
+                    pair, smart_entry.early_breakout.volume_ratio, smart_entry.early_breakout.score,
                 )
 
         # ── Trade flow analysis ───────────────────────────────────────────────

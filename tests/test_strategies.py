@@ -110,9 +110,10 @@ class SmartEntryStrategyTests(unittest.TestCase):
 
     def _make_see(self, pre_pump=False, pp_score=0.0, pump_detected=False, pump_score=0.0,
                   wp_detected=False, wp_side=None, wp_pressure=0.0, fb_detected=False,
-                  fb_score=0.0):
+                  fb_score=0.0, eb_detected=False, eb_score=0.0):
         from bot.analysis import (
-            PrePumpSignal, PumpSniperSignal, WhalePressure, FakeBreakoutRisk, SmartEntryResult
+            PrePumpSignal, PumpSniperSignal, WhalePressure, FakeBreakoutRisk,
+            SmartEntryResult, EarlyBreakoutSignal
         )
         return SmartEntryResult(
             pre_pump=PrePumpSignal(detected=pre_pump, volume_surge_ratio=2.0 if pre_pump else 1.0, score=pp_score),
@@ -121,6 +122,8 @@ class SmartEntryStrategyTests(unittest.TestCase):
             whale_pressure=WhalePressure(detected=wp_detected, side=wp_side, pressure=wp_pressure),
             fake_breakout=FakeBreakoutRisk(breakout_present=fb_detected, detected=fb_detected,
                                            volume_ratio=1.0 - fb_score, score=fb_score),
+            early_breakout=EarlyBreakoutSignal(detected=eb_detected, proximity_pct=0.005,
+                                               volume_ratio=1.0 + eb_score, score=eb_score),
         )
 
     def test_pre_pump_boosts_buy_confidence(self):
@@ -176,6 +179,14 @@ class SmartEntryStrategyTests(unittest.TestCase):
         see_dec = make_trade_decision(trend, orderbook, vol, 100.0, config, levels, smart_entry=see)
         self.assertLess(see_dec.confidence, base.confidence)
         self.assertIn("see_fake_breakout", see_dec.reason)
+
+    def test_early_breakout_boosts_buy_confidence(self):
+        trend, orderbook, vol, levels, config = self._base_inputs()
+        base = make_trade_decision(trend, orderbook, vol, 100.0, config, levels)
+        see = self._make_see(eb_detected=True, eb_score=0.8)
+        see_dec = make_trade_decision(trend, orderbook, vol, 100.0, config, levels, smart_entry=see)
+        self.assertGreater(see_dec.confidence, base.confidence)
+        self.assertIn("see_early_breakout", see_dec.reason)
 
     def test_no_smart_entry_unchanged(self):
         """Passing smart_entry=None should produce the same result as omitting it."""

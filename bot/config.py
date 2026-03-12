@@ -325,6 +325,10 @@ class BotConfig:
     # Minimum (recent_vol / avg_vol) ratio to treat a resistance breakout as
     # volume-confirmed and genuine.  E.g. 0.7 = 70% of average volume needed.
     see_breakout_volume_min: float = 0.7
+    # Early breakout detector — flags price pressing near resistance with a
+    # volume surge (potential early breakout before a confirmed break).
+    early_breakout_proximity_pct: float = 0.005  # within 0.5% of resistance
+    early_breakout_min_volume_ratio: float = 1.2  # recent_vol / avg_vol
     # ── Anti-fake-pump detection ──────────────────────────────────────────────
     # On Indodax, manipulative actors frequently execute a rapid pump followed
     # by an equally rapid dump within ≈20 seconds.  This guard watches the
@@ -703,6 +707,8 @@ class BotConfig:
             see_pump_sniper_long=_env_int("SEE_PUMP_SNIPER_LONG", "12"),
             see_whale_pressure_min=_env_float("SEE_WHALE_PRESSURE_MIN", "2.0"),
             see_breakout_volume_min=_env_float("SEE_BREAKOUT_VOLUME_MIN", "0.7"),
+            early_breakout_proximity_pct=_env_float("EARLY_BREAKOUT_PROXIMITY_PCT", "0.005"),
+            early_breakout_min_volume_ratio=_env_float("EARLY_BREAKOUT_MIN_VOLUME_RATIO", "1.2"),
             fake_pump_reversal_pct=_env_float("FAKE_PUMP_REVERSAL_PCT", "0"),
             min_order_idr=_env_float("MIN_ORDER_IDR", "15000"),
             max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", "0"),
@@ -914,6 +920,10 @@ class BotConfig:
             raise ValueError("SEE_WHALE_PRESSURE_MIN must be non-negative")
         if not (0.0 <= self.see_breakout_volume_min <= 1.0):
             raise ValueError("SEE_BREAKOUT_VOLUME_MIN must be between 0 and 1")
+        if self.early_breakout_proximity_pct < 0:
+            raise ValueError("EARLY_BREAKOUT_PROXIMITY_PCT must be non-negative")
+        if self.early_breakout_min_volume_ratio < 0:
+            raise ValueError("EARLY_BREAKOUT_MIN_VOLUME_RATIO must be non-negative")
         if self.fake_pump_reversal_pct < 0:
             raise ValueError("FAKE_PUMP_REVERSAL_PCT must be non-negative")
         if self.min_order_idr <= 0:
