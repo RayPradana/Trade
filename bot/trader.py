@@ -1525,6 +1525,18 @@ class Trader:
 
         return None  # all checks pass → allow the cheap coin
 
+    def _small_coin_trade_reason(self, trades_24h: int) -> Optional[str]:
+        """Return skip reason for cheap coins with insufficient reported trades."""
+        min_trades = self.config.small_coin_min_trades_24h
+        if min_trades <= 0:
+            return None
+        if trades_24h <= 0:
+            # Trade count missing/unknown — do not block solely on absence.
+            return None
+        if trades_24h < min_trades:
+            return f"small_coin_low_trades {trades_24h} < {min_trades}"
+        return None
+
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         _pair = snapshot["pair"]
         decision: StrategyDecision = snapshot["decision"]
@@ -1852,24 +1864,16 @@ class Trader:
                         ),
                         "portfolio": _tracker.as_dict(price),
                     }
-                # Only enforce trade-count check when the exchange reports it; some
-                # tickers omit trade_count entirely (treated as 0/unknown).
-                if (
-                    self.config.small_coin_min_trades_24h > 0
-                    and trades_24h > 0
-                    and trades_24h < self.config.small_coin_min_trades_24h
-                ):
+                trade_reason = self._small_coin_trade_reason(trades_24h)
+                if trade_reason:
                     logger.info(
-                        "Cheap coin %s blocked by low trade count: %d < %d",
+                        "Cheap coin %s blocked by low trade count: %s",
                         snapshot["pair"],
-                        trades_24h,
-                        self.config.small_coin_min_trades_24h,
+                        trade_reason,
                     )
                     return {
                         "status": "skipped",
-                        "reason": (
-                            f"small_coin_low_trades {trades_24h} < {self.config.small_coin_min_trades_24h}"
-                        ),
+                        "reason": trade_reason,
                         "portfolio": _tracker.as_dict(price),
                     }
 
@@ -3025,21 +3029,15 @@ class Trader:
                             skipped_pairs.append(pair)
                             continue
                         _trades_24h = self._extract_trade_count_24h(prefetched_ticker)
-                        # Only enforce when trade count is present (>0); summaries
-                        # that omit trade_count are treated as unknown.
-                        if (
-                            self.config.small_coin_min_trades_24h > 0
-                            and _trades_24h > 0
-                            and _trades_24h < self.config.small_coin_min_trades_24h
-                        ):
+                        trade_reason = self._small_coin_trade_reason(_trades_24h)
+                        if trade_reason:
                             logger.debug(
                                 "Pre-scan: skipping cheap low-trade coin %s "
-                                "(price=%.6g IDR < %.6g, trades24h=%d < %d)",
+                                "(price=%.6g IDR < %.6g, %s)",
                                 pair,
                                 _last_price,
                                 self.config.min_buy_price_idr,
-                                _trades_24h,
-                                self.config.small_coin_min_trades_24h,
+                                trade_reason,
                             )
                             skipped_pairs.append(pair)
                             continue
