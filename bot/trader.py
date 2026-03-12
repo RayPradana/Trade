@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import requests
 
@@ -42,6 +43,8 @@ from .tracking import MultiPositionManager, PortfolioTracker
 from .journal import TradeJournal
 
 logger = logging.getLogger(__name__)
+
+_WHALE_EVENT_MAX = 100
 
 # Extra candles requested beyond slow_window when fetching OHLC history so
 # that EMA-based indicators (MACD, Bollinger) have enough warm-up data.
@@ -96,6 +99,8 @@ class Trader:
                 target_profit_pct=config.target_profit_pct,
                 max_loss_pct=config.max_loss_pct,
             )
+        # Whale wallet tracking (recent events, limited to prevent unbounded growth)
+        self._whale_events: Deque[Dict[str, object]] = deque(maxlen=_WHALE_EVENT_MAX)
         # ── Auto-resume: persistence and state recovery ──────────────────────
         self.persistence = StatePersistence(config.state_path)
         self.restored_pair: Optional[str] = None  # set when state is loaded from disk
@@ -314,6 +319,11 @@ class Trader:
         else:
             self._pair_min_order_cache_cycles += 1
 
+    def _restore_whale_events(self, state: Dict[str, Any]) -> None:
+        events = state.get("whale_events")
+        if isinstance(events, list):
+            self._whale_events = deque(events[-_WHALE_EVENT_MAX:], maxlen=_WHALE_EVENT_MAX)
+
     def _try_restore_state(self) -> None:
         """Load persisted state on startup and restore PortfolioTracker.
 
@@ -343,6 +353,7 @@ class Trader:
                 self.config.dry_run,
             )
             return
+        self._restore_whale_events(state)
 
         # ── Multi-position restore path ───────────────────────────────────────
         if self.multi_manager is not None:
@@ -544,6 +555,7 @@ class Trader:
                 "portfolio": self.tracker.to_state(),
                 "pair": pair,
                 "dry_run": self.config.dry_run,
+                "whale_events": list(self._whale_events),
             }
             if self.multi_manager is not None:
                 payload["multi_positions"] = {
@@ -781,6 +793,24 @@ class Trader:
         cutoff = now - self.config.pump_lookback_seconds
         while len(buf) > 1 and buf[0][0] < cutoff:
             buf.pop(0)
+
+    def _record_whale_event(self, pair: str, whale: WhaleActivity, price: float) -> None:
+        """Track recent whale detections for observability / debugging."""
+        if not whale.detected:
+            return
+        self._whale_events.append(
+            {
+                "pair": pair,
+                "side": whale.side,
+                "ratio": round(whale.ratio, 3),
+                "price": price,
+                "ts": time.time(),
+            }
+        )
+
+    def whale_events(self) -> List[Dict[str, object]]:
+        """Return recent whale-detection events (newest last)."""
+        return list(self._whale_events)
 
     def _is_pumped(self, pair: str, current_price: float) -> bool:
         """Return *True* when *pair*'s price has risen above the pump threshold.
@@ -1358,6 +1388,7 @@ class Trader:
         whale: WhaleActivity = detect_whale_activity(depth)
         if whale.detected:
             logger.debug("Whale detected on %s: side=%s ratio=%.1f×", pair, whale.side, whale.ratio)
+            self._record_whale_event(pair, whale, price)
 
         # ── Spoofing / manipulation detection ────────────────────────────────
         spoofing: SpoofingResult = detect_spoofing(depth)

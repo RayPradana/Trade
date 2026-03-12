@@ -1,9 +1,12 @@
 import logging
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Dict, Any
 
 import requests
 
+from bot.analysis import WhaleActivity
 from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
@@ -3205,6 +3208,42 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         outcome = trader.maybe_execute(snap)
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("all_steps_below_min_order", outcome["reason"])
+
+
+class WhaleTrackingTests(unittest.TestCase):
+    class _Client:
+        def get_pairs(self) -> list:
+            return [{"name": "btc_idr"}]
+
+        def get_summaries(self) -> dict:
+            return {}
+
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def test_whale_events_are_tracked_and_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "bot_state.json"
+            config = BotConfig(api_key=None, dry_run=True, state_path=state_path, multi_position_enabled=False)
+            trader = Trader(config, client=self._Client())
+
+            whale = WhaleActivity(detected=True, side="bid", ratio=6.0)
+            trader.tracker.base_position = 1.0  # ensure state persists
+            trader._record_whale_event("btc_idr", whale, price=100.0)
+            trader._save_state("btc_idr")
+
+            fresh_config = BotConfig(api_key=None, dry_run=True, state_path=state_path, multi_position_enabled=False)
+            fresh = Trader(fresh_config, client=self._Client())
+            events = fresh.whale_events()
+
+            self.assertEqual(len(events), 1)
+            event = events[0]
+            self.assertEqual(event["pair"], "btc_idr")
+            self.assertEqual(event["side"], "bid")
+            self.assertAlmostEqual(event["ratio"], 6.0, places=3)
 
 
 class ForceSellDustTests(unittest.TestCase):
