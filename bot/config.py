@@ -411,6 +411,15 @@ class BotConfig:
     #   Default: 0.01.
     max_hold_seconds: float = 0.0
     max_hold_profit_pct: float = 0.01
+    # ── Adaptive hold time based on volume ────────────────────────────────────
+    # When volume_high_threshold_idr > 0, the effective max_hold_seconds is
+    # chosen dynamically:
+    #   - volume >= threshold  → max_hold_seconds_volume_high (default 5400 = 90 min)
+    #   - volume <  threshold  → max_hold_seconds_volume_low  (default 1800 = 30 min)
+    # Set volume_high_threshold_idr = 0 to disable adaptive hold time.
+    volume_high_threshold_idr: float = 0.0
+    max_hold_seconds_volume_high: float = 5400.0  # 90 minutes
+    max_hold_seconds_volume_low: float = 1800.0   # 30 minutes
     # ── Multi-position / parallel trading ─────────────────────────────────────
     # Allow the bot to hold up to *multi_position_max* open positions across
     # different pairs simultaneously.  Capital is split evenly among all open
@@ -664,6 +673,9 @@ class BotConfig:
             confidence_tier_max_pct=float(os.getenv("CONFIDENCE_TIER_MAX_PCT", "0.25")),
             max_hold_seconds=float(os.getenv("MAX_HOLD_SECONDS", "0")),
             max_hold_profit_pct=float(os.getenv("MAX_HOLD_PROFIT_PCT", "0.01")),
+            volume_high_threshold_idr=float(os.getenv("VOLUME_HIGH_THRESHOLD_IDR", "0")),
+            max_hold_seconds_volume_high=float(os.getenv("MAX_HOLD_SECONDS_VOLUME_HIGH", "5400")),
+            max_hold_seconds_volume_low=float(os.getenv("MAX_HOLD_SECONDS_VOLUME_LOW", "1800")),
             multi_position_enabled=os.getenv("MULTI_POSITION_ENABLED", "false").lower() in {"1", "true", "yes"},
             multi_position_max=int(os.getenv("MULTI_POSITION_MAX", "3")),
             ob_imbalance_boost_threshold=float(os.getenv("OB_IMBALANCE_BOOST_THRESHOLD", "0")),
@@ -874,6 +886,12 @@ class BotConfig:
             raise ValueError("MAX_HOLD_SECONDS must be non-negative")
         if self.max_hold_profit_pct < 0:
             raise ValueError("MAX_HOLD_PROFIT_PCT must be non-negative")
+        if self.volume_high_threshold_idr < 0:
+            raise ValueError("VOLUME_HIGH_THRESHOLD_IDR must be non-negative")
+        if self.max_hold_seconds_volume_high < 0:
+            raise ValueError("MAX_HOLD_SECONDS_VOLUME_HIGH must be non-negative")
+        if self.max_hold_seconds_volume_low < 0:
+            raise ValueError("MAX_HOLD_SECONDS_VOLUME_LOW must be non-negative")
         if self.multi_position_max < 1:
             raise ValueError("MULTI_POSITION_MAX must be >= 1")
         if self.ob_imbalance_boost_threshold < 0 or self.ob_imbalance_boost_threshold > 1:

@@ -390,6 +390,18 @@ class Trader:
             raise ValueError("Ticker missing price fields")
         return float(last_value)
 
+    def _extract_volume_idr(self, ticker: Dict[str, Any]) -> float:
+        """Extract 24-h IDR trading volume from a raw ticker dict."""
+        src = ticker.get("ticker", ticker)
+        for key in ("vol_idr", "volume_idr", "volume", "vol"):
+            val = src.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
     def _fetch_candles(
         self,
         pair: str,
@@ -927,6 +939,7 @@ class Trader:
                 _rug_orderbook = analyze_orderbook(depth)
                 _rug_vol = analyze_volatility(candles)
                 _rug_levels = support_resistance(candles)
+                _rug_indicators = derive_indicators(candles)
                 return {
                     "pair": pair,
                     "price": price,
@@ -936,6 +949,8 @@ class Trader:
                     "orderbook": _rug_orderbook,
                     "volatility": _rug_vol,
                     "levels": _rug_levels,
+                    "indicators": _rug_indicators,
+                    "volume_24h_idr": self._extract_volume_idr(ticker),
                 }
 
         insufficient_data = len(candles) < self.config.min_candles
@@ -1081,6 +1096,7 @@ class Trader:
             "reference_trend": reference_trend,
             "smart_entry": smart_entry,
             "trade_flow": trade_flow,
+            "volume_24h_idr": self._extract_volume_idr(ticker),
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -1117,19 +1133,28 @@ class Trader:
         # Force-sell an open position that has been held longer than
         # max_hold_seconds without reaching the profit threshold.  This
         # prevents capital from being tied up in slow/illiquid pairs.
+        # When volume_high_threshold_idr > 0, the effective hold limit is
+        # chosen adaptively: 90 min for high-volume pairs, 30 min otherwise.
+        _effective_max_hold = self.config.max_hold_seconds
+        if self.config.volume_high_threshold_idr > 0:
+            _vol_24h = snapshot.get("volume_24h_idr", 0.0)
+            if _vol_24h >= self.config.volume_high_threshold_idr:
+                _effective_max_hold = self.config.max_hold_seconds_volume_high
+            else:
+                _effective_max_hold = self.config.max_hold_seconds_volume_low
         if (
-            self.config.max_hold_seconds > 0
+            _effective_max_hold > 0
             and _tracker.base_position > 0
             and _tracker.avg_cost > 0
         ):
             hold_secs = _tracker.position_hold_seconds
-            if hold_secs >= self.config.max_hold_seconds:
+            if hold_secs >= _effective_max_hold:
                 unrealised_pct = (price - _tracker.avg_cost) / _tracker.avg_cost
                 if unrealised_pct < self.config.max_hold_profit_pct:
                     logger.info(
                         "Time-based exit: held %.0fs ≥ %.0fs, profit=%.2f%% < %.2f%% — force selling",
                         hold_secs,
-                        self.config.max_hold_seconds,
+                        _effective_max_hold,
                         unrealised_pct * 100,
                         self.config.max_hold_profit_pct * 100,
                     )
