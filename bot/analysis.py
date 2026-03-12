@@ -284,6 +284,8 @@ def analyze_trade_flow(
     buy_vol = 0.0
     sell_vol = 0.0
     for t in trades:
+        if not isinstance(t, dict):
+            continue
         trade_type = str(t.get("type", "")).lower()
         # Support both amount and vol field names used by different API
         # versions.

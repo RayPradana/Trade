@@ -550,3 +550,31 @@ class TradeFlowAnalysisTest(unittest.TestCase):
         ]
         result = analyze_trade_flow(trades)
         self.assertAlmostEqual(result.buy_ratio, 0.5)
+
+    def test_non_dict_items_are_skipped(self):
+        """analyze_trade_flow must not crash when the trades list contains
+        plain strings (e.g. unexpected Indodax API response for usdt_idr).
+        Non-dict items should be silently ignored; valid dict items are still
+        processed normally.
+        """
+        from bot.analysis import analyze_trade_flow
+        # Mix of strings and a valid buy dict — only the dict should count
+        trades = [
+            "some_string",
+            "another_string",
+            {"type": "buy", "price": "100", "amount": "1"},
+        ]
+        # Should not raise AttributeError
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 1.0)
+        self.assertEqual(result.sell_volume, 0.0)
+
+    def test_all_non_dict_items_returns_neutral(self):
+        """When every item in trades is a non-dict, the result should be
+        neutral (buy_ratio=0.5) rather than crashing.
+        """
+        from bot.analysis import analyze_trade_flow
+        trades = ["buy", "sell", "123"]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 0.5)
+        self.assertFalse(result.aggressive_buyers)
