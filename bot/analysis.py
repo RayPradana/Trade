@@ -1226,3 +1226,458 @@ def detect_rug_pull_risk(
             )
 
     return no_risk
+
+
+# ---------------------------------------------------------------------------
+# Liquidity Sweep Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LiquiditySweep:
+    """Result of liquidity sweep detection.
+
+    ``detected`` is ``True`` when a sharp price move swept through a recent
+    high/low and then reversed, suggesting stop-loss hunting.
+
+    ``direction`` is ``"up"`` (swept highs) or ``"down"`` (swept lows).
+    ``sweep_pct`` is the size of the spike relative to the pre-sweep price.
+    ``reversal_pct`` is how much the price reversed from the spike extreme.
+    """
+
+    detected: bool
+    direction: Optional[str]
+    sweep_pct: float
+    reversal_pct: float
+
+
+def detect_liquidity_sweep(
+    candles: Sequence[Candle],
+    lookback: int = 10,
+    min_sweep_pct: float = 0.01,
+    reversal_pct: float = 0.005,
+) -> LiquiditySweep:
+    """Detect a liquidity sweep pattern in recent candles.
+
+    A sweep is detected when the most recent candle's wick (high or low)
+    extends beyond the prior *lookback* candles' extreme by at least
+    *min_sweep_pct*, AND the candle closes back within the prior range by
+    at least *reversal_pct* — indicating the spike was rejected.
+
+    :param candles: Ordered candle history (most recent last).
+    :param lookback: Number of prior candles to define the reference range.
+    :param min_sweep_pct: Minimum wick extension beyond range to qualify.
+    :param reversal_pct: Minimum close-back from the wick extreme.
+    :returns: :class:`LiquiditySweep` result.
+    """
+    no_sweep = LiquiditySweep(detected=False, direction=None, sweep_pct=0.0, reversal_pct=0.0)
+    if len(candles) < lookback + 1:
+        return no_sweep
+
+    prior = candles[-(lookback + 1):-1]
+    current = candles[-1]
+
+    prior_high = max(c.high for c in prior)
+    prior_low = min(c.low for c in prior)
+
+    # Check upward sweep (swept highs)
+    if prior_high > 0 and current.high > prior_high:
+        sweep_pct = (current.high - prior_high) / prior_high
+        rev_pct = (current.high - current.close) / current.high if current.high > 0 else 0.0
+        if sweep_pct >= min_sweep_pct and rev_pct >= reversal_pct:
+            return LiquiditySweep(
+                detected=True,
+                direction="up",
+                sweep_pct=round(sweep_pct, 4),
+                reversal_pct=round(rev_pct, 4),
+            )
+
+    # Check downward sweep (swept lows)
+    if prior_low > 0 and current.low < prior_low:
+        sweep_pct = (prior_low - current.low) / prior_low
+        rev_pct = (current.close - current.low) / current.close if current.close > 0 else 0.0
+        if sweep_pct >= min_sweep_pct and rev_pct >= reversal_pct:
+            return LiquiditySweep(
+                detected=True,
+                direction="down",
+                sweep_pct=round(sweep_pct, 4),
+                reversal_pct=round(rev_pct, 4),
+            )
+
+    return no_sweep
+
+
+# ---------------------------------------------------------------------------
+# Liquidity Trap Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LiquidityTrap:
+    """Result of liquidity trap (false breakout) detection.
+
+    ``detected`` is ``True`` when price broke a recent high/low but then
+    reversed back, indicating a false breakout trap.
+
+    ``direction`` is ``"up"`` (trapped buyers above resistance) or
+    ``"down"`` (trapped sellers below support).
+    ``breakout_pct`` is the size of the false breakout.
+    ``reversal_pct`` is how much price reversed after the breakout.
+    """
+
+    detected: bool
+    direction: Optional[str]
+    breakout_pct: float
+    reversal_pct: float
+
+
+def detect_liquidity_trap(
+    candles: Sequence[Candle],
+    lookback: int = 10,
+    breakout_pct: float = 0.005,
+    reversal_pct: float = 0.008,
+) -> LiquidityTrap:
+    """Detect a liquidity trap (false breakout) pattern.
+
+    Examines the last three candles: if the previous candle broke a prior
+    high/low and the current candle has reversed past the breakout level,
+    a trap is flagged.
+
+    :param candles: Ordered candle history (most recent last).
+    :param lookback: Prior candles used to define the range.
+    :param breakout_pct: Minimum close-beyond-range to count as a breakout.
+    :param reversal_pct: Minimum reversal needed to confirm the trap.
+    :returns: :class:`LiquidityTrap` result.
+    """
+    no_trap = LiquidityTrap(detected=False, direction=None, breakout_pct=0.0, reversal_pct=0.0)
+    if len(candles) < lookback + 2:
+        return no_trap
+
+    prior = candles[-(lookback + 2):-(2)]
+    prev = candles[-2]
+    current = candles[-1]
+
+    prior_high = max(c.high for c in prior)
+    prior_low = min(c.low for c in prior)
+
+    # Upward false breakout: prev closed above prior high, now reversing
+    if prior_high > 0 and prev.close > prior_high * (1 + breakout_pct):
+        bo_pct = (prev.close - prior_high) / prior_high
+        rev = (prev.close - current.close) / prev.close if prev.close > 0 else 0.0
+        if rev >= reversal_pct:
+            return LiquidityTrap(
+                detected=True,
+                direction="up",
+                breakout_pct=round(bo_pct, 4),
+                reversal_pct=round(rev, 4),
+            )
+
+    # Downward false breakout: prev closed below prior low, now reversing
+    if prior_low > 0 and prev.close < prior_low * (1 - breakout_pct):
+        bo_pct = (prior_low - prev.close) / prior_low
+        rev = (current.close - prev.close) / prev.close if prev.close > 0 else 0.0
+        if rev >= reversal_pct:
+            return LiquidityTrap(
+                detected=True,
+                direction="down",
+                breakout_pct=round(bo_pct, 4),
+                reversal_pct=round(rev, 4),
+            )
+
+    return no_trap
+
+
+# ---------------------------------------------------------------------------
+# Liquidity Vacuum Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LiquidityVacuum:
+    """Result of liquidity vacuum detection in the order book.
+
+    ``detected`` is ``True`` when a large gap (vacuum) exists between
+    consecutive price levels on the ask side near the current price.
+
+    ``gap_pct`` is the relative size of the largest detected gap.
+    ``gap_price`` is the price at the top of the gap.
+    """
+
+    detected: bool
+    gap_pct: float
+    gap_price: float
+
+
+def detect_liquidity_vacuum(
+    depth: Dict[str, object],
+    min_gap_pct: float = 0.02,
+    depth_levels: int = 10,
+) -> LiquidityVacuum:
+    """Detect a liquidity vacuum (gap) in the order book's ask side.
+
+    Iterates over the top *depth_levels* ask levels and flags the largest
+    consecutive price gap.  A gap larger than *min_gap_pct* of the lower
+    level's price indicates thin liquidity where price can move rapidly.
+
+    :param depth: Raw depth dict with ``"buy"`` and ``"sell"`` keys.
+    :param min_gap_pct: Minimum gap fraction to flag as a vacuum.
+    :param depth_levels: Number of ask levels to inspect.
+    :returns: :class:`LiquidityVacuum` result.
+    """
+    no_vacuum = LiquidityVacuum(detected=False, gap_pct=0.0, gap_price=0.0)
+    asks = (depth.get("sell") or [])[:depth_levels]
+    if len(asks) < 2:
+        return no_vacuum
+
+    try:
+        prices = sorted(float(level[0]) for level in asks)
+    except (IndexError, TypeError, ValueError):
+        return no_vacuum
+
+    max_gap_pct = 0.0
+    max_gap_price = 0.0
+    for i in range(1, len(prices)):
+        if prices[i - 1] <= 0:
+            continue
+        gap = (prices[i] - prices[i - 1]) / prices[i - 1]
+        if gap > max_gap_pct:
+            max_gap_pct = gap
+            max_gap_price = prices[i]
+
+    if max_gap_pct >= min_gap_pct:
+        return LiquidityVacuum(
+            detected=True,
+            gap_pct=round(max_gap_pct, 4),
+            gap_price=max_gap_price,
+        )
+    return no_vacuum
+
+
+# ---------------------------------------------------------------------------
+# Smart Money Footprint
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SmartMoneyFootprint:
+    """Result of smart money (institutional) accumulation/distribution detection.
+
+    ``detected`` is ``True`` when a volume spike accompanies a price move
+    that diverges from the expected direction — a sign of large players.
+
+    ``bias`` is ``"accumulation"`` (bullish) or ``"distribution"`` (bearish).
+    ``volume_ratio`` is current volume / average volume (higher = stronger signal).
+    """
+
+    detected: bool
+    bias: Optional[str]
+    volume_ratio: float
+
+
+def detect_smart_money_footprint(
+    candles: Sequence[Candle],
+    volume_factor: float = 3.0,
+    divergence_lookback: int = 5,
+) -> SmartMoneyFootprint:
+    """Detect smart-money accumulation or distribution footprints.
+
+    A footprint is detected when:
+    - The current candle has a volume spike (>= *volume_factor* × recent avg)
+    - Price closed higher than open (accumulation) or lower (distribution)
+    - The price move is relatively small compared to the volume spike
+      (large volume + small price move = institutional absorption)
+
+    :param candles: Ordered candle history (most recent last).
+    :param volume_factor: Volume must exceed this multiple of average to flag.
+    :param divergence_lookback: Candles used to compute the baseline volume avg.
+    :returns: :class:`SmartMoneyFootprint` result.
+    """
+    no_signal = SmartMoneyFootprint(detected=False, bias=None, volume_ratio=1.0)
+    if len(candles) < divergence_lookback + 1:
+        return no_signal
+
+    prior = candles[-(divergence_lookback + 1):-1]
+    current = candles[-1]
+
+    avg_vol = mean(c.volume for c in prior) if prior else 0.0
+    if avg_vol <= 0 or current.volume <= 0:
+        return no_signal
+
+    vol_ratio = current.volume / avg_vol
+    if vol_ratio < volume_factor:
+        return no_signal
+
+    # Volume spike detected — check price-volume divergence
+    price_move_pct = abs(current.close - current.open) / current.open if current.open > 0 else 0.0
+
+    # Large volume + small price move = absorption (institutional)
+    # Large volume + close > open = accumulation
+    # Large volume + close < open = distribution
+    if current.close >= current.open:
+        bias = "accumulation"
+    else:
+        bias = "distribution"
+
+    return SmartMoneyFootprint(
+        detected=True,
+        bias=bias,
+        volume_ratio=round(vol_ratio, 2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Volume Acceleration Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VolumeAcceleration:
+    """Result of volume acceleration detection.
+
+    ``detected`` is ``True`` when volume is growing at an accelerating rate.
+
+    ``acceleration_ratio`` is current_avg_vol / prior_avg_vol where the
+    windows are consecutive halves of the lookback period.
+    """
+
+    detected: bool
+    acceleration_ratio: float
+
+
+def detect_volume_acceleration(
+    candles: Sequence[Candle],
+    window: int = 5,
+    min_ratio: float = 1.5,
+) -> VolumeAcceleration:
+    """Detect accelerating volume trend.
+
+    Splits the last *2*window* candles into two equal halves and compares
+    their average volumes.  When the recent half has *min_ratio* times more
+    volume than the prior half, acceleration is detected.
+
+    :param candles: Ordered candle history (most recent last).
+    :param window: Half-window size (total lookback = 2 * window).
+    :param min_ratio: Minimum recent/prior volume ratio to flag acceleration.
+    :returns: :class:`VolumeAcceleration` result.
+    """
+    no_signal = VolumeAcceleration(detected=False, acceleration_ratio=1.0)
+    total = window * 2
+    if len(candles) < total:
+        return no_signal
+
+    prior_half = candles[-total:-window]
+    recent_half = candles[-window:]
+
+    prior_avg = mean(c.volume for c in prior_half)
+    recent_avg = mean(c.volume for c in recent_half)
+
+    if prior_avg <= 0:
+        return no_signal
+
+    ratio = recent_avg / prior_avg
+    if ratio >= min_ratio:
+        return VolumeAcceleration(detected=True, acceleration_ratio=round(ratio, 2))
+    return VolumeAcceleration(detected=False, acceleration_ratio=round(ratio, 2))
+
+
+# ---------------------------------------------------------------------------
+# Micro Trend Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MicroTrend:
+    """Result of short-window micro trend detection.
+
+    ``direction`` is ``"up"``, ``"down"``, or ``"flat"``.
+    ``strength`` is the magnitude of the micro trend (0–1 scale).
+    """
+
+    direction: str
+    strength: float
+
+
+def detect_micro_trend(
+    candles: Sequence[Candle],
+    window: int = 3,
+) -> MicroTrend:
+    """Detect the micro trend from the most recent *window* candles.
+
+    Uses the slope of closing prices over the last *window* candles as a
+    simple linear trend indicator.
+
+    :param candles: Ordered candle history (most recent last).
+    :param window: Number of recent candles to analyse.
+    :returns: :class:`MicroTrend` result.
+    """
+    if len(candles) < window or window < 2:
+        return MicroTrend(direction="flat", strength=0.0)
+
+    closes = [c.close for c in candles[-window:]]
+    if closes[0] <= 0:
+        return MicroTrend(direction="flat", strength=0.0)
+
+    # Simple slope: (last - first) / first
+    slope = (closes[-1] - closes[0]) / closes[0]
+    strength = round(min(1.0, abs(slope) * 20), 4)  # scale to roughly 0-1
+
+    if slope > 0.001:
+        direction = "up"
+    elif slope < -0.001:
+        direction = "down"
+    else:
+        direction = "flat"
+
+    return MicroTrend(direction=direction, strength=strength)
+
+
+# ---------------------------------------------------------------------------
+# Spread Expansion Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SpreadExpansion:
+    """Result of spread expansion detection.
+
+    ``detected`` is ``True`` when the current spread is significantly wider
+    than the recent baseline, indicating liquidity withdrawal.
+
+    ``current_spread_pct`` is the live spread fraction.
+    ``baseline_spread_pct`` is the recent average spread.
+    ``expansion_ratio`` is current / baseline.
+    """
+
+    detected: bool
+    current_spread_pct: float
+    baseline_spread_pct: float
+    expansion_ratio: float
+
+
+def detect_spread_expansion(
+    current_spread_pct: float,
+    spread_history: Sequence[float],
+    multiplier: float = 2.0,
+) -> SpreadExpansion:
+    """Detect when the spread is expanding above its recent baseline.
+
+    :param current_spread_pct: Current bid-ask spread as a fraction of best bid.
+    :param spread_history: Recent spread values (most recent last, excluding current).
+    :param multiplier: Flag when current > multiplier * baseline_avg.
+    :returns: :class:`SpreadExpansion` result.
+    """
+    no_expansion = SpreadExpansion(
+        detected=False,
+        current_spread_pct=current_spread_pct,
+        baseline_spread_pct=0.0,
+        expansion_ratio=1.0,
+    )
+    if not spread_history:
+        return no_expansion
+
+    baseline = mean(spread_history)
+    if baseline <= 0:
+        return no_expansion
+
+    ratio = current_spread_pct / baseline
+    detected = ratio >= multiplier
+
+    return SpreadExpansion(
+        detected=detected,
+        current_spread_pct=round(current_spread_pct, 6),
+        baseline_spread_pct=round(baseline, 6),
+        expansion_ratio=round(ratio, 2),
+    )

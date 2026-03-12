@@ -448,6 +448,54 @@ class BotConfig:
     partial_tp3_fraction: float = 0.0
     partial_tp3_target_pct: float = 0.0
 
+    # ── Liquidity Sweep Detection ──────────────────────────────────────────────
+    # Detect when price sweeps through a key level and quickly reverses.
+    # 0 = disabled (default).
+    liquidity_sweep_enabled: bool = False
+    liquidity_sweep_lookback: int = 10  # candles to look back for the key level
+    liquidity_sweep_min_pct: float = 0.01  # minimum sweep size (1% default)
+    liquidity_sweep_reversal_pct: float = 0.005  # reversal needed to confirm (0.5%)
+
+    # ── Liquidity Trap Detection ───────────────────────────────────────────────
+    # Detect false breakouts that trap buyers/sellers.
+    # 0 = disabled (default).
+    liquidity_trap_enabled: bool = False
+    liquidity_trap_breakout_pct: float = 0.005  # min breakout size to flag
+    liquidity_trap_reversal_pct: float = 0.008  # reversal needed to confirm trap
+
+    # ── Liquidity Vacuum Detection ────────────────────────────────────────────
+    # Skip buy when there is a large gap (vacuum) in the orderbook above current price.
+    # 0 = disabled (default).
+    liquidity_vacuum_min_gap_pct: float = 0.0  # min gap fraction to flag (0=disabled)
+    liquidity_vacuum_depth_levels: int = 10  # levels to inspect
+
+    # ── Smart Money Footprint ──────────────────────────────────────────────────
+    # Detect institutional accumulation/distribution via volume-price divergence.
+    # 0 = disabled (default).
+    smart_money_enabled: bool = False
+    smart_money_volume_factor: float = 3.0  # volume spike multiplier threshold
+    smart_money_divergence_lookback: int = 5  # candles for divergence check
+
+    # ── Volume Acceleration ────────────────────────────────────────────────────
+    # Detect accelerating volume trend (volume derivative) as a buy amplifier.
+    # false = disabled (default).
+    volume_accel_enabled: bool = False
+    volume_accel_window: int = 5  # candles to compute acceleration over
+    volume_accel_min_ratio: float = 1.5  # acceleration ratio threshold
+
+    # ── Micro Trend Detection ──────────────────────────────────────────────────
+    # Use a short-window (e.g. last 3 candles) micro trend to filter entries.
+    # false = disabled (default).
+    micro_trend_enabled: bool = False
+    micro_trend_window: int = 3  # candles for micro trend (shorter than fast_window)
+
+    # ── Spread Expansion Detector ─────────────────────────────────────────────
+    # Block buy when the current spread is expanding (> multiplier * recent avg).
+    # 0 = disabled (default).
+    spread_expansion_enabled: bool = False
+    spread_expansion_multiplier: float = 2.0  # current > this * recent_avg = expanding
+    spread_expansion_window: int = 10  # recent candle count to build spread baseline
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         existing_keys = set(os.environ.keys())
@@ -592,6 +640,26 @@ class BotConfig:
             momentum_exit_min_profit_pct=float(os.getenv("MOMENTUM_EXIT_MIN_PROFIT_PCT", "0")),
             partial_tp3_fraction=float(os.getenv("PARTIAL_TP3_FRACTION", "0")),
             partial_tp3_target_pct=float(os.getenv("PARTIAL_TP3_TARGET_PCT", "0")),
+            liquidity_sweep_enabled=os.getenv("LIQUIDITY_SWEEP_ENABLED", "false").lower() in {"1", "true", "yes"},
+            liquidity_sweep_lookback=int(os.getenv("LIQUIDITY_SWEEP_LOOKBACK", "10")),
+            liquidity_sweep_min_pct=float(os.getenv("LIQUIDITY_SWEEP_MIN_PCT", "0.01")),
+            liquidity_sweep_reversal_pct=float(os.getenv("LIQUIDITY_SWEEP_REVERSAL_PCT", "0.005")),
+            liquidity_trap_enabled=os.getenv("LIQUIDITY_TRAP_ENABLED", "false").lower() in {"1", "true", "yes"},
+            liquidity_trap_breakout_pct=float(os.getenv("LIQUIDITY_TRAP_BREAKOUT_PCT", "0.005")),
+            liquidity_trap_reversal_pct=float(os.getenv("LIQUIDITY_TRAP_REVERSAL_PCT", "0.008")),
+            liquidity_vacuum_min_gap_pct=float(os.getenv("LIQUIDITY_VACUUM_MIN_GAP_PCT", "0")),
+            liquidity_vacuum_depth_levels=int(os.getenv("LIQUIDITY_VACUUM_DEPTH_LEVELS", "10")),
+            smart_money_enabled=os.getenv("SMART_MONEY_ENABLED", "false").lower() in {"1", "true", "yes"},
+            smart_money_volume_factor=float(os.getenv("SMART_MONEY_VOLUME_FACTOR", "3.0")),
+            smart_money_divergence_lookback=int(os.getenv("SMART_MONEY_DIVERGENCE_LOOKBACK", "5")),
+            volume_accel_enabled=os.getenv("VOLUME_ACCEL_ENABLED", "false").lower() in {"1", "true", "yes"},
+            volume_accel_window=int(os.getenv("VOLUME_ACCEL_WINDOW", "5")),
+            volume_accel_min_ratio=float(os.getenv("VOLUME_ACCEL_MIN_RATIO", "1.5")),
+            micro_trend_enabled=os.getenv("MICRO_TREND_ENABLED", "false").lower() in {"1", "true", "yes"},
+            micro_trend_window=int(os.getenv("MICRO_TREND_WINDOW", "3")),
+            spread_expansion_enabled=os.getenv("SPREAD_EXPANSION_ENABLED", "false").lower() in {"1", "true", "yes"},
+            spread_expansion_multiplier=float(os.getenv("SPREAD_EXPANSION_MULTIPLIER", "2.0")),
+            spread_expansion_window=int(os.getenv("SPREAD_EXPANSION_WINDOW", "10")),
         )
         cfg._validate()
         return cfg

@@ -18,6 +18,12 @@ from .analysis import (
     TrendResult,
     VolatilityStats,
     WhaleActivity,
+    LiquiditySweep,
+    LiquidityTrap,
+    LiquidityVacuum,
+    MicroTrend,
+    SmartMoneyFootprint,
+    VolumeAcceleration,
 )
 from .config import BotConfig
 
@@ -322,6 +328,12 @@ def make_trade_decision(
     effective_capital: Optional[float] = None,
     smart_entry: Optional[SmartEntryResult] = None,
     trade_flow: Optional[TradeFlowResult] = None,
+    liquidity_sweep: Optional[LiquiditySweep] = None,
+    liquidity_trap: Optional[LiquidityTrap] = None,
+    liquidity_vacuum: Optional[LiquidityVacuum] = None,
+    smart_money: Optional[SmartMoneyFootprint] = None,
+    volume_accel: Optional[VolumeAcceleration] = None,
+    micro_trend: Optional[MicroTrend] = None,
 ) -> StrategyDecision:
     """Produce a :class:`StrategyDecision` incorporating all available signals.
 
@@ -544,9 +556,74 @@ def make_trade_decision(
             conf *= 1.0 - 0.4 * smart_entry.fake_breakout.score
             see_note += ("_" if see_note else "") + "see_fake_breakout"
 
+    # ── Liquidity Sweep signal ────────────────────────────────────────────────
+    sweep_note = ""
+    if liquidity_sweep is not None and liquidity_sweep.detected:
+        if action == "buy" and liquidity_sweep.direction == "down":
+            # Down sweep = stop hunted lows → potential reversal buy
+            conf = min(1.0, conf + 0.04)
+            sweep_note = f"liq_sweep_down(+)"
+        elif action == "buy" and liquidity_sweep.direction == "up":
+            # Up sweep = exhaustion top → avoid buying
+            conf *= 0.80
+            sweep_note = f"liq_sweep_up(-)"
+
+    # ── Liquidity Trap signal ─────────────────────────────────────────────────
+    trap_note = ""
+    if liquidity_trap is not None and liquidity_trap.detected:
+        if action == "buy" and liquidity_trap.direction == "up":
+            # Upward trap → buyers just got trapped → avoid
+            conf *= 0.70
+            trap_note = f"liq_trap_up(-)"
+        elif action == "sell" and liquidity_trap.direction == "down":
+            # Downward trap → sellers just got trapped → reversal sell avoided
+            conf *= 0.70
+            trap_note = f"liq_trap_down(-)"
+
+    # ── Liquidity Vacuum (hard skip) ─────────────────────────────────────────
+    vacuum_note = ""
+    if liquidity_vacuum is not None and liquidity_vacuum.detected and action == "buy":
+        # Large gap above means price could gap up, but it's also risky — reduce conf
+        conf *= 0.85
+        vacuum_note = f"liq_vacuum(gap={liquidity_vacuum.gap_pct:.2%})"
+
+    # ── Smart Money Footprint ─────────────────────────────────────────────────
+    smart_money_note = ""
+    if smart_money is not None and smart_money.detected:
+        if action == "buy" and smart_money.bias == "accumulation":
+            conf = min(1.0, conf + 0.06)
+            smart_money_note = f"smart_money_accum(x{smart_money.volume_ratio:.1f})"
+        elif action == "buy" and smart_money.bias == "distribution":
+            conf *= 0.80
+            smart_money_note = f"smart_money_dist(-)"
+        elif action == "sell" and smart_money.bias == "distribution":
+            conf = min(1.0, conf + 0.04)
+            smart_money_note = f"smart_money_dist_sell(+)"
+
+    # ── Volume Acceleration ───────────────────────────────────────────────────
+    vaccel_note = ""
+    if volume_accel is not None and volume_accel.detected:
+        if action == "buy":
+            boost = min(0.08, 0.02 * volume_accel.acceleration_ratio)
+            conf = min(1.0, conf + boost)
+            vaccel_note = f"vol_accel(x{volume_accel.acceleration_ratio:.1f})"
+
+    # ── Micro Trend ───────────────────────────────────────────────────────────
+    micro_note = ""
+    if micro_trend is not None:
+        if action == "buy" and micro_trend.direction == "up":
+            conf = min(1.0, conf + 0.03 * micro_trend.strength)
+            micro_note = f"micro_up"
+        elif action == "buy" and micro_trend.direction == "down":
+            conf *= 0.85
+            micro_note = f"micro_down(-)"
+        elif action == "sell" and micro_trend.direction == "down":
+            conf = min(1.0, conf + 0.03 * micro_trend.strength)
+            micro_note = f"micro_down_sell"
+
     conf = round(max(0.0, min(1.0, conf)), 3)
 
-    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note) if n)
+    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note, sweep_note, trap_note, vacuum_note, smart_money_note, vaccel_note, micro_note) if n)
 
     # Adaptive sizing note: show effective risk when adaptive mode is on
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
