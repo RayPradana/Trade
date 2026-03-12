@@ -45,6 +45,7 @@ AI_PUMP_SNIPER_BONUS = 0.1
 AI_WHALE_BONUS = 0.1
 AI_EB_BONUS = 0.05
 AI_FAKE_BREAKOUT_PENALTY = 0.15
+AI_TREND_MISALIGNMENT_PENALTY = 0.4
 
 
 def _ai_entry_score(
@@ -57,9 +58,9 @@ def _ai_entry_score(
     """Heuristic machine-style score synthesising multiple signals (0..1)."""
     trend_score = min(1.0, max(0.0, abs(trend.strength) * AI_TREND_SCALE))
     if action == "buy" and trend.direction != "up":
-        trend_score *= 0.4
+        trend_score *= AI_TREND_MISALIGNMENT_PENALTY
     if action == "sell" and trend.direction != "down":
-        trend_score *= 0.4
+        trend_score *= AI_TREND_MISALIGNMENT_PENALTY
 
     ob_bias = orderbook.imbalance
     ob_score = (

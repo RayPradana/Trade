@@ -882,7 +882,8 @@ def detect_pump_sniper(
     vol_factor = vol_ratio / min_volume_ratio if min_volume_ratio > 0 else 0.0
     min_factor = min(price_factor, vol_factor)
     # Normalise so min_factor=1 → score 0, min_factor=2 → score 1 (linear ramp
-    # on the weaker of price/volume surges).
+    # on the weaker of price/volume surges). Scores saturate at 1 when the
+    # weaker factor is ≥ 2× the minimum threshold.
     score = max(0.0, min(1.0, min_factor - 1.0))
 
     return PumpSniperSignal(
