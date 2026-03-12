@@ -23,10 +23,10 @@ class ConfigRealTimeTest(TestCase):
             cfg = BotConfig.from_env()
             self.assertEqual(cfg.api_secret, "mysecret")
 
-    def test_trailing_stop_defaults_to_zero(self):
+    def test_trailing_stop_default(self):
         with patch.dict(os.environ, {}, clear=True):
             cfg = BotConfig.from_env()
-            self.assertEqual(cfg.trailing_stop_pct, 0.0)
+            self.assertAlmostEqual(cfg.trailing_stop_pct, 0.03)
 
     def test_trailing_stop_loaded_from_env(self):
         with patch.dict(os.environ, {"TRAILING_STOP_PCT": "0.02"}, clear=True):
@@ -259,7 +259,7 @@ class DynamicTpConfigTest(TestCase):
         from unittest.mock import patch
         with patch.dict(__import__("os").environ, {}, clear=True):
             cfg = BotConfig.from_env()
-            self.assertEqual(cfg.trailing_tp_pct, 0.0)
+            self.assertAlmostEqual(cfg.trailing_tp_pct, 0.02)
             self.assertEqual(cfg.conditional_tp_min_trend_strength, 0.0)
             self.assertEqual(cfg.conditional_tp_min_ob_imbalance, 0.0)
             self.assertEqual(cfg.conditional_tp_max_rsi, 0.0)

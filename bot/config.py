@@ -79,7 +79,7 @@ class BotConfig:
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
-    trailing_stop_pct: float = 0.0  # 0 = disabled; e.g. 0.02 = 2% trailing stop
+    trailing_stop_pct: float = 0.03  # 3% trailing stop (rises with price, never falls)
     staged_entry_steps: int = 3
     # Minimum portfolio cash (IDR) required to use multi-step staged entry.
     # When the available cash falls below this threshold the bot collapses to a
@@ -192,7 +192,7 @@ class BotConfig:
     # only closed when price falls back through the floor, locking in the best
     # available exit rather than a fixed 20%.
     # E.g. 0.01 = trail 1% below the highest price since TP was hit.
-    trailing_tp_pct: float = 0.0
+    trailing_tp_pct: float = 0.02  # 2% trailing floor below peak after TP activation
     # Conditional TP: extra market-condition checks before closing at TP.
     # If the conditions below are met the bot holds the position and waits
     # (using the trailing TP if configured, or a bare hold if not).
@@ -455,7 +455,7 @@ class BotConfig:
             initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000000")),
             target_profit_pct=float(os.getenv("TARGET_PROFIT_PCT", "0.2")),
             max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
-            trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.0")),
+            trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.03")),
             staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
             staged_entry_min_equity=float(os.getenv("STAGED_ENTRY_MIN_EQUITY", "1000000")),
             position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
@@ -488,7 +488,7 @@ class BotConfig:
             max_portfolio_risk_pct=float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "0")),
             min_liquidity_depth_idr=float(os.getenv("MIN_LIQUIDITY_DEPTH_IDR", "0")),
             profit_buffer_drawdown_pct=float(os.getenv("PROFIT_BUFFER_DRAWDOWN_PCT", "0")),
-            trailing_tp_pct=float(os.getenv("TRAILING_TP_PCT", "0")),
+            trailing_tp_pct=float(os.getenv("TRAILING_TP_PCT", "0.02")),
             conditional_tp_min_trend_strength=float(os.getenv("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0")),
             conditional_tp_min_ob_imbalance=float(os.getenv("CONDITIONAL_TP_MIN_OB_IMBALANCE", "0")),
             conditional_tp_max_rsi=float(os.getenv("CONDITIONAL_TP_MAX_RSI", "0")),
