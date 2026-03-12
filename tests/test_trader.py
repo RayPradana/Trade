@@ -2192,3 +2192,152 @@ class PairCooldownTraderTest(unittest.TestCase):
         trader = Trader(config)
         trader._persist_after_trade("sol_idr")
         self.assertNotIn("sol_idr", trader._pair_last_trade)
+
+
+class ZeroAmountBuySkipTest(unittest.TestCase):
+    """Bug fix: bot must NOT report PLACED/simulated when all staged steps are below min_order_idr."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    @staticmethod
+    def _dummy_client():
+        """Return a minimal fake client that satisfies depth checks."""
+        return type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["2699999", "1"]], "sell": [["2700001", "1"]]},
+        })()
+
+    def _make_snapshot(self, pair="cast_idr", price=2_700_000.0, conf=0.353):
+        return {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=conf,
+                reason="test",
+                target_price=price,
+                # Amount small enough that step_amount * price < min_order_idr
+                # With price=2_700_000 and amount=0.000003 → Rp8.1 < min Rp15000
+                amount=0.000003,
+                stop_loss=price * 0.95,
+                take_profit=price * 1.05,
+            ),
+        }
+
+    def test_dry_run_all_steps_below_min_returns_skipped(self):
+        """Dry-run: if the total order value is below min_order_idr, status must be 'skipped'."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_order_idr=15000,
+            # disable RSI / resistance / cooldown filters so the only skip reason
+            # is the min_order check
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client()
+        snap = self._make_snapshot()
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        # Either the pre-staged check or the post-loop guard should fire
+        self.assertTrue(
+            "order_below_minimum" in outcome["reason"]
+            or "all_steps_below_min_order" in outcome["reason"],
+            f"Unexpected reason: {outcome['reason']}",
+        )
+
+    def test_dry_run_portfolio_unchanged_after_zero_amount_skip(self):
+        """Portfolio cash must be unchanged (no coins bought) when skipped."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_order_idr=15000,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client()
+        initial_cash = trader.tracker.cash
+        snap = self._make_snapshot()
+        trader.maybe_execute(snap)
+        self.assertEqual(trader.tracker.cash, initial_cash)
+        self.assertEqual(trader.tracker.base_position, 0.0)
+
+    def test_pair_cooldown_not_recorded_after_zero_amount_skip(self):
+        """Pair cooldown must NOT be set when the order was never actually placed."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_order_idr=15000,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            pair_cooldown_seconds=300.0,
+            min_confidence=0.0,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client()
+        snap = self._make_snapshot(pair="cast_idr")
+        trader.maybe_execute(snap)
+        # _persist_after_trade should not have been called → no cooldown recorded
+        self.assertNotIn("cast_idr", trader._pair_last_trade)
+
+    def test_all_staged_steps_individually_below_min_after_split(self):
+        """When total passes pre-check but every staged split is below min, must skip."""
+        from bot.analysis import VolatilityStats
+        # min_order_idr = 30000, price = 100
+        # decision.amount = 400 → effective_amount capped at min(400, cash/100)
+        # default cash=1_000_000 → max_affordable=10000 → effective_amount=400
+        # total IDR = 400 × 100 = 40000 > 30000 (passes pre-check)
+        # staged fractions with vol=0.015, conf=0.5: [0.6, 0.4]
+        # step1 = 240 × 100 = 24000 < 30000, step2 = 160 × 100 = 16000 < 30000
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_order_idr=30000,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            max_slippage_pct=0.05,   # generous slippage to avoid early skip
+        )
+        trader = Trader(config)
+        # Depth prices close to 100 to avoid slippage rejection
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["99", "1"]], "sell": [["101", "1"]]},
+        })()
+        snap = {
+            "pair": "split_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": VolatilityStats(volatility=0.015, avg_volume=1000.0),
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.5,
+                reason="test",
+                target_price=100.0,
+                amount=400.0,
+                stop_loss=90.0,
+                take_profit=110.0,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("all_steps_below_min_order", outcome["reason"])

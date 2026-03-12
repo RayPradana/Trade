@@ -1238,6 +1238,20 @@ class Trader:
                 self.tracker.record_trade(decision.action, reference_price, step_amount)
                 remaining_amount -= step_amount
                 executed_steps.append({"amount": step_amount, "price": reference_price})
+            # Guard: if every staged step was below min_order, nothing was bought.
+            # Return skipped so the caller never logs a false "PLACED" / "✅".
+            if not executed_steps:
+                logger.info(
+                    "All staged steps below min Rp%.0f — skipping %s on %s",
+                    self.config.min_order_idr,
+                    decision.action,
+                    snapshot["pair"],
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"all_steps_below_min_order (min=Rp{self.config.min_order_idr:.0f})",
+                    "portfolio": self.tracker.as_dict(reference_price),
+                }
             outcome = {
                 "status": "simulated",
                 "action": decision.action,
@@ -1313,6 +1327,19 @@ class Trader:
                 reference_price,
                 order_resp,
             )
+        # Guard: if every staged step was below min_order, nothing was placed.
+        if not executed_steps:
+            logger.info(
+                "All staged steps below min Rp%.0f — skipping %s on %s",
+                self.config.min_order_idr,
+                decision.action,
+                snapshot["pair"],
+            )
+            return {
+                "status": "skipped",
+                "reason": f"all_steps_below_min_order (min=Rp{self.config.min_order_idr:.0f})",
+                "portfolio": self.tracker.as_dict(reference_price),
+            }
         outcome = {
             "status": "placed",
             "action": decision.action,

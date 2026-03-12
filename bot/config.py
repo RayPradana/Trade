@@ -275,20 +275,20 @@ class BotConfig:
     # After a buy or sell is executed for a pair, the pair is put in cooldown for
     # this many seconds.  Any subsequent buy signal on the same pair within the
     # window is skipped with status="skipped", reason="pair_cooldown".
-    # 0 = disabled (default).  Recommended: 300 (5 minutes).
-    pair_cooldown_seconds: float = 0.0
+    # 0 = disabled.  Default: 300 (5 minutes).
+    pair_cooldown_seconds: float = 300.0
     # ── RSI overbought buy filter ─────────────────────────────────────────────
     # Hard-skip BUY when RSI is at or above this threshold.  Complements the
     # existing soft penalty (conf *= 0.8 above 70) by providing a hard cut-off
     # for extreme overbought conditions (e.g. RSI ≥ 85 after a spike).
-    # 0 = disabled (default).  Recommended: 85.
-    buy_max_rsi: float = 0.0
+    # 0 = disabled.  Default: 85.
+    buy_max_rsi: float = 85.0
     # ── Distance-to-resistance buy filter ────────────────────────────────────
     # Hard-skip BUY when the current price is within this fraction of the
     # nearest resistance level.  For example 0.01 = skip if price is < 1%
     # below resistance.  Only active when resistance data is available.
-    # 0 = disabled (default).  Recommended: 0.01.
-    buy_max_resistance_proximity_pct: float = 0.0
+    # 0 = disabled.  Default: 0.01 (1%).
+    buy_max_resistance_proximity_pct: float = 0.01
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -402,9 +402,9 @@ class BotConfig:
             adaptive_tier0_max_pos=int(os.getenv("ADAPTIVE_TIER0_MAX_POS", "3")),
             adaptive_tier1_max_pos=int(os.getenv("ADAPTIVE_TIER1_MAX_POS", "4")),
             adaptive_tier2_max_pos=int(os.getenv("ADAPTIVE_TIER2_MAX_POS", "5")),
-            pair_cooldown_seconds=float(os.getenv("PAIR_COOLDOWN_SECONDS", "0")),
-            buy_max_rsi=float(os.getenv("BUY_MAX_RSI", "0")),
-            buy_max_resistance_proximity_pct=float(os.getenv("BUY_MAX_RESISTANCE_PROXIMITY_PCT", "0")),
+            pair_cooldown_seconds=float(os.getenv("PAIR_COOLDOWN_SECONDS", "300")),
+            buy_max_rsi=float(os.getenv("BUY_MAX_RSI", "85")),
+            buy_max_resistance_proximity_pct=float(os.getenv("BUY_MAX_RESISTANCE_PROXIMITY_PCT", "0.01")),
         )
         cfg._validate()
         return cfg
