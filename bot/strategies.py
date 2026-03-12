@@ -29,6 +29,49 @@ MIN_STOP_DISTANCE = 1e-6
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
 
 
+def adaptive_risk_per_trade(equity: float, config: BotConfig) -> float:
+    """Return the effective risk-per-trade fraction for the given equity.
+
+    When ``config.adaptive_sizing_enabled`` is ``False`` the static
+    ``config.risk_per_trade`` is returned unchanged.
+
+    When adaptive sizing is enabled, equity is mapped to one of three tiers:
+
+    * **Tier 0** (small cap, ``equity < adaptive_tier1_equity``):
+      uses ``adaptive_tier0_risk`` (default 10%).
+    * **Tier 1** (medium cap, ``adaptive_tier1_equity ≤ equity < adaptive_tier2_equity``):
+      uses ``adaptive_tier1_risk`` (default 7%).
+    * **Tier 2** (large cap, ``equity ≥ adaptive_tier2_equity``):
+      uses ``adaptive_tier2_risk`` (default 3%).
+    """
+    if not config.adaptive_sizing_enabled or equity <= 0:
+        return config.risk_per_trade
+    if equity < config.adaptive_tier1_equity:
+        return config.adaptive_tier0_risk
+    if equity < config.adaptive_tier2_equity:
+        return config.adaptive_tier1_risk
+    return config.adaptive_tier2_risk
+
+
+def adaptive_max_positions(equity: float, config: BotConfig) -> int:
+    """Return the effective max-open-positions limit for the given equity.
+
+    When ``config.adaptive_sizing_enabled`` is ``False``, returns
+    ``config.max_open_positions`` (0 = no limit).
+
+    When adaptive sizing is enabled, returns the tier-specific value
+    (``adaptive_tier0_max_pos`` / ``adaptive_tier1_max_pos`` / ``adaptive_tier2_max_pos``),
+    overriding the static ``max_open_positions``.
+    """
+    if not config.adaptive_sizing_enabled or equity <= 0:
+        return config.max_open_positions
+    if equity < config.adaptive_tier1_equity:
+        return config.adaptive_tier0_max_pos
+    if equity < config.adaptive_tier2_equity:
+        return config.adaptive_tier1_max_pos
+    return config.adaptive_tier2_max_pos
+
+
 @dataclass
 class StrategyDecision:
     mode: str
@@ -192,9 +235,11 @@ def _position_size(
         return 0.0
     # Use compounding capital when available, otherwise fall back to initial_capital
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
+    # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
+    risk = adaptive_risk_per_trade(capital, config)
     # Compute how many units of the base asset represent one "risk unit" of capital
-    dynamic_base = (config.risk_per_trade * capital) / current_price
-    desired_risk_value = capital * config.risk_per_trade
+    dynamic_base = (risk * capital) / current_price
+    desired_risk_value = capital * risk
     base_order_risk = risk_per_unit * dynamic_base
     dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
     scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
@@ -369,11 +414,20 @@ def make_trade_decision(
     conf = round(max(0.0, min(1.0, conf)), 3)
 
     _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note) if n)
+
+    # Adaptive sizing note: show effective risk when adaptive mode is on
+    capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
+    eff_risk = adaptive_risk_per_trade(capital, config)
+    adaptive_note = (
+        f"adaptive_risk={eff_risk:.0%}" if config.adaptive_sizing_enabled else ""
+    )
+    _all_notes = " ".join(n for n in (_notes, adaptive_note) if n)
+
     reason = (
         f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
         f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} "
         f"rsi={indicators.rsi if indicators else float('nan'):.2f}"
-        + (f" {_notes}" if _notes else "")
+        + (f" {_all_notes}" if _all_notes else "")
     )
 
     # size based on risk per trade relative to stop distance

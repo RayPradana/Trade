@@ -173,3 +173,107 @@ class SmartEntryStrategyTests(unittest.TestCase):
         base = make_trade_decision(trend, orderbook, vol, 100.0, config, levels)
         with_none = make_trade_decision(trend, orderbook, vol, 100.0, config, levels, smart_entry=None)
         self.assertEqual(base.confidence, with_none.confidence)
+
+
+class AdaptiveSizingTests(unittest.TestCase):
+    """Tests for adaptive_risk_per_trade() and adaptive_max_positions()."""
+
+    from bot.strategies import adaptive_risk_per_trade, adaptive_max_positions
+
+    def _cfg(self, **kwargs) -> BotConfig:
+        defaults = dict(
+            api_key=None, dry_run=True,
+            adaptive_sizing_enabled=True,
+            adaptive_tier1_equity=2_000_000.0,
+            adaptive_tier2_equity=5_000_000.0,
+            adaptive_tier0_risk=0.10,
+            adaptive_tier1_risk=0.07,
+            adaptive_tier2_risk=0.03,
+            adaptive_tier0_max_pos=3,
+            adaptive_tier1_max_pos=4,
+            adaptive_tier2_max_pos=5,
+        )
+        defaults.update(kwargs)
+        return BotConfig(**defaults)
+
+    def test_small_cap_risk(self):
+        """Equity below tier1 threshold → tier0 risk."""
+        from bot.strategies import adaptive_risk_per_trade
+        cfg = self._cfg()
+        self.assertAlmostEqual(adaptive_risk_per_trade(500_000.0, cfg), 0.10)
+
+    def test_medium_cap_risk(self):
+        """Equity between tier1 and tier2 → tier1 risk."""
+        from bot.strategies import adaptive_risk_per_trade
+        cfg = self._cfg()
+        self.assertAlmostEqual(adaptive_risk_per_trade(3_000_000.0, cfg), 0.07)
+
+    def test_large_cap_risk(self):
+        """Equity above tier2 → tier2 risk."""
+        from bot.strategies import adaptive_risk_per_trade
+        cfg = self._cfg()
+        self.assertAlmostEqual(adaptive_risk_per_trade(10_000_000.0, cfg), 0.03)
+
+    def test_boundary_tier1(self):
+        """Equity exactly at tier1 threshold should use tier1 risk (medium cap)."""
+        from bot.strategies import adaptive_risk_per_trade
+        cfg = self._cfg()
+        self.assertAlmostEqual(adaptive_risk_per_trade(2_000_000.0, cfg), 0.07)
+
+    def test_boundary_tier2(self):
+        """Equity exactly at tier2 threshold should use tier2 risk (large cap)."""
+        from bot.strategies import adaptive_risk_per_trade
+        cfg = self._cfg()
+        self.assertAlmostEqual(adaptive_risk_per_trade(5_000_000.0, cfg), 0.03)
+
+    def test_disabled_returns_static_risk(self):
+        """When adaptive_sizing_enabled=False, static risk_per_trade is returned."""
+        from bot.strategies import adaptive_risk_per_trade
+        cfg = self._cfg(adaptive_sizing_enabled=False, risk_per_trade=0.02)
+        self.assertAlmostEqual(adaptive_risk_per_trade(500_000.0, cfg), 0.02)
+
+    def test_small_cap_max_pos(self):
+        """Equity < tier1 → tier0 max positions."""
+        from bot.strategies import adaptive_max_positions
+        cfg = self._cfg()
+        self.assertEqual(adaptive_max_positions(500_000.0, cfg), 3)
+
+    def test_medium_cap_max_pos(self):
+        """Equity in tier1 → tier1 max positions."""
+        from bot.strategies import adaptive_max_positions
+        cfg = self._cfg()
+        self.assertEqual(adaptive_max_positions(3_000_000.0, cfg), 4)
+
+    def test_large_cap_max_pos(self):
+        """Equity >= tier2 → tier2 max positions."""
+        from bot.strategies import adaptive_max_positions
+        cfg = self._cfg()
+        self.assertEqual(adaptive_max_positions(10_000_000.0, cfg), 5)
+
+    def test_disabled_returns_static_max_pos(self):
+        """When adaptive_sizing_enabled=False, static max_open_positions is returned."""
+        from bot.strategies import adaptive_max_positions
+        cfg = self._cfg(adaptive_sizing_enabled=False, max_open_positions=7)
+        self.assertEqual(adaptive_max_positions(500_000.0, cfg), 7)
+
+    def test_position_size_larger_for_small_cap(self):
+        """With adaptive sizing, small capital should produce larger relative position than without."""
+        from bot.analysis import VolatilityStats
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        cfg_adaptive = self._cfg(initial_capital=500_000.0)
+        cfg_static = self._cfg(adaptive_sizing_enabled=False, risk_per_trade=0.01, initial_capital=500_000.0)
+        # With adaptive: risk = 10% of 500k
+        # With static: risk = 1% of 500k → much smaller
+        size_adaptive = _position_size(50_000.0, 49_000.0, cfg_adaptive, 1000.0, 0.7, vol, 500_000.0)
+        size_static = _position_size(50_000.0, 49_000.0, cfg_static, 1000.0, 0.7, vol, 500_000.0)
+        self.assertGreater(size_adaptive, size_static)
+
+    def test_adaptive_note_in_reason(self):
+        """Decision reason should include adaptive_risk when adaptive sizing is enabled."""
+        from bot.analysis import OrderbookInsight, TrendResult, VolatilityStats
+        trend = TrendResult(direction="up", fast_ma=102.0, slow_ma=100.0, strength=0.02)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=100.0, ask_volume=70.0, imbalance=0.3)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        cfg = self._cfg(initial_capital=500_000.0)
+        dec = make_trade_decision(trend, ob, vol, 50_000.0, cfg, effective_capital=500_000.0)
+        self.assertIn("adaptive_risk=", dec.reason)

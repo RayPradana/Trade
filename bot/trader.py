@@ -33,7 +33,7 @@ from .rate_limit import RateLimitedOrderQueue
 from .realtime import MultiPairFeed, RealtimeFeed
 from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
-from .strategies import StrategyDecision, make_trade_decision
+from .strategies import StrategyDecision, adaptive_max_positions, adaptive_risk_per_trade, make_trade_decision
 from .tracking import PortfolioTracker
 from .journal import TradeJournal
 
@@ -936,6 +936,24 @@ class Trader:
             if self.tracker.loss_streak >= self.config.max_consecutive_losses:
                 return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": self.tracker.as_dict(price)}
 
+        # Max open positions check (static or adaptive)
+        if decision.action == "buy":
+            equity = self.tracker.effective_capital()
+            eff_max_pos = adaptive_max_positions(equity, self.config)
+            if eff_max_pos > 0 and self.tracker.base_position > 0:
+                # Count current open position (this bot tracks one position at a time,
+                # but when eff_max_pos == 1 it means no concurrent positions allowed
+                # while one is already open).
+                if eff_max_pos <= 1:
+                    logger.info(
+                        "Max open positions reached (%d) — skipping buy", eff_max_pos
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": f"max_open_positions={eff_max_pos}",
+                        "portfolio": self.tracker.as_dict(price),
+                    }
+
         # Flash dump protection
         if self.config.flash_dump_pct > 0 and decision.action == "buy":
             pair_history = self._price_history.get(snapshot["pair"], [])
@@ -1127,6 +1145,15 @@ class Trader:
         if decision.action == "buy":
             max_affordable = max(0.0, self.tracker.cash / reference_price)
             effective_amount = min(decision.amount, max_affordable)
+            # Log adaptive sizing tier when it's active
+            if self.config.adaptive_sizing_enabled:
+                equity = self.tracker.effective_capital()
+                eff_risk = adaptive_risk_per_trade(equity, self.config)
+                eff_max = adaptive_max_positions(equity, self.config)
+                logger.debug(
+                    "Adaptive sizing: equity=%.0f risk=%.0f%% max_pos=%d",
+                    equity, eff_risk * 100, eff_max,
+                )
         elif decision.action == "sell":
             max_sellable = max(0.0, self.tracker.base_position)
             effective_amount = min(decision.amount, max_sellable)

@@ -215,9 +215,10 @@ class BotConfig:
     # so that the error is caught gracefully as a "skipped" outcome rather than
     # raising a runtime exception.
     #
-    # The value can be raised above the exchange minimum if desired (e.g. to
-    # avoid wasting fees on very small trades).  Must be > 0.
-    min_order_idr: float = 10_000.0
+    # Default is raised to 15,000 IDR above the exchange minimum to avoid
+    # wasting fees on tiny trades and to ensure trades "feel" meaningful.
+    # Must be > 0.
+    min_order_idr: float = 15_000.0
     # Consecutive loss protection
     max_consecutive_losses: int = 0  # 0=disabled; stop trading after N losing sells in a row
     # Volatility cooldown
@@ -246,6 +247,30 @@ class BotConfig:
     # Flash dump protection
     flash_dump_pct: float = 0.0
     flash_dump_lookback_seconds: float = 60.0
+    # ── Adaptive position sizing ──────────────────────────────────────────────
+    # When enabled, risk_per_trade and max_open_positions are automatically
+    # adjusted based on current equity (effective_capital), making the bot more
+    # aggressive with small capital and more conservative with large capital.
+    #
+    # Three tiers (small / medium / large) are defined by two equity thresholds:
+    #   equity < adaptive_tier1_equity         → Tier 0 (small cap)
+    #   adaptive_tier1_equity ≤ equity < adaptive_tier2_equity → Tier 1 (medium cap)
+    #   equity ≥ adaptive_tier2_equity          → Tier 2 (large cap)
+    #
+    # Set ADAPTIVE_SIZING_ENABLED=true to activate.  When disabled (default)
+    # the static RISK_PER_TRADE and MAX_OPEN_POSITIONS values are used.
+    adaptive_sizing_enabled: bool = False
+    # Equity thresholds (IDR)
+    adaptive_tier1_equity: float = 2_000_000.0   # below this → Tier 0 (small cap)
+    adaptive_tier2_equity: float = 5_000_000.0   # above this → Tier 2 (large cap)
+    # Risk per trade for each tier (fraction of equity, e.g. 0.10 = 10%)
+    adaptive_tier0_risk: float = 0.10   # small cap: 10%
+    adaptive_tier1_risk: float = 0.07   # medium cap: 7%
+    adaptive_tier2_risk: float = 0.03   # large cap: 3%
+    # Max open positions for each tier
+    adaptive_tier0_max_pos: int = 3
+    adaptive_tier1_max_pos: int = 4
+    adaptive_tier2_max_pos: int = 5
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -333,7 +358,7 @@ class BotConfig:
             see_whale_pressure_min=float(os.getenv("SEE_WHALE_PRESSURE_MIN", "2.0")),
             see_breakout_volume_min=float(os.getenv("SEE_BREAKOUT_VOLUME_MIN", "0.7")),
             fake_pump_reversal_pct=float(os.getenv("FAKE_PUMP_REVERSAL_PCT", "0")),
-            min_order_idr=float(os.getenv("MIN_ORDER_IDR", "10000")),
+            min_order_idr=float(os.getenv("MIN_ORDER_IDR", "15000")),
             max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0")),
             volatility_cooldown_pct=float(os.getenv("VOLATILITY_COOLDOWN_PCT", "0")),
             volatility_cooldown_seconds=float(os.getenv("VOLATILITY_COOLDOWN_SECONDS", "0")),
@@ -350,6 +375,15 @@ class BotConfig:
             orderbook_absorption_threshold=float(os.getenv("ORDERBOOK_ABSORPTION_THRESHOLD", "0")),
             flash_dump_pct=float(os.getenv("FLASH_DUMP_PCT", "0")),
             flash_dump_lookback_seconds=float(os.getenv("FLASH_DUMP_LOOKBACK_SECONDS", "60")),
+            adaptive_sizing_enabled=os.getenv("ADAPTIVE_SIZING_ENABLED", "false").lower() in {"1", "true", "yes"},
+            adaptive_tier1_equity=float(os.getenv("ADAPTIVE_TIER1_EQUITY", "2000000")),
+            adaptive_tier2_equity=float(os.getenv("ADAPTIVE_TIER2_EQUITY", "5000000")),
+            adaptive_tier0_risk=float(os.getenv("ADAPTIVE_TIER0_RISK", "0.10")),
+            adaptive_tier1_risk=float(os.getenv("ADAPTIVE_TIER1_RISK", "0.07")),
+            adaptive_tier2_risk=float(os.getenv("ADAPTIVE_TIER2_RISK", "0.03")),
+            adaptive_tier0_max_pos=int(os.getenv("ADAPTIVE_TIER0_MAX_POS", "3")),
+            adaptive_tier1_max_pos=int(os.getenv("ADAPTIVE_TIER1_MAX_POS", "4")),
+            adaptive_tier2_max_pos=int(os.getenv("ADAPTIVE_TIER2_MAX_POS", "5")),
         )
         cfg._validate()
         return cfg
@@ -480,5 +514,23 @@ class BotConfig:
             raise ValueError("FLASH_DUMP_PCT must be non-negative")
         if self.flash_dump_lookback_seconds <= 0:
             raise ValueError("FLASH_DUMP_LOOKBACK_SECONDS must be positive")
+        if self.adaptive_tier1_equity <= 0:
+            raise ValueError("ADAPTIVE_TIER1_EQUITY must be positive")
+        if self.adaptive_tier2_equity <= self.adaptive_tier1_equity:
+            raise ValueError("ADAPTIVE_TIER2_EQUITY must be greater than ADAPTIVE_TIER1_EQUITY")
+        for name, val in (
+            ("ADAPTIVE_TIER0_RISK", self.adaptive_tier0_risk),
+            ("ADAPTIVE_TIER1_RISK", self.adaptive_tier1_risk),
+            ("ADAPTIVE_TIER2_RISK", self.adaptive_tier2_risk),
+        ):
+            if not (0 < val <= 0.5):
+                raise ValueError(f"{name} must be in (0, 0.5]")
+        for name, val in (
+            ("ADAPTIVE_TIER0_MAX_POS", self.adaptive_tier0_max_pos),
+            ("ADAPTIVE_TIER1_MAX_POS", self.adaptive_tier1_max_pos),
+            ("ADAPTIVE_TIER2_MAX_POS", self.adaptive_tier2_max_pos),
+        ):
+            if val < 1:
+                raise ValueError(f"{name} must be at least 1")
         if not self.dry_run and not self.api_key:
             self.require_auth()
