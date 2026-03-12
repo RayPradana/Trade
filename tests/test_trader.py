@@ -3643,3 +3643,35 @@ class MultiPositionTraderTest(unittest.TestCase):
         trader.tracker.record_trade("buy", 500_000.0, 1.0)
         self.assertEqual(len(trader.active_positions), 1)
         self.assertTrue(trader.at_max_positions())
+
+    def test_portfolio_snapshot_multi_no_positions_shows_initial_capital(self):
+        """portfolio_snapshot shows total cash (initial capital) when no positions held."""
+        trader = self._make_trader(max_pos=3)
+        snap = trader.portfolio_snapshot("btc_idr", 1_000_000.0)
+        # No positions yet — equity should equal the full initial capital, not zero.
+        self.assertAlmostEqual(snap["equity"], 3_000_000.0, delta=1.0)
+        self.assertAlmostEqual(snap["cash"], 3_000_000.0, delta=1.0)
+        self.assertEqual(snap["base_position"], 0.0)
+        self.assertEqual(snap["realized_pnl"], 0.0)
+        self.assertEqual(snap["principal"], 3_000_000.0)
+
+    def test_portfolio_snapshot_multi_with_position_reflects_holdings(self):
+        """portfolio_snapshot aggregates equity when at least one position is open."""
+        trader = self._make_trader(max_pos=3)
+        # Open a position
+        trader.maybe_execute(self._buy_snapshot("btc_idr", 1_000_000.0, 1.0))
+        snap = trader.portfolio_snapshot("btc_idr", 1_050_000.0)
+        # Equity = remaining cash + btc position at current price
+        self.assertGreater(snap["equity"], 0)
+        self.assertAlmostEqual(snap["principal"], 3_000_000.0, delta=1.0)
+        # Profit buffer should be ≥ 0
+        self.assertGreaterEqual(snap["profit_buffer"], 0.0)
+
+    def test_portfolio_snapshot_single_mode_delegates_to_tracker(self):
+        """In single-position mode, portfolio_snapshot returns tracker.as_dict()."""
+        config = BotConfig(api_key=None, dry_run=True, initial_capital=1_000_000.0, multi_position_enabled=False)
+        trader = Trader(config)
+        snap = trader.portfolio_snapshot("btc_idr", 1_000_000.0)
+        expected = trader.tracker.as_dict(1_000_000.0)
+        self.assertEqual(snap["equity"], expected["equity"])
+        self.assertEqual(snap["cash"], expected["cash"])

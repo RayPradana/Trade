@@ -891,7 +891,7 @@ def main() -> None:
                         _bought_tracker.update_trailing_stop(snapshot["price"], config.trailing_stop_pct)
                     if config.trailing_tp_pct > 0:
                         _bought_tracker.activate_trailing_tp(snapshot["price"], config.trailing_tp_pct)
-            portfolio = trader._active_tracker(snapshot["pair"]).as_dict(snapshot["price"])
+            portfolio = trader.portfolio_snapshot(snapshot["pair"], snapshot["price"])
             _log_portfolio(portfolio, config.initial_capital)
 
             # Telegram notification for actionable outcomes

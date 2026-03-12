@@ -177,6 +177,56 @@ class Trader:
             return not self.multi_manager.can_open_position()
         return self.tracker.base_position > 0
 
+    def portfolio_snapshot(self, pair: str, price: float) -> Dict[str, object]:
+        """Return a portfolio dict suitable for logging and display.
+
+        In **multi-position mode** returns aggregate stats across the entire
+        multi-position portfolio (total equity = unallocated cash + mark-to-market
+        value of all open positions), so callers always see the overall bot
+        financial state rather than a zero-placeholder for pairs not yet entered.
+
+        In **single-position mode** delegates to the primary tracker's
+        :meth:`~PortfolioTracker.as_dict`.
+        """
+        if self.multi_manager is not None:
+            # Build a price map for mark-to-market valuation.
+            # Use the current scan price for the scanned pair; fall back to
+            # avg_cost for other held pairs so we don't need extra API calls.
+            prices: Dict[str, float] = {pair: price}
+            for p, t in self.multi_manager.active_positions.items():
+                if p not in prices:
+                    prices[p] = t.avg_cost or 0.0
+            equity = self.multi_manager.total_equity(prices)
+            cash = self.multi_manager.cash
+            pnl = self.multi_manager.total_realized_pnl()
+            total_trades = sum(t.trade_count for t in self.multi_manager._trackers.values())
+            winning = sum(
+                round(t.trade_count * t.win_rate)
+                for t in self.multi_manager._trackers.values()
+            )
+            win_rate = winning / total_trades if total_trades > 0 else 0.0
+            initial = self.multi_manager.initial_capital
+            return {
+                "equity": equity,
+                "cash": cash,
+                "base_position": 0.0,
+                "realized_pnl": pnl,
+                "trade_count": total_trades,
+                "win_rate": win_rate,
+                "trailing_stop": None,
+                "target_equity": 0.0,
+                "min_equity": 0.0,
+                "avg_cost": 0.0,
+                "principal": initial,
+                "profit_buffer": max(0.0, equity - initial),
+                "effective_capital": equity,
+                "peak_profit_buffer": 0.0,
+                "profit_buffer_drawdown": 0.0,
+                "tp_activated": False,
+                "trailing_tp_stop": None,
+            }
+        return self.tracker.as_dict(price)
+
     # ------------------------------------------------------------------
     # Auto-resume helpers
     # ------------------------------------------------------------------
@@ -1401,8 +1451,9 @@ class Trader:
             return self._execute_grid(snapshot)
 
         if decision.action == "hold":
-            logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, _tracker.as_dict(price))
-            outcome = {"status": "hold", "reason": decision.reason, "portfolio": _tracker.as_dict(price)}
+            _portfolio = self.portfolio_snapshot(_pair, price)
+            logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, _portfolio)
+            outcome = {"status": "hold", "reason": decision.reason, "portfolio": _portfolio}
             return outcome
 
         # When confidence-based position sizing is active, honour the tier_skip
