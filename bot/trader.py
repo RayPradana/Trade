@@ -313,6 +313,16 @@ class Trader:
                             )
                     if not self.config.dry_run:
                         self._reconcile_with_api(restored_pairs[0])
+                else:
+                    # multi_positions was non-empty but all entries had
+                    # base_position=0 (stale/corrupted state).  Clear the file
+                    # and reset the cash pool so the bot starts fresh.
+                    logger.warning(
+                        "Stale multi-position state (no valid positions found) — "
+                        "clearing state and resetting cash to initial_capital"
+                    )
+                    self.persistence.clear()
+                    self.multi_manager.cash = self.multi_manager.initial_capital
                 return
 
             # Backward-compat: single-position save format used with multi-position
@@ -865,17 +875,29 @@ class Trader:
             # ── Pre-filter: minimum volume ────────────────────────────────────
             min_vol = self.config.top_volume_min_volume_idr
             min_chg = self.config.top_volume_min_price_change_24h_pct
+            min_price = self.config.min_buy_price_idr
             candidates = all_known
             dropped_vol: List[str] = []
             dropped_stagnant: List[str] = []
+            dropped_low_price: List[str] = []
 
-            if min_vol > 0 or min_chg > 0:
+            if min_vol > 0 or min_chg > 0 or min_price > 0:
                 filtered: List[str] = []
                 for p in candidates:
                     ticker = self._multi_feed.get_ticker(p)
                     if ticker is None:
                         filtered.append(p)  # no data → keep and let score sort it out
                         continue
+
+                    # Price check (skip tiny-price coins like DENT at 4 IDR)
+                    if min_price > 0:
+                        try:
+                            last_price = float(ticker.get("last") or ticker.get("last_price") or 0)
+                            if 0 < last_price < min_price:
+                                dropped_low_price.append(p)
+                                continue
+                        except (ValueError, TypeError):
+                            pass  # price missing → keep pair
 
                     # Volume check
                     if min_vol > 0:
@@ -908,6 +930,12 @@ class Trader:
                     filtered.append(p)
                 candidates = filtered
 
+            if dropped_low_price:
+                logger.debug(
+                    "Top-volume selector: dropped %d low-price pairs (< Rp%.0f)",
+                    len(dropped_low_price),
+                    min_price,
+                )
             if dropped_vol:
                 logger.debug(
                     "Top-volume selector: dropped %d low-volume pairs (< Rp%.0f)",
@@ -935,11 +963,12 @@ class Trader:
                 self._all_pairs = new_pairs
                 logger.info(
                     "Top-volume selector: watchlist updated → %d pairs "
-                    "(top=%d, filtered_vol=%d, filtered_stagnant=%d): %s",
+                    "(top=%d, filtered_vol=%d, filtered_stagnant=%d, filtered_low_price=%d): %s",
                     len(new_pairs),
                     top_n,
                     len(dropped_vol),
                     len(dropped_stagnant),
+                    len(dropped_low_price),
                     ", ".join(new_pairs[:10]) + (" …" if len(new_pairs) > 10 else ""),
                 )
         except Exception:

@@ -19,6 +19,13 @@ class StatePersistence:
 
     def load(self) -> Optional[Dict[str, Any]]:
         if self.path is None or not self.path.exists():
+            # Clean up any stray temp file from a previous interrupted save.
+            if self.path is not None:
+                tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return None
         try:
             raw = json.loads(self.path.read_text())
@@ -47,6 +54,12 @@ class StatePersistence:
             except OSError:
                 # Safe to ignore inability to delete; caller may retry later.
                 pass
+        # Also remove any stray temp file left by an interrupted save.
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def backup(self, backup_path: Path) -> None:
         """Copy the current state file to *backup_path* as a safety snapshot.

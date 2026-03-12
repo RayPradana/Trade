@@ -578,3 +578,32 @@ class TradeFlowAnalysisTest(unittest.TestCase):
         result = analyze_trade_flow(trades)
         self.assertAlmostEqual(result.buy_ratio, 0.5)
         self.assertFalse(result.aggressive_buyers)
+
+    def test_zero_amount_not_silently_replaced_by_vol(self):
+        """A trade with amount=0 must not fall back to the vol field when
+        amount is the integer/float zero (not None).  The fix ensures we check
+        for None explicitly instead of using boolean falsiness.
+        """
+        from bot.analysis import analyze_trade_flow
+        # amount = 0 (zero int), vol = 5.  The old code would pick vol=5 via
+        # `amount or vol`.  The fixed code uses amount=0 when the key exists.
+        trades = [
+            {"type": "buy", "price": "100", "amount": 0, "vol": 5},
+            {"type": "sell", "price": "100", "amount": "2"},
+        ]
+        result = analyze_trade_flow(trades)
+        # Only the sell trade contributes notional (0*100=0 for buy, 2*100=200 for sell)
+        self.assertAlmostEqual(result.buy_ratio, 0.0, places=3)
+
+    def test_vol_fallback_used_when_amount_is_absent(self):
+        """When the 'amount' key is absent entirely (None), the vol fallback
+        must be used instead.
+        """
+        from bot.analysis import analyze_trade_flow
+        # Only vol key, no amount key
+        trades = [
+            {"type": "buy", "price": "100", "vol": "3"},
+        ]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 1.0)
+        self.assertAlmostEqual(result.buy_volume, 300.0)  # 3 * 100

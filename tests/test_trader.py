@@ -1990,6 +1990,46 @@ class TopVolumeAutoSelectorTest(unittest.TestCase):
         # highvol pair should rank above lowvol pair
         self.assertLess(pairs.index("highvol_idr"), pairs.index("lowvol_idr"))
 
+    def test_low_price_pairs_excluded_from_watchlist(self):
+        """Pairs with last price below min_buy_price_idr must not appear in the watchlist."""
+        tickers = {
+            "btc_idr": {
+                "vol_idr": "5000000000", "last": "1000000000",
+                "high": "1100000000", "low": "900000000",
+            },
+            # DENT-like coin: price = 4 IDR (well below 100 IDR threshold)
+            "dent_idr": {
+                "vol_idr": "200000000", "last": "4",
+                "high": "5", "low": "3",
+            },
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            min_buy_price_idr=100.0,  # skip coins below 100 IDR
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("btc_idr", trader._all_pairs)
+        self.assertNotIn("dent_idr", trader._all_pairs)
+
+    def test_low_price_filter_disabled_when_zero(self):
+        """min_buy_price_idr=0 must not filter any pairs by price."""
+        tickers = {
+            "dent_idr": {
+                "vol_idr": "200000000", "last": "4",
+                "high": "5", "low": "3",
+            },
+        }
+        feed = self._make_feed_with_tickers(tickers)
+        trader = self._trader_with_feed(
+            feed,
+            dynamic_pairs_top_n=20,
+            min_buy_price_idr=0,  # disabled
+        )
+        trader._refresh_dynamic_pairs()
+        self.assertIn("dent_idr", trader._all_pairs)
+
 
 class SellWallGuardTest(unittest.TestCase):
     """Tests for ORDERBOOK_WALL_THRESHOLD sell-wall guard in maybe_execute."""

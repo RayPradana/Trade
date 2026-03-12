@@ -1,9 +1,48 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
+
+_logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: str) -> float:
+    """Read *name* from the environment and convert it to ``float``.
+
+    Falls back to *default* (also converted) when the variable is unset or
+    contains a value that cannot be parsed.  Logs a warning on parse error so
+    mis-configured deployments are easy to spot in logs.
+    """
+    raw = os.getenv(name, default)
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        _logger.warning(
+            "Invalid value for %s=%r — expected a number, using default %s",
+            name, raw, default,
+        )
+        return float(default)
+
+
+def _env_int(name: str, default: str) -> int:
+    """Read *name* from the environment and convert it to ``int``.
+
+    Falls back to *default* (also converted) when the variable is unset or
+    contains a value that cannot be parsed.  Logs a warning on parse error so
+    mis-configured deployments are easy to spot in logs.
+    """
+    raw = os.getenv(name, default)
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        _logger.warning(
+            "Invalid value for %s=%r — expected an integer, using default %s",
+            name, raw, default,
+        )
+        return int(default)
 
 
 def _load_dotenv(path: Optional[Path] = None) -> None:
@@ -546,103 +585,103 @@ class BotConfig:
         websocket_enabled = os.getenv("WEBSOCKET_ENABLED", "true").lower() in {"1", "true", "yes"}
         interval_env = os.getenv("INTERVAL_SECONDS")
         if real_time:
-            interval_seconds = int(interval_env) if user_set_interval and interval_env is not None else 1
+            interval_seconds = _env_int("INTERVAL_SECONDS", "1") if user_set_interval and interval_env is not None else 1
         else:
-            interval_seconds = int(interval_env) if interval_env is not None else int(interval_default)
+            interval_seconds = _env_int("INTERVAL_SECONDS", interval_default) if interval_env is not None else int(interval_default)
         cfg = cls(
             api_key=os.getenv("INDODAX_KEY"),
             api_secret=os.getenv("INDODAX_SECRET"),
-            risk_per_trade=float(os.getenv("RISK_PER_TRADE", "0.01")),
+            risk_per_trade=_env_float("RISK_PER_TRADE", "0.01"),
             dry_run=os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"},
             run_once=os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"},
             real_time=real_time,
             grid_enabled=grid_enabled,
-            grid_levels_per_side=int(os.getenv("GRID_LEVELS_PER_SIDE", "3")),
-            grid_spacing_pct=float(os.getenv("GRID_SPACING_PCT", "0.004")),
-            grid_order_size=float(os.getenv("GRID_ORDER_SIZE")) if os.getenv("GRID_ORDER_SIZE") else None,
+            grid_levels_per_side=_env_int("GRID_LEVELS_PER_SIDE", "3"),
+            grid_spacing_pct=_env_float("GRID_SPACING_PCT", "0.004"),
+            grid_order_size=_env_float("GRID_ORDER_SIZE", "0") if os.getenv("GRID_ORDER_SIZE") else None,
             order_queue_enabled=os.getenv("ORDER_QUEUE_ENABLED", "true").lower() in {"1", "true", "yes"},
-            order_min_interval=float(os.getenv("ORDER_MIN_INTERVAL", "2.0")),
-            scan_request_delay=float(os.getenv("SCAN_REQUEST_DELAY", "0.2")),
-            trade_count=int(os.getenv("TRADE_COUNT", "1000")),
-            min_candles=int(os.getenv("MIN_CANDLES", "20")),
+            order_min_interval=_env_float("ORDER_MIN_INTERVAL", "2.0"),
+            scan_request_delay=_env_float("SCAN_REQUEST_DELAY", "0.2"),
+            trade_count=_env_int("TRADE_COUNT", "1000"),
+            min_candles=_env_int("MIN_CANDLES", "20"),
             websocket_enabled=websocket_enabled,
             websocket_url=os.getenv("WEBSOCKET_URL", "wss://ws3.indodax.com/ws/") or None,
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
-            websocket_batch_size=int(os.getenv("WEBSOCKET_BATCH_SIZE", "100")),
-            pairs_per_cycle=int(os.getenv("PAIRS_PER_CYCLE", "20")),
-            min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.52")),
+            websocket_batch_size=_env_int("WEBSOCKET_BATCH_SIZE", "100"),
+            pairs_per_cycle=_env_int("PAIRS_PER_CYCLE", "20"),
+            min_confidence=_env_float("MIN_CONFIDENCE", "0.52"),
             interval_seconds=interval_seconds,
-            fast_window=int(os.getenv("FAST_WINDOW", "12")),
-            slow_window=int(os.getenv("SLOW_WINDOW", "48")),
-            max_slippage_pct=float(os.getenv("MAX_SLIPPAGE_PCT", "0.001")),
-            initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000000")),
-            target_profit_pct=float(os.getenv("TARGET_PROFIT_PCT", "0.2")),
-            max_loss_pct=float(os.getenv("MAX_LOSS_PCT", "0.1")),
-            trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.03")),
-            staged_entry_steps=int(os.getenv("STAGED_ENTRY_STEPS", "3")),
-            staged_entry_min_equity=float(os.getenv("STAGED_ENTRY_MIN_EQUITY", "1000000")),
-            position_check_interval_seconds=int(os.getenv("POSITION_CHECK_INTERVAL", "60")),
-            cycle_summary_interval=int(os.getenv("CYCLE_SUMMARY_INTERVAL", "10")),
+            fast_window=_env_int("FAST_WINDOW", "12"),
+            slow_window=_env_int("SLOW_WINDOW", "48"),
+            max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", "0.001"),
+            initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
+            target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
+            max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),
+            trailing_stop_pct=_env_float("TRAILING_STOP_PCT", "0.03"),
+            staged_entry_steps=_env_int("STAGED_ENTRY_STEPS", "3"),
+            staged_entry_min_equity=_env_float("STAGED_ENTRY_MIN_EQUITY", "1000000"),
+            position_check_interval_seconds=_env_int("POSITION_CHECK_INTERVAL", "60"),
+            cycle_summary_interval=_env_int("CYCLE_SUMMARY_INTERVAL", "10"),
             trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
             state_path=Path(os.getenv("STATE_PATH", "bot_state.json")),
-            state_backup_interval=int(os.getenv("STATE_BACKUP_INTERVAL", "10")),
-            min_volume_idr=float(os.getenv("MIN_VOLUME_IDR", "0")),
+            state_backup_interval=_env_int("STATE_BACKUP_INTERVAL", "10"),
+            min_volume_idr=_env_float("MIN_VOLUME_IDR", "0"),
             log_file=os.getenv("LOG_FILE") or None,
             telegram_token=os.getenv("TELEGRAM_TOKEN") or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
-            ws_stale_threshold=float(os.getenv("WS_STALE_THRESHOLD", "120")),
+            ws_stale_threshold=_env_float("WS_STALE_THRESHOLD", "120"),
             mtf_timeframes=[
                 tf.strip()
                 for tf in os.getenv("MTF_TIMEFRAMES", "").split(",")
                 if tf.strip()
             ],
-            max_exposure_per_coin_pct=float(os.getenv("MAX_EXPOSURE_PER_COIN_PCT", "0")),
-            max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "0")),
+            max_exposure_per_coin_pct=_env_float("MAX_EXPOSURE_PER_COIN_PCT", "0"),
+            max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", "0"),
             discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL") or None,
-            dynamic_pairs_refresh_cycles=int(os.getenv("DYNAMIC_PAIRS_REFRESH_CYCLES", "5")),
-            dynamic_pairs_top_n=int(os.getenv("DYNAMIC_PAIRS_TOP_N", "20")),
-            top_volume_min_volume_idr=float(os.getenv("TOP_VOLUME_MIN_VOLUME_IDR", "0")),
+            dynamic_pairs_refresh_cycles=_env_int("DYNAMIC_PAIRS_REFRESH_CYCLES", "5"),
+            dynamic_pairs_top_n=_env_int("DYNAMIC_PAIRS_TOP_N", "20"),
+            top_volume_min_volume_idr=_env_float("TOP_VOLUME_MIN_VOLUME_IDR", "0"),
             top_volume_min_price_change_24h_pct=float(os.getenv("TOP_VOLUME_MIN_PRICE_CHANGE_24H_PCT", "0")),
-            partial_tp_fraction=float(os.getenv("PARTIAL_TP_FRACTION", "0")),
-            re_entry_cooldown_seconds=float(os.getenv("RE_ENTRY_COOLDOWN_SECONDS", "0")),
-            re_entry_dip_pct=float(os.getenv("RE_ENTRY_DIP_PCT", "0")),
+            partial_tp_fraction=_env_float("PARTIAL_TP_FRACTION", "0"),
+            re_entry_cooldown_seconds=_env_float("RE_ENTRY_COOLDOWN_SECONDS", "0"),
+            re_entry_dip_pct=_env_float("RE_ENTRY_DIP_PCT", "0"),
             adaptive_interval_enabled=os.getenv("ADAPTIVE_INTERVAL_ENABLED", "false").lower() in {"1", "true", "yes"},
-            adaptive_interval_min_seconds=int(os.getenv("ADAPTIVE_INTERVAL_MIN_SECONDS", "30")),
-            max_portfolio_risk_pct=float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "0")),
-            min_liquidity_depth_idr=float(os.getenv("MIN_LIQUIDITY_DEPTH_IDR", "0")),
-            profit_buffer_drawdown_pct=float(os.getenv("PROFIT_BUFFER_DRAWDOWN_PCT", "0")),
-            trailing_tp_pct=float(os.getenv("TRAILING_TP_PCT", "0.02")),
-            conditional_tp_min_trend_strength=float(os.getenv("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0")),
-            conditional_tp_min_ob_imbalance=float(os.getenv("CONDITIONAL_TP_MIN_OB_IMBALANCE", "0")),
-            conditional_tp_max_rsi=float(os.getenv("CONDITIONAL_TP_MAX_RSI", "0")),
-            orderbook_wall_threshold=float(os.getenv("ORDERBOOK_WALL_THRESHOLD", "0")),
-            pump_protection_pct=float(os.getenv("PUMP_PROTECTION_PCT", "0")),
-            pump_lookback_seconds=float(os.getenv("PUMP_LOOKBACK_SECONDS", "60")),
-            max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", "0")),
-            min_buy_price_idr=float(os.getenv("MIN_BUY_PRICE_IDR", "0")),
-            max_tick_move_pct=float(os.getenv("MAX_TICK_MOVE_PCT", "0")),
+            adaptive_interval_min_seconds=_env_int("ADAPTIVE_INTERVAL_MIN_SECONDS", "30"),
+            max_portfolio_risk_pct=_env_float("MAX_PORTFOLIO_RISK_PCT", "0"),
+            min_liquidity_depth_idr=_env_float("MIN_LIQUIDITY_DEPTH_IDR", "0"),
+            profit_buffer_drawdown_pct=_env_float("PROFIT_BUFFER_DRAWDOWN_PCT", "0"),
+            trailing_tp_pct=_env_float("TRAILING_TP_PCT", "0.02"),
+            conditional_tp_min_trend_strength=_env_float("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0"),
+            conditional_tp_min_ob_imbalance=_env_float("CONDITIONAL_TP_MIN_OB_IMBALANCE", "0"),
+            conditional_tp_max_rsi=_env_float("CONDITIONAL_TP_MAX_RSI", "0"),
+            orderbook_wall_threshold=_env_float("ORDERBOOK_WALL_THRESHOLD", "0"),
+            pump_protection_pct=_env_float("PUMP_PROTECTION_PCT", "0"),
+            pump_lookback_seconds=_env_float("PUMP_LOOKBACK_SECONDS", "60"),
+            max_spread_pct=_env_float("MAX_SPREAD_PCT", "0"),
+            min_buy_price_idr=_env_float("MIN_BUY_PRICE_IDR", "0"),
+            max_tick_move_pct=_env_float("MAX_TICK_MOVE_PCT", "0"),
             see_enabled=os.getenv("SEE_ENABLED", "false").lower() in {"1", "true", "yes"},
-            see_volume_surge_ratio=float(os.getenv("SEE_VOLUME_SURGE_RATIO", "2.0")),
-            see_whale_pressure_min=float(os.getenv("SEE_WHALE_PRESSURE_MIN", "2.0")),
-            see_breakout_volume_min=float(os.getenv("SEE_BREAKOUT_VOLUME_MIN", "0.7")),
-            fake_pump_reversal_pct=float(os.getenv("FAKE_PUMP_REVERSAL_PCT", "0")),
-            min_order_idr=float(os.getenv("MIN_ORDER_IDR", "15000")),
-            max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0")),
-            volatility_cooldown_pct=float(os.getenv("VOLATILITY_COOLDOWN_PCT", "0")),
-            volatility_cooldown_seconds=float(os.getenv("VOLATILITY_COOLDOWN_SECONDS", "0")),
-            circuit_breaker_max_errors=int(os.getenv("CIRCUIT_BREAKER_MAX_ERRORS", "0")),
-            circuit_breaker_pause_seconds=float(os.getenv("CIRCUIT_BREAKER_PAUSE_SECONDS", "300")),
+            see_volume_surge_ratio=_env_float("SEE_VOLUME_SURGE_RATIO", "2.0"),
+            see_whale_pressure_min=_env_float("SEE_WHALE_PRESSURE_MIN", "2.0"),
+            see_breakout_volume_min=_env_float("SEE_BREAKOUT_VOLUME_MIN", "0.7"),
+            fake_pump_reversal_pct=_env_float("FAKE_PUMP_REVERSAL_PCT", "0"),
+            min_order_idr=_env_float("MIN_ORDER_IDR", "15000"),
+            max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", "0"),
+            volatility_cooldown_pct=_env_float("VOLATILITY_COOLDOWN_PCT", "0"),
+            volatility_cooldown_seconds=_env_float("VOLATILITY_COOLDOWN_SECONDS", "0"),
+            circuit_breaker_max_errors=_env_int("CIRCUIT_BREAKER_MAX_ERRORS", "0"),
+            circuit_breaker_pause_seconds=_env_float("CIRCUIT_BREAKER_PAUSE_SECONDS", "300"),
             balance_check_enabled=os.getenv("BALANCE_CHECK_ENABLED", "false").lower() in {"1", "true", "yes"},
-            stale_order_seconds=float(os.getenv("STALE_ORDER_SECONDS", "0")),
-            strategy_auto_disable_losses=int(os.getenv("STRATEGY_AUTO_DISABLE_LOSSES", "0")),
+            stale_order_seconds=_env_float("STALE_ORDER_SECONDS", "0"),
+            strategy_auto_disable_losses=_env_int("STRATEGY_AUTO_DISABLE_LOSSES", "0"),
             partial_tp2_fraction=float(os.getenv("PARTIAL_TP2_FRACTION", "0")),
             partial_tp2_target_pct=float(os.getenv("PARTIAL_TP2_TARGET_PCT", "0")),
             journal_path=os.getenv("JOURNAL_PATH") or None,
-            max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "0")),
-            spread_anomaly_multiplier=float(os.getenv("SPREAD_ANOMALY_MULTIPLIER", "0")),
-            orderbook_absorption_threshold=float(os.getenv("ORDERBOOK_ABSORPTION_THRESHOLD", "0")),
-            flash_dump_pct=float(os.getenv("FLASH_DUMP_PCT", "0")),
-            flash_dump_lookback_seconds=float(os.getenv("FLASH_DUMP_LOOKBACK_SECONDS", "60")),
+            max_open_positions=_env_int("MAX_OPEN_POSITIONS", "0"),
+            spread_anomaly_multiplier=_env_float("SPREAD_ANOMALY_MULTIPLIER", "0"),
+            orderbook_absorption_threshold=_env_float("ORDERBOOK_ABSORPTION_THRESHOLD", "0"),
+            flash_dump_pct=_env_float("FLASH_DUMP_PCT", "0"),
+            flash_dump_lookback_seconds=_env_float("FLASH_DUMP_LOOKBACK_SECONDS", "60"),
             adaptive_sizing_enabled=os.getenv("ADAPTIVE_SIZING_ENABLED", "false").lower() in {"1", "true", "yes"},
             adaptive_tier1_equity=float(os.getenv("ADAPTIVE_TIER1_EQUITY", "2000000")),
             adaptive_tier2_equity=float(os.getenv("ADAPTIVE_TIER2_EQUITY", "5000000")),
@@ -652,60 +691,60 @@ class BotConfig:
             adaptive_tier0_max_pos=int(os.getenv("ADAPTIVE_TIER0_MAX_POS", "3")),
             adaptive_tier1_max_pos=int(os.getenv("ADAPTIVE_TIER1_MAX_POS", "4")),
             adaptive_tier2_max_pos=int(os.getenv("ADAPTIVE_TIER2_MAX_POS", "5")),
-            pair_cooldown_seconds=float(os.getenv("PAIR_COOLDOWN_SECONDS", "300")),
-            buy_max_rsi=float(os.getenv("BUY_MAX_RSI", "85")),
-            buy_max_resistance_proximity_pct=float(os.getenv("BUY_MAX_RESISTANCE_PROXIMITY_PCT", "0.01")),
+            pair_cooldown_seconds=_env_float("PAIR_COOLDOWN_SECONDS", "300"),
+            buy_max_rsi=_env_float("BUY_MAX_RSI", "85"),
+            buy_max_resistance_proximity_pct=_env_float("BUY_MAX_RESISTANCE_PROXIMITY_PCT", "0.01"),
             rug_pull_max_drop_24h_pct=float(os.getenv("RUG_PULL_MAX_DROP_24H_PCT", "0")),
-            rug_pull_min_volume_idr=float(os.getenv("RUG_PULL_MIN_VOLUME_IDR", "0")),
+            rug_pull_min_volume_idr=_env_float("RUG_PULL_MIN_VOLUME_IDR", "0"),
             rug_pull_min_trades_24h=int(os.getenv("RUG_PULL_MIN_TRADES_24H", "0")),
             pair_min_order_cache_enabled=os.getenv("PAIR_MIN_ORDER_CACHE_ENABLED", "true").lower() in {"1", "true", "yes"},
-            pair_min_order_refresh_cycles=int(os.getenv("PAIR_MIN_ORDER_REFRESH_CYCLES", "0")),
-            account_info_cache_ttl=float(os.getenv("ACCOUNT_INFO_CACHE_TTL", "30")),
-            open_orders_cache_ttl=float(os.getenv("OPEN_ORDERS_CACHE_TTL", "15")),
+            pair_min_order_refresh_cycles=_env_int("PAIR_MIN_ORDER_REFRESH_CYCLES", "0"),
+            account_info_cache_ttl=_env_float("ACCOUNT_INFO_CACHE_TTL", "30"),
+            open_orders_cache_ttl=_env_float("OPEN_ORDERS_CACHE_TTL", "15"),
             confidence_position_sizing_enabled=os.getenv("CONFIDENCE_POSITION_SIZING_ENABLED", "false").lower() in {"1", "true", "yes"},
-            confidence_tier_skip=float(os.getenv("CONFIDENCE_TIER_SKIP", "0.40")),
-            confidence_tier_low=float(os.getenv("CONFIDENCE_TIER_LOW", "0.50")),
-            confidence_tier_mid=float(os.getenv("CONFIDENCE_TIER_MID", "0.65")),
-            confidence_tier_high=float(os.getenv("CONFIDENCE_TIER_HIGH", "0.80")),
-            confidence_tier_low_pct=float(os.getenv("CONFIDENCE_TIER_LOW_PCT", "0.10")),
-            confidence_tier_mid_pct=float(os.getenv("CONFIDENCE_TIER_MID_PCT", "0.15")),
-            confidence_tier_high_pct=float(os.getenv("CONFIDENCE_TIER_HIGH_PCT", "0.20")),
-            confidence_tier_max_pct=float(os.getenv("CONFIDENCE_TIER_MAX_PCT", "0.25")),
-            max_hold_seconds=float(os.getenv("MAX_HOLD_SECONDS", "0")),
-            max_hold_profit_pct=float(os.getenv("MAX_HOLD_PROFIT_PCT", "0.01")),
-            volume_high_threshold_idr=float(os.getenv("VOLUME_HIGH_THRESHOLD_IDR", "0")),
-            max_hold_seconds_volume_high=float(os.getenv("MAX_HOLD_SECONDS_VOLUME_HIGH", "5400")),
-            max_hold_seconds_volume_low=float(os.getenv("MAX_HOLD_SECONDS_VOLUME_LOW", "1800")),
+            confidence_tier_skip=_env_float("CONFIDENCE_TIER_SKIP", "0.40"),
+            confidence_tier_low=_env_float("CONFIDENCE_TIER_LOW", "0.50"),
+            confidence_tier_mid=_env_float("CONFIDENCE_TIER_MID", "0.65"),
+            confidence_tier_high=_env_float("CONFIDENCE_TIER_HIGH", "0.80"),
+            confidence_tier_low_pct=_env_float("CONFIDENCE_TIER_LOW_PCT", "0.10"),
+            confidence_tier_mid_pct=_env_float("CONFIDENCE_TIER_MID_PCT", "0.15"),
+            confidence_tier_high_pct=_env_float("CONFIDENCE_TIER_HIGH_PCT", "0.20"),
+            confidence_tier_max_pct=_env_float("CONFIDENCE_TIER_MAX_PCT", "0.25"),
+            max_hold_seconds=_env_float("MAX_HOLD_SECONDS", "0"),
+            max_hold_profit_pct=_env_float("MAX_HOLD_PROFIT_PCT", "0.01"),
+            volume_high_threshold_idr=_env_float("VOLUME_HIGH_THRESHOLD_IDR", "0"),
+            max_hold_seconds_volume_high=_env_float("MAX_HOLD_SECONDS_VOLUME_HIGH", "5400"),
+            max_hold_seconds_volume_low=_env_float("MAX_HOLD_SECONDS_VOLUME_LOW", "1800"),
             multi_position_enabled=os.getenv("MULTI_POSITION_ENABLED", "true").lower() in {"1", "true", "yes"},
-            multi_position_max=int(os.getenv("MULTI_POSITION_MAX", "3")),
-            ob_imbalance_boost_threshold=float(os.getenv("OB_IMBALANCE_BOOST_THRESHOLD", "0")),
-            ob_imbalance_size_multiplier=float(os.getenv("OB_IMBALANCE_SIZE_MULTIPLIER", "2.0")),
-            ob_imbalance_min_entry=float(os.getenv("OB_IMBALANCE_MIN_ENTRY", "0")),
-            trade_flow_min_buy_ratio=float(os.getenv("TRADE_FLOW_MIN_BUY_RATIO", "0")),
-            momentum_exit_ob_threshold=float(os.getenv("MOMENTUM_EXIT_OB_THRESHOLD", "0")),
-            momentum_exit_min_profit_pct=float(os.getenv("MOMENTUM_EXIT_MIN_PROFIT_PCT", "0")),
+            multi_position_max=_env_int("MULTI_POSITION_MAX", "3"),
+            ob_imbalance_boost_threshold=_env_float("OB_IMBALANCE_BOOST_THRESHOLD", "0"),
+            ob_imbalance_size_multiplier=_env_float("OB_IMBALANCE_SIZE_MULTIPLIER", "2.0"),
+            ob_imbalance_min_entry=_env_float("OB_IMBALANCE_MIN_ENTRY", "0"),
+            trade_flow_min_buy_ratio=_env_float("TRADE_FLOW_MIN_BUY_RATIO", "0"),
+            momentum_exit_ob_threshold=_env_float("MOMENTUM_EXIT_OB_THRESHOLD", "0"),
+            momentum_exit_min_profit_pct=_env_float("MOMENTUM_EXIT_MIN_PROFIT_PCT", "0"),
             partial_tp3_fraction=float(os.getenv("PARTIAL_TP3_FRACTION", "0")),
             partial_tp3_target_pct=float(os.getenv("PARTIAL_TP3_TARGET_PCT", "0")),
             liquidity_sweep_enabled=os.getenv("LIQUIDITY_SWEEP_ENABLED", "false").lower() in {"1", "true", "yes"},
-            liquidity_sweep_lookback=int(os.getenv("LIQUIDITY_SWEEP_LOOKBACK", "10")),
-            liquidity_sweep_min_pct=float(os.getenv("LIQUIDITY_SWEEP_MIN_PCT", "0.01")),
-            liquidity_sweep_reversal_pct=float(os.getenv("LIQUIDITY_SWEEP_REVERSAL_PCT", "0.005")),
+            liquidity_sweep_lookback=_env_int("LIQUIDITY_SWEEP_LOOKBACK", "10"),
+            liquidity_sweep_min_pct=_env_float("LIQUIDITY_SWEEP_MIN_PCT", "0.01"),
+            liquidity_sweep_reversal_pct=_env_float("LIQUIDITY_SWEEP_REVERSAL_PCT", "0.005"),
             liquidity_trap_enabled=os.getenv("LIQUIDITY_TRAP_ENABLED", "false").lower() in {"1", "true", "yes"},
-            liquidity_trap_breakout_pct=float(os.getenv("LIQUIDITY_TRAP_BREAKOUT_PCT", "0.005")),
-            liquidity_trap_reversal_pct=float(os.getenv("LIQUIDITY_TRAP_REVERSAL_PCT", "0.008")),
-            liquidity_vacuum_min_gap_pct=float(os.getenv("LIQUIDITY_VACUUM_MIN_GAP_PCT", "0")),
-            liquidity_vacuum_depth_levels=int(os.getenv("LIQUIDITY_VACUUM_DEPTH_LEVELS", "10")),
+            liquidity_trap_breakout_pct=_env_float("LIQUIDITY_TRAP_BREAKOUT_PCT", "0.005"),
+            liquidity_trap_reversal_pct=_env_float("LIQUIDITY_TRAP_REVERSAL_PCT", "0.008"),
+            liquidity_vacuum_min_gap_pct=_env_float("LIQUIDITY_VACUUM_MIN_GAP_PCT", "0"),
+            liquidity_vacuum_depth_levels=_env_int("LIQUIDITY_VACUUM_DEPTH_LEVELS", "10"),
             smart_money_enabled=os.getenv("SMART_MONEY_ENABLED", "false").lower() in {"1", "true", "yes"},
-            smart_money_volume_factor=float(os.getenv("SMART_MONEY_VOLUME_FACTOR", "3.0")),
-            smart_money_divergence_lookback=int(os.getenv("SMART_MONEY_DIVERGENCE_LOOKBACK", "5")),
+            smart_money_volume_factor=_env_float("SMART_MONEY_VOLUME_FACTOR", "3.0"),
+            smart_money_divergence_lookback=_env_int("SMART_MONEY_DIVERGENCE_LOOKBACK", "5"),
             volume_accel_enabled=os.getenv("VOLUME_ACCEL_ENABLED", "false").lower() in {"1", "true", "yes"},
-            volume_accel_window=int(os.getenv("VOLUME_ACCEL_WINDOW", "5")),
-            volume_accel_min_ratio=float(os.getenv("VOLUME_ACCEL_MIN_RATIO", "1.5")),
+            volume_accel_window=_env_int("VOLUME_ACCEL_WINDOW", "5"),
+            volume_accel_min_ratio=_env_float("VOLUME_ACCEL_MIN_RATIO", "1.5"),
             micro_trend_enabled=os.getenv("MICRO_TREND_ENABLED", "false").lower() in {"1", "true", "yes"},
-            micro_trend_window=int(os.getenv("MICRO_TREND_WINDOW", "3")),
+            micro_trend_window=_env_int("MICRO_TREND_WINDOW", "3"),
             spread_expansion_enabled=os.getenv("SPREAD_EXPANSION_ENABLED", "false").lower() in {"1", "true", "yes"},
-            spread_expansion_multiplier=float(os.getenv("SPREAD_EXPANSION_MULTIPLIER", "2.0")),
-            spread_expansion_window=int(os.getenv("SPREAD_EXPANSION_WINDOW", "10")),
+            spread_expansion_multiplier=_env_float("SPREAD_EXPANSION_MULTIPLIER", "2.0"),
+            spread_expansion_window=_env_int("SPREAD_EXPANSION_WINDOW", "10"),
         )
         cfg._validate()
         return cfg
@@ -741,6 +780,8 @@ class BotConfig:
             raise ValueError("INTERVAL_SECONDS must be positive")
         if self.max_slippage_pct < 0:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
+        if self.initial_capital <= 0:
+            raise ValueError("INITIAL_CAPITAL must be positive (e.g. INITIAL_CAPITAL=1000000)")
         if self.staged_entry_steps <= 0:
             raise ValueError("STAGED_ENTRY_STEPS must be positive")
         if self.staged_entry_min_equity < 0:

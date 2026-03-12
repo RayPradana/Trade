@@ -288,8 +288,13 @@ def analyze_trade_flow(
             continue
         trade_type = str(t.get("type", "")).lower()
         # Support both amount and vol field names used by different API
-        # versions.
-        amount = _safe_float(t.get("amount") or t.get("vol", 0))
+        # versions.  Explicitly check for None/missing rather than using
+        # boolean truthiness so that a valid zero-amount trade is not
+        # silently replaced by the vol field.
+        raw_amount = t.get("amount")
+        if raw_amount is None:
+            raw_amount = t.get("vol", 0)
+        amount = _safe_float(raw_amount)
         price = _safe_float(t.get("price", 0))
         notional = amount * price if price else amount
         if trade_type in ("buy", "bid"):

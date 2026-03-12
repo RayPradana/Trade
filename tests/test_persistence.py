@@ -302,6 +302,60 @@ class MultiPositionPersistenceTests(unittest.TestCase):
             self.assertGreater(active["btc_idr"].base_position, 0)
             self.assertGreater(active["eth_idr"].base_position, 0)
 
+    def test_stale_multi_positions_reset_cash_to_initial(self) -> None:
+        """When multi_positions exist but all have base_position=0, cash must
+        be reset to initial_capital and the state file cleared."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            # Manually craft a stale state: non-empty multi_positions where
+            # every entry has base_position=0 (simulates corrupt state).
+            zero_tracker = PortfolioTracker(1_000_000.0, 0.2, 0.1)
+            # Do not record any trade so base_position stays 0
+            stale_state: Dict[str, Any] = {
+                "portfolio": {},
+                "pair": "btc_idr",
+                "dry_run": True,
+                "multi_positions": {
+                    "btc_idr": zero_tracker.to_state(),  # base_position=0
+                },
+                "multi_cash": 0.0,  # looks like all capital was deployed
+            }
+            StatePersistence(state_path).save(stale_state)
+            config = self._make_config(state_path)
+            fresh = Trader(config, client=_FakeClient())
+            # Cash must be reset to initial_capital, not stuck at 0
+            self.assertAlmostEqual(
+                fresh.multi_manager.cash, config.initial_capital, places=2
+            )
+            # State file must be cleared to avoid re-loading stale data
+            self.assertIsNone(StatePersistence(state_path).load())
+
+
+class TempFileCleanupTests(unittest.TestCase):
+    """Tests for persistence temp-file cleanup."""
+
+    def test_clear_removes_tmp_file(self) -> None:
+        """clear() must remove any stray .tmp file left by an interrupted save."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            tmp_path = state_path.with_suffix(".json.tmp")
+            # Simulate an interrupted save: only the tmp file exists
+            tmp_path.write_text('{"partial": true}')
+            p = StatePersistence(state_path)
+            p.clear()
+            self.assertFalse(tmp_path.exists())
+
+    def test_load_cleans_up_tmp_file_when_main_missing(self) -> None:
+        """load() must remove a stray .tmp file when the main state file is absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            tmp_path = state_path.with_suffix(".json.tmp")
+            tmp_path.write_text('{"partial": true}')
+            p = StatePersistence(state_path)
+            result = p.load()
+            self.assertIsNone(result)
+            self.assertFalse(tmp_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

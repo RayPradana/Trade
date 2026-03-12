@@ -477,3 +477,40 @@ class MultiPositionDefaultTest(TestCase):
         with patch.dict(os.environ, {"INDODAX_API_KEY": "k", "INDODAX_API_SECRET": "s", "INITIAL_CAPITAL": "100000", "MULTI_POSITION_ENABLED": "false"}):
             cfg = BotConfig.from_env()
             self.assertFalse(cfg.multi_position_enabled)
+
+
+class EnvParsingRobustnessTest(TestCase):
+    """Tests for _env_float/_env_int error handling in from_env()."""
+
+    def test_invalid_float_env_falls_back_to_default(self):
+        """A non-numeric INITIAL_CAPITAL env var must use the default value."""
+        with patch.dict(os.environ, {
+            "INDODAX_API_KEY": "k",
+            "INITIAL_CAPITAL": "not_a_number",
+        }):
+            cfg = BotConfig.from_env()
+            # Must fall back to the default "1000000"
+            self.assertAlmostEqual(cfg.initial_capital, 1_000_000.0)
+
+    def test_invalid_int_env_falls_back_to_default(self):
+        """A non-numeric FAST_WINDOW env var must use the default value."""
+        with patch.dict(os.environ, {
+            "INDODAX_API_KEY": "k",
+            "INITIAL_CAPITAL": "1000000",
+            "FAST_WINDOW": "abc",
+        }):
+            cfg = BotConfig.from_env()
+            # Must fall back to the default "12"
+            self.assertEqual(cfg.fast_window, 12)
+
+    def test_zero_initial_capital_is_invalid(self):
+        """INITIAL_CAPITAL=0 must raise ValueError."""
+        cfg = BotConfig(api_key=None, initial_capital=0.0)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_negative_initial_capital_is_invalid(self):
+        """Negative INITIAL_CAPITAL must raise ValueError."""
+        cfg = BotConfig(api_key=None, initial_capital=-1.0)
+        with self.assertRaises(ValueError):
+            cfg._validate()

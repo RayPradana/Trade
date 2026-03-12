@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import threading
 from dataclasses import dataclass, field
 from statistics import mean
 from typing import Dict, List, Optional
@@ -62,6 +63,7 @@ class TradeJournal:
     def __init__(self, path: Optional[str] = None) -> None:
         self.path = path
         self._records: List[TradeRecord] = []
+        self._lock = threading.Lock()
         if path:
             self._load()
 
@@ -124,11 +126,13 @@ class TradeJournal:
             avg_cost=avg_cost,
             equity=equity,
         )
-        self._records.append(record)
-        if self.path:
-            self._append_to_csv(record)
+        with self._lock:
+            self._records.append(record)
+            if self.path:
+                self._append_to_csv(record)
 
     def _append_to_csv(self, record: TradeRecord) -> None:
+        # Caller must hold self._lock before calling this method.
         write_header = not os.path.exists(self.path) or _file_empty(self.path)
         try:
             with open(self.path, "a", newline="", encoding="utf-8") as f:
@@ -154,7 +158,8 @@ class TradeJournal:
             logger.warning("Failed to write journal entry: %s", exc)
 
     def metrics(self) -> PerformanceMetrics:
-        sell_records = [r for r in self._records if r.action == "sell"]
+        with self._lock:
+            sell_records = [r for r in self._records if r.action == "sell"]
         if not sell_records:
             return PerformanceMetrics(
                 win_rate=0.0,
