@@ -1072,16 +1072,25 @@ class Trader:
             outcome = {"status": "hold", "reason": decision.reason, "portfolio": self.tracker.as_dict(price)}
             return outcome
 
-        if decision.confidence < self.config.min_confidence:
+        # When confidence-based position sizing is active, honour the tier_skip
+        # threshold as an additional lower bound on the minimum confidence, so
+        # setting CONFIDENCE_POSITION_SIZING_ENABLED=true is sufficient without
+        # requiring a separate MIN_CONFIDENCE adjustment.
+        _effective_min_conf = (
+            min(self.config.min_confidence, self.config.confidence_tier_skip)
+            if self.config.confidence_position_sizing_enabled
+            else self.config.min_confidence
+        )
+        if decision.confidence < _effective_min_conf:
             logger.info(
                 "Skip low confidence action=%s conf=%.3f min=%.3f",
                 decision.action,
                 decision.confidence,
-                self.config.min_confidence,
+                _effective_min_conf,
             )
             outcome = {
                 "status": "skipped",
-                "reason": f"confidence {decision.confidence} below threshold {self.config.min_confidence}",
+                "reason": f"confidence {decision.confidence} below threshold {_effective_min_conf}",
                 "portfolio": self.tracker.as_dict(price),
             }
             return outcome
@@ -2103,7 +2112,12 @@ class Trader:
             # liquidity (liquid-first), this exits on the highest-quality
             # opportunity available without analysing all 500+ pairs.
             # Lower-volume pairs are deferred to later cycle windows.
-            if decision.confidence >= self.config.min_confidence:
+            _scan_min_conf = (
+                min(self.config.min_confidence, self.config.confidence_tier_skip)
+                if self.config.confidence_position_sizing_enabled
+                else self.config.min_confidence
+            )
+            if decision.confidence >= _scan_min_conf:
                 logger.debug(
                     "Serial scan: early exit on %s (conf=%.3f, scanned %d/%d pairs)",
                     pair,

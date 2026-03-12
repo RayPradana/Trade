@@ -2,7 +2,7 @@ import unittest
 
 from bot.config import BotConfig
 from bot.grid import build_grid_plan
-from bot.strategies import StrategyDecision, make_trade_decision, select_strategy, _position_size
+from bot.strategies import StrategyDecision, make_trade_decision, select_strategy, _position_size, confidence_position_pct
 from bot.analysis import OrderbookInsight, TrendResult, VolatilityStats, SupportResistance
 
 
@@ -345,3 +345,117 @@ class BuyFilterTests(unittest.TestCase):
         levels = SupportResistance(support=90.0, resistance=100.0, lookback=20)
         dec = make_trade_decision(trend, ob, vol, 99.9, cfg, levels=levels)
         self.assertEqual(dec.action, "buy")
+
+
+class TestConfidencePositionSizing(unittest.TestCase):
+    """Tests for confidence_position_pct() and _position_size() with confidence-tier mode."""
+
+    def _cfg(self, **kw) -> BotConfig:
+        defaults = dict(
+            api_key=None, dry_run=True,
+            confidence_position_sizing_enabled=True,
+            confidence_tier_skip=0.40,
+            confidence_tier_low=0.50,
+            confidence_tier_mid=0.65,
+            confidence_tier_high=0.80,
+            confidence_tier_low_pct=0.10,
+            confidence_tier_mid_pct=0.15,
+            confidence_tier_high_pct=0.20,
+            confidence_tier_max_pct=0.25,
+            initial_capital=500_000.0,
+        )
+        defaults.update(kw)
+        return BotConfig(**defaults)
+
+    # ── confidence_position_pct() ────────────────────────────────────────────
+
+    def test_below_skip_returns_zero(self):
+        cfg = self._cfg()
+        self.assertEqual(confidence_position_pct(0.30, cfg), 0.0)
+        self.assertEqual(confidence_position_pct(0.39, cfg), 0.0)
+
+    def test_at_skip_boundary_returns_low_pct(self):
+        """Exactly at tier_skip → enters the low tier (not skip)."""
+        cfg = self._cfg()
+        self.assertEqual(confidence_position_pct(0.40, cfg), 0.10)
+
+    def test_low_tier_range(self):
+        cfg = self._cfg()
+        self.assertEqual(confidence_position_pct(0.45, cfg), 0.10)
+        self.assertEqual(confidence_position_pct(0.499, cfg), 0.10)
+
+    def test_mid_tier_range(self):
+        cfg = self._cfg()
+        self.assertEqual(confidence_position_pct(0.50, cfg), 0.15)
+        self.assertEqual(confidence_position_pct(0.60, cfg), 0.15)
+        self.assertEqual(confidence_position_pct(0.649, cfg), 0.15)
+
+    def test_high_tier_range(self):
+        cfg = self._cfg()
+        self.assertEqual(confidence_position_pct(0.65, cfg), 0.20)
+        self.assertEqual(confidence_position_pct(0.79, cfg), 0.20)
+
+    def test_max_tier_at_and_above_high(self):
+        cfg = self._cfg()
+        self.assertEqual(confidence_position_pct(0.80, cfg), 0.25)
+        self.assertEqual(confidence_position_pct(1.00, cfg), 0.25)
+
+    # ── _position_size() with confidence_position_sizing_enabled ─────────────
+
+    def test_position_size_tier_mid_at_price(self):
+        """Mid tier (conf=0.55, 15 %) on 500k capital at price 100k = 0.75 units."""
+        cfg = self._cfg()
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price = 100_000.0
+        size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.55, vol, 500_000.0)
+        expected = (0.15 * 500_000.0) / price
+        self.assertAlmostEqual(size, expected, places=8)
+
+    def test_position_size_high_tier(self):
+        """High tier (conf=0.70, 20 %) on 500k capital at price 91_496."""
+        cfg = self._cfg()
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price = 91_496.0
+        size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0)
+        expected = (0.20 * 500_000.0) / price
+        self.assertAlmostEqual(size, expected, places=8)
+
+    def test_position_size_below_skip_returns_zero(self):
+        """Confidence below tier_skip → position size = 0."""
+        cfg = self._cfg()
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        size = _position_size(50_000.0, 49_000.0, cfg, 1000.0, 0.35, vol, 500_000.0)
+        self.assertEqual(size, 0.0)
+
+    def test_position_size_zero_price_returns_zero(self):
+        """Zero price should not cause division by zero regardless of mode."""
+        cfg = self._cfg()
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        size = _position_size(0.0, 0.0, cfg, 0.0, 0.80, vol)
+        self.assertEqual(size, 0.0)
+
+    def test_feature_disabled_uses_original_formula(self):
+        """When confidence_position_sizing_enabled=False, original formula is used."""
+        from bot.analysis import VolatilityStats
+        cfg_off = BotConfig(api_key=None, confidence_position_sizing_enabled=False,
+                            initial_capital=500_000.0)
+        cfg_on = self._cfg(initial_capital=500_000.0)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        price, stop = 50_000.0, 49_000.0
+        size_off = _position_size(price, stop, cfg_off, price - stop, 0.70, vol, 500_000.0)
+        size_on = _position_size(price, stop, cfg_on, price - stop, 0.70, vol, 500_000.0)
+        # Both should be positive but they use different formulas → values differ
+        self.assertGreater(size_off, 0.0)
+        self.assertGreater(size_on, 0.0)
+        self.assertNotAlmostEqual(size_off, size_on, places=4)
+
+    def test_idr_value_matches_expected_pct_of_capital(self):
+        """IDR value of position should equal tier_pct * capital."""
+        cfg = self._cfg()
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        capital = 500_000.0
+        price = 91_496.0
+        # confidence=0.82 → max tier → 25 %
+        size = _position_size(price, price * 0.99, cfg, price * 0.01, 0.82, vol, capital)
+        idr_value = size * price
+        self.assertAlmostEqual(idr_value, 0.25 * capital, delta=1.0)

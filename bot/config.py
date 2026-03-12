@@ -54,6 +54,24 @@ class BotConfig:
     websocket_batch_size: int = 100  # max pairs per WebSocket connection for multi-pair feed
     pairs_per_cycle: int = 20  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
     min_confidence: float = 0.52
+    # ── Confidence-based position sizing ──────────────────────────────────────
+    # When enabled, position size is a direct percentage of available capital
+    # determined by confidence tier rather than the risk/stop-distance formula.
+    # Tier thresholds and percentages:
+    #   confidence < tier_skip              → skip trade (return 0)
+    #   tier_skip  ≤ confidence < tier_low  → tier_low_pct  of capital
+    #   tier_low   ≤ confidence < tier_mid  → tier_mid_pct  of capital
+    #   tier_mid   ≤ confidence < tier_high → tier_high_pct of capital
+    #   confidence ≥ tier_high              → tier_max_pct  of capital
+    confidence_position_sizing_enabled: bool = False
+    confidence_tier_skip: float = 0.40   # below this: skip trade
+    confidence_tier_low: float = 0.50    # 0.40 – 0.50 → low pct
+    confidence_tier_mid: float = 0.65    # 0.50 – 0.65 → mid pct
+    confidence_tier_high: float = 0.80   # 0.65 – 0.80 → high pct
+    confidence_tier_low_pct: float = 0.10   # 10 % of capital
+    confidence_tier_mid_pct: float = 0.15   # 15 % of capital
+    confidence_tier_high_pct: float = 0.20  # 20 % of capital
+    confidence_tier_max_pct: float = 0.25   # 25 % of capital (> tier_high)
     interval_seconds: int = 300
     fast_window: int = 12
     slow_window: int = 48
@@ -444,6 +462,15 @@ class BotConfig:
             rug_pull_min_trades_24h=int(os.getenv("RUG_PULL_MIN_TRADES_24H", "0")),
             pair_min_order_cache_enabled=os.getenv("PAIR_MIN_ORDER_CACHE_ENABLED", "true").lower() in {"1", "true", "yes"},
             pair_min_order_refresh_cycles=int(os.getenv("PAIR_MIN_ORDER_REFRESH_CYCLES", "0")),
+            confidence_position_sizing_enabled=os.getenv("CONFIDENCE_POSITION_SIZING_ENABLED", "false").lower() in {"1", "true", "yes"},
+            confidence_tier_skip=float(os.getenv("CONFIDENCE_TIER_SKIP", "0.40")),
+            confidence_tier_low=float(os.getenv("CONFIDENCE_TIER_LOW", "0.50")),
+            confidence_tier_mid=float(os.getenv("CONFIDENCE_TIER_MID", "0.65")),
+            confidence_tier_high=float(os.getenv("CONFIDENCE_TIER_HIGH", "0.80")),
+            confidence_tier_low_pct=float(os.getenv("CONFIDENCE_TIER_LOW_PCT", "0.10")),
+            confidence_tier_mid_pct=float(os.getenv("CONFIDENCE_TIER_MID_PCT", "0.15")),
+            confidence_tier_high_pct=float(os.getenv("CONFIDENCE_TIER_HIGH_PCT", "0.20")),
+            confidence_tier_max_pct=float(os.getenv("CONFIDENCE_TIER_MAX_PCT", "0.25")),
         )
         cfg._validate()
         return cfg
@@ -608,5 +635,22 @@ class BotConfig:
             raise ValueError("RUG_PULL_MIN_TRADES_24H must be non-negative")
         if self.pair_min_order_refresh_cycles < 0:
             raise ValueError("PAIR_MIN_ORDER_REFRESH_CYCLES must be non-negative")
+        if self.confidence_position_sizing_enabled:
+            for name, val in (
+                ("CONFIDENCE_TIER_SKIP", self.confidence_tier_skip),
+                ("CONFIDENCE_TIER_LOW", self.confidence_tier_low),
+                ("CONFIDENCE_TIER_MID", self.confidence_tier_mid),
+                ("CONFIDENCE_TIER_HIGH", self.confidence_tier_high),
+            ):
+                if not (0.0 <= val <= 1.0):
+                    raise ValueError(f"{name} must be in [0, 1]")
+            for name, val in (
+                ("CONFIDENCE_TIER_LOW_PCT", self.confidence_tier_low_pct),
+                ("CONFIDENCE_TIER_MID_PCT", self.confidence_tier_mid_pct),
+                ("CONFIDENCE_TIER_HIGH_PCT", self.confidence_tier_high_pct),
+                ("CONFIDENCE_TIER_MAX_PCT", self.confidence_tier_max_pct),
+            ):
+                if not (0.0 < val <= 1.0):
+                    raise ValueError(f"{name} must be in (0, 1]")
         if not self.dry_run and not self.api_key:
             self.require_auth()

@@ -215,6 +215,30 @@ def _confidence_with_indicators(
     return round(max(0.0, min(1.0, conf)), 3)
 
 
+def confidence_position_pct(confidence: float, config: BotConfig) -> float:
+    """Return the position size as a fraction of capital for the given confidence level.
+
+    Used when ``config.confidence_position_sizing_enabled`` is True.
+    Returns 0.0 when confidence is below ``config.confidence_tier_skip`` (skip trade).
+
+    Tier mapping (defaults):
+      < 0.40  → 0.0   (skip)
+      0.40–0.50 → 10 %
+      0.50–0.65 → 15 %
+      0.65–0.80 → 20 %
+      > 0.80  → 25 %
+    """
+    if confidence < config.confidence_tier_skip:
+        return 0.0
+    if confidence < config.confidence_tier_low:
+        return config.confidence_tier_low_pct
+    if confidence < config.confidence_tier_mid:
+        return config.confidence_tier_mid_pct
+    if confidence < config.confidence_tier_high:
+        return config.confidence_tier_high_pct
+    return config.confidence_tier_max_pct
+
+
 def _position_size(
     current_price: float,
     stop_loss: Optional[float],
@@ -224,17 +248,32 @@ def _position_size(
     vol: VolatilityStats,
     effective_capital: Optional[float] = None,
 ) -> float:
-    """Dynamic risk-based position sizing: base size = risk_per_trade * capital / price.
+    """Dynamic position sizing: base size = risk_per_trade * capital / price.
+
+    When ``config.confidence_position_sizing_enabled`` is True the size is instead
+    computed as a direct percentage of available capital determined by the
+    confidence tier (see :func:`confidence_position_pct`).
 
     :param effective_capital: When provided, this is used as the capital base
         for sizing instead of ``config.initial_capital``.  Pass
         ``tracker.effective_capital()`` to enable automatic compounding: as
         profits accumulate, position sizes grow proportionally.
     """
-    if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE or current_price <= 0:
+    if current_price <= 0:
         return 0.0
     # Use compounding capital when available, otherwise fall back to initial_capital
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
+
+    # ── Confidence-tier-based sizing ─────────────────────────────────────────
+    if config.confidence_position_sizing_enabled:
+        pct = confidence_position_pct(confidence, config)
+        if pct <= 0.0:
+            return 0.0
+        return (pct * capital) / current_price
+
+    # ── Original risk/stop-distance-based sizing ──────────────────────────────
+    if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
+        return 0.0
     # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
     risk = adaptive_risk_per_trade(capital, config)
     # Compute how many units of the base asset represent one "risk unit" of capital
