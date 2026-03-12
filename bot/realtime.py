@@ -439,6 +439,25 @@ class MultiPairFeed:
         # Used by :meth:`is_ws_stale` to detect a silent disconnect.
         self._last_ws_update: Optional[float] = None
 
+        # ── Per-pair real-time orderbook + trades via WS ──────────────────
+        # Populated by market:order-book-{pair} and market:trade-activity-{pair}
+        # channels subscribed for the active watchlist.  Keyed by canonical
+        # pair name (e.g. "btc_idr").
+        self._depth_cache: Dict[str, Dict[str, Any]] = {}
+        # Rolling trade buffer per pair, newest first, max 2000 entries.
+        # Large enough to build 20+ candles for technical indicators without
+        # any REST OHLC call.
+        self._trades_buf: Dict[str, List[Dict[str, Any]]] = {}
+        # Pairs currently subscribed to depth/trades channels.
+        self._depth_pairs: List[str] = []
+        # Reference to the currently active WebSocket app so that
+        # subscribe_depth_pairs() can send subscription messages at any time.
+        self._ws_active: Optional[Any] = None
+        self._ws_active_lock = threading.Lock()
+        # Monotonically increasing id counter for subscription messages.
+        # Starts at 100 to avoid conflicts with auth (id=1) and summary (id=2).
+        self._sub_id_counter: int = 100
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -463,6 +482,74 @@ class MultiPairFeed:
             if self._last_ws_update is None:
                 return False  # WS never received data — not considered stale
             return (time.time() - self._last_ws_update) > threshold_seconds
+
+    def get_depth(self, pair: str) -> Optional[Dict[str, Any]]:
+        """Return the latest real-time orderbook for *pair*, or ``None``.
+
+        Populated by the ``market:order-book-{pair}`` WebSocket channel.
+        Returns ``None`` when the channel has not yet delivered data for this pair.
+        Returns a shallow copy so callers cannot mutate the internal cache.
+        """
+        with self._lock:
+            depth = self._depth_cache.get(pair)
+            if depth is None:
+                return None
+            return dict(depth)
+
+    def get_trades(self, pair: str) -> Optional[List[Dict[str, Any]]]:
+        """Return the rolling real-time trade buffer for *pair*, or ``None``.
+
+        Populated by the ``market:trade-activity-{pair}`` WebSocket channel.
+        Newest trades are first; up to 2000 entries per pair.
+        Returns ``None`` when no WS trade data is available yet for this pair.
+        """
+        with self._lock:
+            buf = self._trades_buf.get(pair)
+            return list(buf) if buf else None
+
+    def subscribe_depth_pairs(self, pairs: List[str]) -> None:
+        """Subscribe to real-time orderbook + trades channels for *pairs*.
+
+        Sends ``market:order-book-{pair}`` and ``market:trade-activity-{pair}``
+        subscription messages over the active WebSocket connection for each
+        pair not yet subscribed.  New subscriptions are remembered so they are
+        automatically re-sent after any reconnect.
+
+        Safe to call from any thread at any time (even before the WS connects).
+        """
+        with self._lock:
+            new_pairs = [p for p in pairs if p not in self._depth_pairs]
+            self._depth_pairs = list(dict.fromkeys(self._depth_pairs + new_pairs))
+
+        if not new_pairs:
+            return
+
+        with self._ws_active_lock:
+            ws = self._ws_active
+        if ws is not None:
+            self._send_depth_subscriptions(ws, new_pairs)
+
+    def _send_depth_subscriptions(self, ws: Any, pairs: List[str]) -> None:
+        """Send WS subscribe messages for *pairs* orderbook + trades channels."""
+        for pair in pairs:
+            pair_nodash = pair.replace("_", "")
+            for channel_type in ("order-book", "trade-activity"):
+                channel = f"market:{channel_type}-{pair_nodash}"
+                with self._lock:
+                    sub_id = self._sub_id_counter
+                    self._sub_id_counter += 1
+                msg = json.dumps(
+                    {"method": 1, "params": {"channel": channel}, "id": sub_id}
+                )
+                try:
+                    ws.send(msg)
+                    logger.debug("MultiPairFeed: subscribed to %s", channel)
+                except Exception:
+                    logger.debug(
+                        "MultiPairFeed: failed to subscribe to %s",
+                        channel,
+                        exc_info=True,
+                    )
 
     def _apply_ws_message_for_pair(self, pair: str, ticker: Dict[str, Any]) -> None:
         """Update the cache for *pair* with *ticker* data.
@@ -613,6 +700,8 @@ class MultiPairFeed:
                 nonlocal backoff
                 backoff = _WS_BACKOFF_INITIAL
                 logger.info("MultiPairFeed WS connected to %s", self._websocket_url)
+                with self._ws_active_lock:
+                    self._ws_active = ws
                 try:
                     ws.send(auth_msg)
                 except Exception:
@@ -636,10 +725,16 @@ class MultiPairFeed:
                             logger.debug(
                                 "MultiPairFeed WS subscribe send failed", exc_info=True
                             )
+                        # Re-subscribe to all watchlist depth/trades channels on
+                        # (re-)connect so real-time orderbook and trade data resume
+                        # immediately after any disconnect.
+                        with self._lock:
+                            depth_pairs = list(self._depth_pairs)
+                        if depth_pairs:
+                            self._send_depth_subscriptions(_ws, depth_pairs)
                         return
 
-                    # ── Push: {"result": {"channel": "market:summary-24h",
-                    #                      "data": {"data": [[pair, ts, last, …], …]}}}
+                    # ── Push: {"result": {"channel": "…", "data": {…}}} ─────
                     result = parsed.get("result") or parsed.get("push", {}).get("pub", {})
                     if not isinstance(result, dict):
                         return
@@ -647,12 +742,24 @@ class MultiPairFeed:
                     data_wrapper = result.get("data", {})
                     if not isinstance(data_wrapper, dict):
                         return
-                    rows = data_wrapper.get("data", [])
-                    if not isinstance(rows, list):
-                        return
 
                     if "market:summary-24h" in channel:
-                        self._apply_summary_rows(rows)
+                        rows = data_wrapper.get("data", [])
+                        if isinstance(rows, list):
+                            self._apply_summary_rows(rows)
+
+                    elif "market:order-book-" in channel:
+                        pair_nodash = channel.split("market:order-book-", 1)[-1]
+                        pair_name = self._key_to_pair.get(pair_nodash.lower())
+                        if pair_name:
+                            self._apply_orderbook_for_pair(pair_name, data_wrapper)
+
+                    elif "market:trade-activity-" in channel:
+                        pair_nodash = channel.split("market:trade-activity-", 1)[-1]
+                        pair_name = self._key_to_pair.get(pair_nodash.lower())
+                        if pair_name:
+                            self._apply_trade_activity_for_pair(pair_name, data_wrapper)
+
                 except Exception:
                     logger.debug("MultiPairFeed WS message parse error", exc_info=True)
 
@@ -661,6 +768,8 @@ class MultiPairFeed:
 
             def _on_close(_: Any, code: Any, msg: Any) -> None:
                 logger.info("MultiPairFeed WS closed (code=%s)", code)
+                with self._ws_active_lock:
+                    self._ws_active = None
 
             ws_app = websocket.WebSocketApp(
                 self._websocket_url,
@@ -722,6 +831,99 @@ class MultiPairFeed:
                 "MultiPairFeed WS: updated %d tickers from market:summary-24h",
                 len(updates),
             )
+
+    def _apply_orderbook_for_pair(self, pair: str, data: Dict[str, Any]) -> None:
+        """Normalize a ``market:order-book-{pair}`` push into the REST depth format.
+
+        The WS push contains a ``data`` wrapper with ``bid`` (buyers) and ``ask``
+        (sellers) lists.  Each entry is a dict with ``price``, ``idr_volume``, and
+        a coin-specific volume field (e.g. ``btc_volume``).
+
+        The REST format expected by :func:`~bot.analysis.analyze_orderbook` is::
+
+            {"buy": [["price", "coin_vol"], …], "sell": [["price", "coin_vol"], …]}
+        """
+        if not isinstance(data, dict):
+            return
+        inner = data.get("data", data)
+        if not isinstance(inner, dict):
+            return
+
+        # Derive the coin name from the pair: "btc_idr" → "btc"
+        coin = pair.split("_")[0] if "_" in pair else pair[:-3]
+        vol_key = f"{coin}_volume"
+
+        def _convert(orders: Any) -> List[List[str]]:
+            result: List[List[str]] = []
+            if not isinstance(orders, list):
+                return result
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                price = str(o.get("price", "0"))
+                vol = str(
+                    o.get(vol_key)
+                    or next(
+                        (v for k, v in o.items() if k not in ("price", "idr_volume")),
+                        "0",
+                    )
+                )
+                result.append([price, vol])
+            return result
+
+        buy_orders = _convert(inner.get("bid", []))
+        sell_orders = _convert(inner.get("ask", []))
+
+        with self._lock:
+            self._depth_cache[pair] = {"buy": buy_orders, "sell": sell_orders}
+            self._last_ws_update = time.time()
+
+    def _apply_trade_activity_for_pair(self, pair: str, data: Dict[str, Any]) -> None:
+        """Accumulate ``market:trade-activity-{pair}`` push events into the per-pair buffer.
+
+        Each row in the push payload is an array::
+
+            [pair, timestamp, sequence, side, price, idr_volume, coin_volume]
+
+        Rows are normalized to the REST trades format::
+
+            {"date": "…", "price": "…", "amount": "…", "type": "buy"|"sell"}
+
+        and prepended to a rolling buffer (newest first, max 2000 entries).
+        The larger buffer (vs the 200-entry per-pair RealtimeFeed buffer) ensures
+        enough trade history to build 20+ candles for technical indicators without
+        any REST call.
+        """
+        rows = data.get("data", [])
+        if not isinstance(rows, list):
+            return
+
+        new_trades: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            try:
+                new_trades.append(
+                    {
+                        "date": str(int(row[1])),
+                        "price": str(row[4]),
+                        "amount": str(row[6]),
+                        "type": str(row[3]),  # "buy" or "sell"
+                    }
+                )
+            except (IndexError, TypeError, ValueError):
+                continue
+
+        if not new_trades:
+            return
+
+        with self._lock:
+            buf = self._trades_buf.get(pair, [])
+            buf = new_trades + buf
+            if len(buf) > 2000:
+                buf = buf[:2000]
+            self._trades_buf[pair] = buf
+            self._last_ws_update = time.time()
 
 
 

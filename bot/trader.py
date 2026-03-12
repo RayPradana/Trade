@@ -619,18 +619,60 @@ class Trader:
         *,
         use_cache: bool = False,
     ) -> List[Any]:
-        """Return OHLCV candles for *pair*, preferring the official OHLC endpoint.
+        """Return OHLCV candles for *pair*.
 
-        Tries ``/tradingview/history_v2`` first (reliable pre-formed candles).
-        Falls back to :func:`~bot.analysis.build_candles` from raw trades when
-        the OHLC endpoint is unavailable or returns no data.
+        Priority (highest to lowest):
 
-        When *use_cache* is ``True`` and ``config.scan_candle_cache_seconds > 0``,
-        a recently fetched result is returned from the in-memory cache without
-        hitting the REST API.  This is used during the scan loop to avoid making
-        a ``get_ohlc`` call for every pair on every cycle, which would quickly
-        exhaust the REST rate limit.
+        1. **WS trade buffer** – When the ``MultiPairFeed`` has accumulated
+           enough real-time trades for *pair*, candles are built directly from
+           that buffer via :func:`~bot.analysis.build_candles`.  This path
+           requires **no REST call and no cache**, giving truly live indicator
+           data that updates with every WS push.
+
+        2. **Passed ``trades`` list** – Candles built from the trades already
+           fetched for this analysis cycle (e.g. from a position-feed snapshot).
+
+        3. **REST OHLC endpoint** – ``/tradingview/history_v2`` is tried when
+           neither WS nor live trades provide enough history.  The result may be
+           stored in the in-memory cache when *use_cache* is ``True`` and
+           ``config.scan_candle_cache_seconds > 0`` to avoid redundant REST calls
+           across repeated scan cycles for the same pair.
+
+        The legacy REST path is used only as a last resort so that the bot can
+        still compute indicators for pairs that are not yet receiving WS trade
+        data (e.g. on first startup before the feed is fully seeded).
         """
+        min_candles = max(2, self.config.slow_window // 2)
+
+        # ── 1. Try real-time WS trade buffer from MultiPairFeed ─────────────
+        if self._multi_feed is not None:
+            ws_trades = self._multi_feed.get_trades(pair)
+            if ws_trades and len(ws_trades) >= min_candles:
+                ws_candles = build_candles(
+                    ws_trades,
+                    interval_seconds=self.config.interval_seconds,
+                    limit=max(200, self.config.slow_window + _OHLC_BUFFER_CANDLES),
+                )
+                if len(ws_candles) >= min_candles:
+                    logger.debug(
+                        "WS candles for %s: %d candles from %d trades",
+                        pair,
+                        len(ws_candles),
+                        len(ws_trades),
+                    )
+                    return ws_candles
+
+        # ── 2. Build from trades already fetched this cycle ──────────────────
+        if trades and len(trades) >= min_candles:
+            live_candles = build_candles(
+                trades,
+                interval_seconds=self.config.interval_seconds,
+                limit=200,
+            )
+            if len(live_candles) >= min_candles:
+                return live_candles
+
+        # ── 3. REST OHLC (fallback only) ─────────────────────────────────────
         ttl = self.config.scan_candle_cache_seconds
         if use_cache and ttl > 0:
             cached = self._candle_cache.get(pair)
@@ -1069,6 +1111,10 @@ class Trader:
             new_pairs = ranked[:top_n] if top_n > 0 else ranked
             if new_pairs:
                 self._all_pairs = new_pairs
+                # Subscribe to real-time orderbook + trades WS channels for the
+                # updated watchlist so scan-phase analysis has live depth data.
+                if self._multi_feed is not None:
+                    self._multi_feed.subscribe_depth_pairs(new_pairs)
                 logger.info(
                     "Top-volume selector: watchlist updated → %d pairs "
                     "(top=%d, filtered_vol=%d, filtered_stagnant=%d, filtered_low_price=%d): %s",
@@ -1170,11 +1216,15 @@ class Trader:
                 or self.client.get_ticker(pair)
             )
             if skip_depth:
-                depth = _empty_depth
+                # Prefer real-time WS orderbook from MultiPairFeed; empty only as
+                # last resort so OB signals are never silently neutral.
+                _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
+                depth = _ws_depth or _rt_snap.get("depth") or _empty_depth
             else:
                 depth = _rt_snap.get("depth") or self.client.get_depth(pair, count=200)
             if skip_trades:
-                trades = []
+                _ws_trades = self._multi_feed.get_trades(pair) if self._multi_feed else None
+                trades = _ws_trades or _rt_snap.get("trades") or []
             else:
                 trades = _rt_snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
         else:
@@ -1182,11 +1232,13 @@ class Trader:
             _multi_ticker = self._multi_feed.get_ticker(pair) if self._multi_feed else None
             ticker = prefetched_ticker or _multi_ticker or self.client.get_ticker(pair)
             if skip_depth:
-                depth = _empty_depth
+                _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
+                depth = _ws_depth or _empty_depth
             else:
                 depth = self.client.get_depth(pair, count=200)
             if skip_trades:
-                trades = []
+                _ws_trades = self._multi_feed.get_trades(pair) if self._multi_feed else None
+                trades = _ws_trades or []
             else:
                 trades = self.client.get_trades(pair, count=self.config.trade_count)
 
@@ -2791,6 +2843,11 @@ class Trader:
             if self.config.dynamic_pairs_refresh_cycles > 0 and self._multi_feed.is_seeded:
                 self._refresh_dynamic_pairs()
                 all_pairs = self._all_pairs or all_pairs
+            else:
+                # No dynamic refresh yet — subscribe to depth/trades for the
+                # initial watchlist so orderbook data is available from the
+                # very first scan cycle.
+                self._multi_feed.subscribe_depth_pairs(all_pairs)
 
         # ── Rotating pair window ─────────────────────────────────────────────
         # When pairs_per_cycle > 0 we analyse a rotating window of that many
@@ -2877,16 +2934,15 @@ class Trader:
             if prefetched_ticker is None and feed_seeded:
                 skipped_pairs.append(pair)
                 continue
-            # When WebSocket ticker data is available, skip the /depth REST
-            # call for this pair during the scan loop.  Orderbook-based signals
-            # (whale/spoofing, imbalance) return neutral defaults without depth,
-            # which is acceptable for pair selection.  The final trade snapshot
-            # (returned by scan_and_choose and used by main.py) already includes
-            # depth via the full analyze_market call at the end of this method.
-            # Similarly, skip the per-pair /trades REST call (skip_trades): the
-            # trade-flow filter returns neutral defaults, and candles come from
-            # the OHLC cache instead.  This eliminates 2 REST calls per pair
-            # per scan cycle, substantially reducing rate-limit pressure.
+            # When WebSocket ticker data is available, the skip_depth / skip_trades
+            # flags suppress per-pair REST calls during the scan loop.
+            # analyze_market() now uses real-time WS depth and trades from
+            # MultiPairFeed when available (market:order-book-{pair} and
+            # market:trade-activity-{pair} channels), so orderbook imbalance,
+            # spread, whale detection, and trade-flow are all live during scanning.
+            # Candles are built from the WS trade buffer when enough data exists,
+            # falling back to REST OHLC only when the buffer is too small.
+            # This eliminates stale-cache and empty-signal issues in pair selection.
             scan_skip_depth = prefetched_ticker is not None
             scan_skip_trades = prefetched_ticker is not None
             try:

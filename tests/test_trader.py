@@ -1912,6 +1912,9 @@ class TopVolumeAutoSelectorTest(unittest.TestCase):
             "_cache": ticker_map,
             "_lock": threading.Lock(),
             "get_ticker": lambda self, p: self._cache.get(p),
+            "get_depth": lambda self, p: None,
+            "get_trades": lambda self, p: None,
+            "subscribe_depth_pairs": lambda self, pairs: None,
             "is_seeded": True,
         })()
         return feed
@@ -3182,6 +3185,8 @@ class RugPullFilterTests(unittest.TestCase):
                 "has_snapshot": False,
                 "is_seeded": False,
                 "get_ticker": lambda self, p: None,
+                "get_depth": lambda self, p: None,
+                "get_trades": lambda self, p: None,
             }
         )()
 
@@ -3218,6 +3223,8 @@ class RugPullFilterTests(unittest.TestCase):
                 "has_snapshot": False,
                 "is_seeded": False,
                 "get_ticker": lambda self, p: None,
+                "get_depth": lambda self, p: None,
+                "get_trades": lambda self, p: None,
             }
         )()
 

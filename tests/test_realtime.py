@@ -815,3 +815,242 @@ class SkipTradesAndCandleCacheTests(unittest.TestCase):
         self.assertEqual(client.ticker_calls, 0)
         # Price must come from the multi-feed cache
         self.assertEqual(snapshot["price"], 12345.0)
+
+
+class MultiPairFeedDepthTradesTests(unittest.TestCase):
+    """Tests for the per-pair real-time orderbook and trades streaming in MultiPairFeed."""
+
+    def _make_feed(self, pairs=("btc_idr", "eth_idr")):
+        class _Stub:
+            def get_summaries(self):
+                return {}
+        return MultiPairFeed(list(pairs), _Stub(), websocket_enabled=False, summaries_interval=9999)
+
+    def test_get_depth_returns_none_before_data(self):
+        feed = self._make_feed()
+        self.assertIsNone(feed.get_depth("btc_idr"))
+
+    def test_get_trades_returns_none_before_data(self):
+        feed = self._make_feed()
+        self.assertIsNone(feed.get_trades("btc_idr"))
+
+    def test_apply_orderbook_for_pair_updates_depth_cache(self):
+        """_apply_orderbook_for_pair must convert WS bid/ask to REST buy/sell format."""
+        feed = self._make_feed()
+        ws_data = {
+            "data": {
+                "bid": [{"price": "10000000", "btc_volume": "0.5", "idr_volume": "5000000"}],
+                "ask": [{"price": "10100000", "btc_volume": "0.3", "idr_volume": "3030000"}],
+            }
+        }
+        feed._apply_orderbook_for_pair("btc_idr", ws_data)
+        depth = feed.get_depth("btc_idr")
+        self.assertIsNotNone(depth)
+        self.assertEqual(depth["buy"][0][0], "10000000")
+        self.assertEqual(depth["buy"][0][1], "0.5")
+        self.assertEqual(depth["sell"][0][0], "10100000")
+        self.assertEqual(depth["sell"][0][1], "0.3")
+
+    def test_apply_orderbook_for_pair_isolated_per_pair(self):
+        """Orderbook update for one pair must not affect other pairs."""
+        feed = self._make_feed()
+        ws_data = {
+            "data": {
+                "bid": [{"price": "5000000", "eth_volume": "1.0", "idr_volume": "5000000"}],
+                "ask": [],
+            }
+        }
+        feed._apply_orderbook_for_pair("eth_idr", ws_data)
+        self.assertIsNone(feed.get_depth("btc_idr"))
+        eth_depth = feed.get_depth("eth_idr")
+        self.assertIsNotNone(eth_depth)
+        self.assertEqual(eth_depth["buy"][0][0], "5000000")
+
+    def test_apply_trade_activity_for_pair_populates_buffer(self):
+        """_apply_trade_activity_for_pair must build a trades buffer in REST format."""
+        feed = self._make_feed()
+        ws_data = {
+            "data": [
+                ["btcidr", 1700000100, 1, "buy",  "10000000", "1000000", "0.1"],
+                ["btcidr", 1700000090, 2, "sell", "9990000",  "999000",  "0.1"],
+            ]
+        }
+        feed._apply_trade_activity_for_pair("btc_idr", ws_data)
+        trades = feed.get_trades("btc_idr")
+        self.assertIsNotNone(trades)
+        self.assertEqual(len(trades), 2)
+        # Newest trades are prepended (newest first)
+        self.assertEqual(trades[0]["type"], "buy")
+        self.assertEqual(trades[0]["price"], "10000000")
+        self.assertEqual(trades[1]["type"], "sell")
+
+    def test_apply_trade_activity_for_pair_isolated_per_pair(self):
+        """Trade activity for one pair must not populate buffer for another pair."""
+        feed = self._make_feed()
+        ws_data = {"data": [["ethidr", 1700000200, 1, "buy", "5000000", "100000", "0.02"]]}
+        feed._apply_trade_activity_for_pair("eth_idr", ws_data)
+        self.assertIsNone(feed.get_trades("btc_idr"))
+        eth_trades = feed.get_trades("eth_idr")
+        self.assertIsNotNone(eth_trades)
+        self.assertEqual(len(eth_trades), 1)
+
+    def test_trade_buffer_capped_at_2000_per_pair(self):
+        """Trade buffer must not grow beyond 2000 entries per pair."""
+        feed = self._make_feed()
+        row = lambda i: ["btcidr", 1700000000 + i, i, "buy", "10000", "100", "0.01"]
+        feed._apply_trade_activity_for_pair("btc_idr", {"data": [row(i) for i in range(1500)]})
+        feed._apply_trade_activity_for_pair("btc_idr", {"data": [row(i + 1500) for i in range(1000)]})
+        trades = feed.get_trades("btc_idr")
+        self.assertEqual(len(trades), 2000)
+
+    def test_subscribe_depth_pairs_stores_pairs(self):
+        """subscribe_depth_pairs must record pairs for later WS subscription."""
+        feed = self._make_feed()
+        feed.subscribe_depth_pairs(["btc_idr", "eth_idr"])
+        with feed._lock:
+            stored = list(feed._depth_pairs)
+        self.assertIn("btc_idr", stored)
+        self.assertIn("eth_idr", stored)
+
+    def test_subscribe_depth_pairs_no_duplicates(self):
+        """Calling subscribe_depth_pairs twice with overlapping lists must not duplicate."""
+        feed = self._make_feed()
+        feed.subscribe_depth_pairs(["btc_idr"])
+        feed.subscribe_depth_pairs(["btc_idr", "eth_idr"])
+        with feed._lock:
+            stored = list(feed._depth_pairs)
+        self.assertEqual(stored.count("btc_idr"), 1)
+        self.assertIn("eth_idr", stored)
+
+    def test_orderbook_updates_last_ws_update_timestamp(self):
+        """_apply_orderbook_for_pair must update the staleness timestamp."""
+        feed = self._make_feed()
+        self.assertIsNone(feed._last_ws_update)
+        feed._apply_orderbook_for_pair("btc_idr", {"data": {"bid": [], "ask": []}})
+        self.assertIsNotNone(feed._last_ws_update)
+
+    def test_trade_activity_updates_last_ws_update_timestamp(self):
+        """_apply_trade_activity_for_pair must update the staleness timestamp."""
+        feed = self._make_feed()
+        self.assertIsNone(feed._last_ws_update)
+        feed._apply_trade_activity_for_pair(
+            "btc_idr",
+            {"data": [["btcidr", 1700000000, 1, "buy", "100", "10", "0.1"]]},
+        )
+        self.assertIsNotNone(feed._last_ws_update)
+
+    def test_get_depth_returns_copy_not_reference(self):
+        """get_depth must return a copy so callers cannot mutate internal state."""
+        feed = self._make_feed()
+        feed._apply_orderbook_for_pair("btc_idr", {"data": {"bid": [], "ask": []}})
+        d1 = feed.get_depth("btc_idr")
+        d1["injected"] = True
+        d2 = feed.get_depth("btc_idr")
+        self.assertNotIn("injected", d2)
+
+    def test_get_trades_returns_copy_not_reference(self):
+        """get_trades must return a copy so callers cannot mutate the buffer."""
+        feed = self._make_feed()
+        feed._apply_trade_activity_for_pair(
+            "btc_idr",
+            {"data": [["btcidr", 1700000000, 1, "buy", "100", "10", "0.1"]]},
+        )
+        t1 = feed.get_trades("btc_idr")
+        t1.append({"injected": True})
+        t2 = feed.get_trades("btc_idr")
+        self.assertEqual(len(t2), 1)
+
+
+class WsDepthAndTradesInScanTests(unittest.TestCase):
+    """Tests that scan-phase analysis uses WS depth/trades from MultiPairFeed."""
+
+    def _make_trader_with_feed(self, pair="btc_idr"):
+        class _Client:
+            def __init__(self):
+                self.depth_calls = 0
+                self.trades_calls = 0
+                self.ohlc_calls = 0
+            def get_ticker(self, p):
+                return {"ticker": {"last": "10000", "high": "11000", "low": "9000", "vol_idr": "1000000000"}}
+            def get_depth(self, p, count=50):
+                self.depth_calls += 1
+                return {"buy": [], "sell": []}
+            def get_trades(self, p, count=200):
+                self.trades_calls += 1
+                return []
+            def get_ohlc(self, p, tf="15", *, limit=200, to_ts=None):
+                self.ohlc_calls += 1
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(api_key=None, real_time=False, dry_run=True)
+        client = _Client()
+        trader = Trader(config, client=client)
+        feed = MultiPairFeed([pair], client, websocket_enabled=False, summaries_interval=9999)
+        feed._apply_ws_message_for_pair(pair, {"last": "10000", "high": "11000", "low": "9000", "vol_idr": "1000000000"})
+        trader._multi_feed = feed
+        return trader, client, feed
+
+    def test_ws_depth_used_when_skip_depth_true(self):
+        """analyze_market(skip_depth=True) must use WS depth from MultiPairFeed, not REST."""
+        trader, client, feed = self._make_trader_with_feed("btc_idr")
+        ws_bids = [{"price": "9900", "btc_volume": "1.0", "idr_volume": "9900000"}] * 5
+        ws_asks = [{"price": "10100", "btc_volume": "0.5", "idr_volume": "5050000"}] * 5
+        feed._apply_orderbook_for_pair("btc_idr", {"data": {"bid": ws_bids, "ask": ws_asks}})
+
+        trader.analyze_market("btc_idr", skip_depth=True)
+
+        # REST /depth must NOT be called — WS data was used
+        self.assertEqual(client.depth_calls, 0)
+
+    def test_ws_trades_used_when_skip_trades_true(self):
+        """analyze_market(skip_trades=True) must use WS trades from MultiPairFeed, not REST."""
+        trader, client, feed = self._make_trader_with_feed("btc_idr")
+        trades_data = [
+            ["btcidr", 1700000000 + i, i, "buy", "10000", "100000", "0.01"]
+            for i in range(50)
+        ]
+        feed._apply_trade_activity_for_pair("btc_idr", {"data": trades_data})
+
+        trader.analyze_market("btc_idr", skip_trades=True)
+
+        # REST /trades must NOT be called — WS data was used
+        self.assertEqual(client.trades_calls, 0)
+
+    def test_candles_from_ws_trades_skip_ohlc_rest(self):
+        """_fetch_candles must build candles from WS trades without calling REST OHLC."""
+        trader, client, feed = self._make_trader_with_feed("btc_idr")
+        # 300 trades, one per minute — enough for 20+ candles at 15-min intervals
+        trades_data = [
+            ["btcidr", 1700000000 + i * 60, i, "buy" if i % 2 == 0 else "sell",
+             "10000", "100000", "0.01"]
+            for i in range(300)
+        ]
+        feed._apply_trade_activity_for_pair("btc_idr", {"data": trades_data})
+
+        candles = trader._fetch_candles("btc_idr", [], use_cache=True)
+
+        # OHLC REST must NOT be called — WS trades were sufficient
+        self.assertEqual(client.ohlc_calls, 0)
+        self.assertGreater(len(candles), 0)
+
+    def test_empty_ws_trades_fall_through_to_ohlc(self):
+        """_fetch_candles must fall back to REST OHLC when WS trades are absent."""
+        trader, client, feed = self._make_trader_with_feed("btc_idr")
+        # No trades injected — WS trade buffer is empty
+
+        trader._fetch_candles("btc_idr", [], use_cache=False)
+
+        # Must have called REST OHLC as the fallback
+        self.assertEqual(client.ohlc_calls, 1)
+
+    def test_ws_depth_empty_falls_back_to_empty_depth(self):
+        """When WS depth is not yet available, skip_depth=True still returns empty depth (no REST)."""
+        trader, client, feed = self._make_trader_with_feed("btc_idr")
+        # No orderbook injected
+
+        trader.analyze_market("btc_idr", skip_depth=True)
+
+        # With WS data absent, REST /depth must still NOT be called
+        self.assertEqual(client.depth_calls, 0)
