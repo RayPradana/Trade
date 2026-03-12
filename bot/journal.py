@@ -168,7 +168,12 @@ class TradeJournal:
         win_rate = len(wins) / len(pnls) if pnls else 0.0
         gross_profit = sum(wins) if wins else 0.0
         gross_loss = abs(sum(losses)) if losses else 0.0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float("inf")  # all wins, no losses
+        else:
+            profit_factor = 0.0
         expectancy = mean(pnls) if pnls else 0.0
         avg_win = mean(wins) if wins else 0.0
         avg_loss = mean(losses) if losses else 0.0

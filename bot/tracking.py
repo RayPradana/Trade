@@ -456,7 +456,11 @@ class PortfolioTracker:
     def profit_factor(self) -> float:
         gross_profit = sum(p for p in self._all_sell_pnls if p > 0)
         gross_loss = abs(sum(p for p in self._all_sell_pnls if p < 0))
-        return gross_profit / gross_loss if gross_loss > 0 else 0.0
+        if gross_loss > 0:
+            return gross_profit / gross_loss
+        if gross_profit > 0:
+            return float("inf")  # all wins, no losses
+        return 0.0
 
     @property
     def expectancy(self) -> float:

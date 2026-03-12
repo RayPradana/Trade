@@ -627,6 +627,9 @@ def main() -> None:
     cycle = 0
     consecutive_errors = 0
     _max_backoff = 300  # 5 minutes cap
+    # Maximum exponent for backoff calculation: 2^_MAX_BACKOFF_EXPONENT = 1024 s,
+    # which is above the _max_backoff ceiling so the cap always wins.
+    _MAX_BACKOFF_EXPONENT = 10
     scan_cycles = 0  # counts cycles that completed a full scan (for periodic summary)
     snapshot: dict = {}  # most recent scan snapshot (used for adaptive interval)
     # Track whether a position has been entered in this session.
@@ -842,8 +845,8 @@ def main() -> None:
             # Cap the exponent so the computed delay doesn't grow beyond _max_backoff.
             # Without this cap the multiplication could produce a very large intermediate
             # value even though min() would ultimately clamp it.
-            # 2^10 = 1024 s, which is well above the _max_backoff ceiling of 300 s.
-            exponent = min(consecutive_errors - 1, 10)
+            # 2^_MAX_BACKOFF_EXPONENT = 1024 s, which is well above the _max_backoff ceiling of 300 s.
+            exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
             backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
                 "⚠️  %sError #%d%s  pair=%s  backing off %.0fs …",
@@ -860,7 +863,7 @@ def main() -> None:
             # handler such errors would propagate all the way out of main() and crash the
             # bot process entirely instead of retrying with back-off.
             consecutive_errors += 1
-            exponent = min(consecutive_errors - 1, 10)
+            exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
             backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
                 "⚠️  Unexpected error #%d  pair=%s  backing off %.0fs …",
