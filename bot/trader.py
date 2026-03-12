@@ -20,6 +20,7 @@ from .analysis import (
     detect_spread_anomaly,
     detect_spoofing,
     detect_whale_activity,
+    detect_market_regime,
     interval_to_ohlc_tf,
     multi_timeframe_confirm,
     smart_entry_filter,
@@ -1371,6 +1372,7 @@ class Trader:
         self._record_price(pair, price)
         indicators: MomentumIndicators = derive_indicators(candles)
         trades_24h = self._extract_trade_count_24h(ticker)
+        regime = detect_market_regime(candles, trend, vol)
 
         # ── Multi-timeframe analysis ─────────────────────────────────────────
         mtf: Optional[MultiTimeframeResult] = None
@@ -1484,6 +1486,7 @@ class Trader:
                 effective_capital=self.tracker.effective_capital(),
                 smart_entry=smart_entry,
                 trade_flow=trade_flow,
+                regime=regime,
             )
             # Apply correlated-pair confidence boost when reference trend aligns
             if reference_trend == "up" and decision.action == "buy":
@@ -1500,6 +1503,7 @@ class Trader:
             "volatility": vol,
             "levels": levels,
             "indicators": indicators,
+            "regime": regime,
             "decision": decision,
             "candles": candles,
             "grid_plan": grid_plan,

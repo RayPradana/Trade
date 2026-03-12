@@ -76,6 +76,16 @@ class StrategyTests(unittest.TestCase):
         size = _position_size(0.0, None, config, 0.0, 0.8, vol)
         self.assertEqual(size, 0.0)
 
+    def test_regime_override_in_trade_decision(self) -> None:
+        trend = TrendResult("up", 102, 100, 0.02)
+        orderbook = OrderbookInsight(spread_pct=0.001, bid_volume=10, ask_volume=8, imbalance=0.1)
+        vol = VolatilityStats(volatility=0.05, avg_volume=1)
+        # Volatile regime should force position_trading mode
+        from bot.analysis import MarketRegime
+        regime = MarketRegime(regime="volatile", strength=0.8, description="high vol")
+        decision = make_trade_decision(trend, orderbook, vol, 100.0, self.config, None, regime=regime)
+        self.assertEqual(decision.mode, "position_trading")
+
     def test_grid_dynamic_amount_scales_with_price(self) -> None:
         """Grid order amount must adapt to price so the IDR value is consistent."""
         config = BotConfig(api_key=None, risk_per_trade=0.01, initial_capital=1_000_000,

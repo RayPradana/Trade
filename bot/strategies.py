@@ -391,6 +391,7 @@ def make_trade_decision(
     smart_money: Optional[SmartMoneyFootprint] = None,
     volume_accel: Optional[VolumeAcceleration] = None,
     micro_trend: Optional[MicroTrend] = None,
+    regime: Optional[MarketRegime] = None,
 ) -> StrategyDecision:
     """Produce a :class:`StrategyDecision` incorporating all available signals.
 
@@ -438,7 +439,7 @@ def make_trade_decision(
         the threshold, buy signals are converted to ``"hold"`` (entry
         blocked — aggressive sellers dominate recent trades).
     """
-    mode = select_strategy(trend, orderbook, vol)
+    mode = select_strategy(trend, orderbook, vol, regime=regime)
     conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
 
     if trend.direction == "up":
