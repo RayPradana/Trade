@@ -395,32 +395,39 @@ def _log_signal(snapshot: dict) -> None:
     )
 
     # ── Technical indicators ─────────────────────────────────────────────
-    insufficient = snapshot.get("insufficient_data", False)
-    # Show "N/A" when indicators are absent or snapshot lacks candle data.
-    # A MomentumIndicators with all-zero BB bands indicates no usable candles.
+    # Show "—" only when indicators are entirely absent (ind is None).
+    # When BB bands are zero but RSI/MACD have values, show partial data so the
+    # log is always informative, even with few candles available.
+    _bb_missing = (
+        ind is not None
+        and ind.bb_upper == 0.0 and ind.bb_mid == 0.0 and ind.bb_lower == 0.0
+    )
     _ind_missing = (
         ind is None
-        or insufficient
-        or (ind.bb_upper == 0.0 and ind.bb_mid == 0.0 and ind.bb_lower == 0.0)
+        or (_bb_missing and ind.rsi == 0.0 and ind.macd == 0.0)
     )
     if ind and not _ind_missing:
         rsi_color  = (_GREEN if 40 < ind.rsi < 60
                       else _RED if ind.rsi >= 70 or ind.rsi <= 30 else _YELLOW)
         macd_color = _GREEN if ind.macd > 0 else _RED
-        bb_lo = _idr_compact(ind.bb_lower)
-        bb_mi = _idr_compact(ind.bb_mid)
-        bb_hi = _idr_compact(ind.bb_upper)
+        if _bb_missing:
+            bb_part = f"BB[{_DIM}N/A{_RESET}]"
+        else:
+            bb_lo = _idr_compact(ind.bb_lower)
+            bb_mi = _idr_compact(ind.bb_mid)
+            bb_hi = _idr_compact(ind.bb_upper)
+            bb_part = (
+                f"BB[{_GREEN}{bb_lo}{_RESET} / {bb_mi} / {_RED}{bb_hi}{_RESET}]"
+            )
         logging.info(
-            "   %s└─%s indic   : RSI=%s%.1f%s  MACD=%s%+.6f%s  BB[%s%s%s / %s / %s%s%s]",
+            "   %s└─%s indic   : RSI=%s%.1f%s  MACD=%s%+.6f%s  %s",
             _DIM, _RESET,
             rsi_color, ind.rsi, _RESET,
             macd_color, ind.macd, _RESET,
-            _GREEN, bb_lo, _RESET,
-            bb_mi,
-            _RED, bb_hi, _RESET,
+            bb_part,
         )
     else:
-        logging.info("   %s└─%s indic   : N/A (insufficient candle data)", _DIM, _RESET)
+        logging.info("   %s└─%s indic   : —  (no candle data)", _DIM, _RESET)
 
 
 # ── Order result display ─────────────────────────────────────────────────

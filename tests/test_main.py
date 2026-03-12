@@ -564,7 +564,7 @@ class LoggingFormatSpecifierTest(unittest.TestCase):
 
 
 class LogSignalIndicatorDisplayTest(unittest.TestCase):
-    """_log_signal() must show 'N/A' when indicators are absent or all-zero."""
+    """_log_signal() shows available indicator data, hiding only when entirely absent."""
 
     def setUp(self):
         logging.disable(logging.NOTSET)
@@ -596,29 +596,44 @@ class LogSignalIndicatorDisplayTest(unittest.TestCase):
                 return msg
         return None
 
-    def test_indicators_none_shows_na(self):
-        """When indicators is None, display 'N/A (insufficient candle data)'."""
+    def test_indicators_none_shows_dash(self):
+        """When indicators is None, display '—  (no candle data)'."""
         snapshot = self._make_snapshot(indicators=None)
         with self.assertLogs(level="INFO") as cm:
             main._log_signal(snapshot)
         msg = self._indic_line(cm.output)
         self.assertIsNotNone(msg, "expected an 'indic' log line")
-        self.assertIn("N/A", msg)
+        self.assertIn("—", msg)
+        self.assertIn("no candle data", msg)
 
-    def test_indicators_all_zero_bb_shows_na(self):
-        """When BB bands are all zero (no candle data), display N/A."""
+    def test_indicators_all_zero_shows_partial(self):
+        """When BB bands are zero but RSI non-zero, show RSI/MACD with BB=N/A."""
         from bot.analysis import MomentumIndicators
-        ind = MomentumIndicators(rsi=50.0, macd=0.0, macd_signal=0.0,
+        ind = MomentumIndicators(rsi=50.0, macd=0.001, macd_signal=0.0,
                                  macd_hist=0.0, bb_upper=0.0, bb_mid=0.0, bb_lower=0.0)
         snapshot = self._make_snapshot(indicators=ind)
         with self.assertLogs(level="INFO") as cm:
             main._log_signal(snapshot)
         msg = self._indic_line(cm.output)
         self.assertIsNotNone(msg, "expected an 'indic' log line")
-        self.assertIn("N/A", msg)
+        self.assertIn("RSI=", msg)
+        self.assertIn("MACD=", msg)
+        self.assertIn("N/A", msg)  # BB shows N/A
 
-    def test_insufficient_data_flag_shows_na(self):
-        """When insufficient_data=True, display N/A even if indicators present."""
+    def test_indicators_all_zero_rsi_macd_shows_dash(self):
+        """When ALL indicators (BB, RSI, MACD) are zero, display '—  (no candle data)'."""
+        from bot.analysis import MomentumIndicators
+        ind = MomentumIndicators(rsi=0.0, macd=0.0, macd_signal=0.0,
+                                 macd_hist=0.0, bb_upper=0.0, bb_mid=0.0, bb_lower=0.0)
+        snapshot = self._make_snapshot(indicators=ind)
+        with self.assertLogs(level="INFO") as cm:
+            main._log_signal(snapshot)
+        msg = self._indic_line(cm.output)
+        self.assertIsNotNone(msg, "expected an 'indic' log line")
+        self.assertIn("—", msg)
+
+    def test_insufficient_data_flag_still_shows_indicators(self):
+        """When insufficient_data=True but indicators are valid, display them anyway."""
         from bot.analysis import MomentumIndicators
         ind = MomentumIndicators(rsi=55.0, macd=0.001, macd_signal=0.0,
                                  macd_hist=0.0, bb_upper=110.0, bb_mid=100.0, bb_lower=90.0)
@@ -627,7 +642,9 @@ class LogSignalIndicatorDisplayTest(unittest.TestCase):
             main._log_signal(snapshot)
         msg = self._indic_line(cm.output)
         self.assertIsNotNone(msg, "expected an 'indic' log line")
-        self.assertIn("N/A", msg)
+        self.assertIn("RSI=", msg)
+        self.assertIn("MACD=", msg)
+        self.assertIn("BB[", msg)
 
     def test_valid_indicators_show_rsi_macd_bb(self):
         """When valid indicators present, display RSI/MACD/BB values."""

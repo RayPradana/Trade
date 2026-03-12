@@ -37,8 +37,15 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `GRID_SPACING_PCT` | Jarak antar level grid (0.004 = 0.4%) | `0.004` |
 | `GRID_ORDER_SIZE` | (Opsional) Ukuran order per level; default memakai `RISK_PER_TRADE × INITIAL_CAPITAL / harga` | - |
 | `ORDER_QUEUE_ENABLED` | Aktifkan antrean permintaan order dengan rate limit | `true` |
-| `ORDER_MIN_INTERVAL` | Jeda minimal antar permintaan order (detik) | `0.25` |
+| `ORDER_MIN_INTERVAL` | Jeda minimal antar permintaan order (detik) — rekomendasi 2.0 s untuk menghindari HTTP 429 | `2.0` |
 | `SCAN_REQUEST_DELAY` | Jeda antar request saat scan pasangan (mencegah HTTP 429) | `0.2` |
+| `ACCOUNT_INFO_CACHE_TTL` | Cache saldo akun selama N detik (0 = nonaktif) | `30` |
+| `OPEN_ORDERS_CACHE_TTL` | Cache open-orders per pair selama N detik (0 = nonaktif) | `15` |
+| `MAX_OPEN_POSITIONS` | Batas maksimum posisi aktif sekaligus (0 = tanpa batas) | `0` |
+| `MAX_HOLD_SECONDS` | Paksa jual posisi yang sudah terbuka lebih dari N detik tanpa profit (0 = nonaktif) | `0` |
+| `VOLUME_HIGH_THRESHOLD_IDR` | Volume 24-jam (IDR) ambang batas hold time adaptif (0 = nonaktif) | `0` |
+| `MAX_HOLD_SECONDS_VOLUME_HIGH` | Hold time maksimum untuk pair volume tinggi (detik) | `5400` |
+| `MAX_HOLD_SECONDS_VOLUME_LOW` | Hold time maksimum untuk pair volume rendah (detik) | `1800` |
 | `WEBSOCKET_ENABLED` | Coba gunakan WebSocket untuk data real-time (fallback ke REST) | `true` |
 | `WEBSOCKET_URL` | URL WebSocket jika ingin override | - |
 | `FAST_WINDOW` | Periode MA cepat | `12` |
@@ -119,8 +126,35 @@ GRID_ENABLED=true GRID_LEVELS_PER_SIDE=4 GRID_SPACING_PCT=0.003 DRY_RUN=true pyt
 
 ### Antrean order dengan rate limit
 
-- `ORDER_QUEUE_ENABLED=true` mengaktifkan antrean order yang menegakkan jeda minimal antar request (default 0.25 detik lewat `ORDER_MIN_INTERVAL`).
+- `ORDER_QUEUE_ENABLED=true` mengaktifkan antrean order yang menegakkan jeda minimal antar request (`ORDER_MIN_INTERVAL`, default **2.0 detik**).
 - Berlaku untuk `create_order` dan `cancel_order` agar tidak melampaui batas rate limit API.
+- REST hanya dipakai untuk: `place order`, `cancel order`, `cek balance`, `cek open orders` — semua serialisasi melalui antrean ini.
+- Data market (harga, orderbook, trade stream) diperoleh via WebSocket sehingga tidak membebani REST.
+
+### Hold time adaptif berdasarkan volume
+
+Fitur ini memungkinkan bot menahan posisi lebih lama di pair liquid dan lebih cepat keluar dari pair iliquid:
+
+```
+VOLUME_HIGH_THRESHOLD_IDR=5000000000   # 5 miliar IDR — batas volume "tinggi"
+MAX_HOLD_SECONDS_VOLUME_HIGH=5400      # 90 menit untuk pair volume tinggi
+MAX_HOLD_SECONDS_VOLUME_LOW=1800       # 30 menit untuk pair volume rendah
+```
+
+Aktifkan dengan menyetel `VOLUME_HIGH_THRESHOLD_IDR > 0`. Jika 0, fitur nonaktif dan `MAX_HOLD_SECONDS` dipakai sebagai batas tetap.
+
+### Caching REST (mencegah spam API)
+
+```
+ACCOUNT_INFO_CACHE_TTL=30   # cache saldo 30 detik
+OPEN_ORDERS_CACHE_TTL=15    # cache open-orders 15 detik
+```
+
+### Batasi posisi aktif
+
+```
+MAX_OPEN_POSITIONS=3   # maksimal 3 pair aktif sekaligus
+```
 
 Opsi penting:
 
