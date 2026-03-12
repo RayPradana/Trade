@@ -321,7 +321,7 @@ class NoDuplicatePairsCallTest(unittest.TestCase):
         client_instance = _Client()
 
         class _Trader(Trader):
-            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False):
                 return snapshot
 
         trader = _Trader(config, client=client_instance)

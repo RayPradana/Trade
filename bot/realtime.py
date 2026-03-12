@@ -68,6 +68,10 @@ class RealtimeFeed:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._ws_thread: Optional[threading.Thread] = None
+        # Rolling trade buffer for WS-sourced trades (newest first, max 200).
+        # Persists across reconnects so analysis always has recent history.
+        self._ws_trades_buf: List[Dict[str, Any]] = []
+        self._ws_trades_lock = threading.Lock()
 
     @property
     def has_snapshot(self) -> bool:
@@ -143,74 +147,230 @@ class RealtimeFeed:
             with self._lock:
                 self._latest.update(update)
 
+    def _apply_orderbook(self, data: Dict[str, Any]) -> None:
+        """Normalize a ``market:order-book-{pair}`` push into the REST depth format.
+
+        The WS push contains a ``data`` wrapper with ``bid`` (buyers) and ``ask``
+        (sellers) lists.  Each entry is a dict with ``price``, ``idr_volume``, and
+        a coin-specific volume field (e.g. ``btc_volume``).
+
+        The REST format expected by :func:`~bot.analysis.analyze_orderbook` is::
+
+            {"buy": [["price", "coin_vol"], …], "sell": [["price", "coin_vol"], …]}
+        """
+        if not isinstance(data, dict):
+            return
+        inner = data.get("data", data)
+        if not isinstance(inner, dict):
+            return
+
+        # Derive the coin name from the pair: "btc_idr" → "btc"
+        coin = self.pair.split("_")[0] if "_" in self.pair else self.pair[:-3]
+        vol_key = f"{coin}_volume"
+
+        def _convert(orders: Any) -> List[List[str]]:
+            result: List[List[str]] = []
+            if not isinstance(orders, list):
+                return result
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                price = str(o.get("price", "0"))
+                # Try the coin-specific volume key first, then any remaining key
+                # that is not "price" or "idr_volume" (covers edge cases).
+                vol = str(
+                    o.get(vol_key)
+                    or next(
+                        (v for k, v in o.items() if k not in ("price", "idr_volume")),
+                        "0",
+                    )
+                )
+                result.append([price, vol])
+            return result
+
+        buy_orders = _convert(inner.get("bid", []))
+        sell_orders = _convert(inner.get("ask", []))
+
+        with self._lock:
+            self._latest["depth"] = {"buy": buy_orders, "sell": sell_orders}
+
+    def _apply_trade_activity(self, data: Dict[str, Any]) -> None:
+        """Accumulate ``market:trade-activity-{pair}`` push events into the trade buffer.
+
+        Each row in the push payload is an array::
+
+            [pair, timestamp, sequence, side, price, idr_volume, coin_volume]
+
+        Rows are normalized to the REST trades format::
+
+            {"date": "…", "price": "…", "amount": "…", "type": "buy"|"sell"}
+
+        and prepended to a rolling buffer (newest first, max 200 entries) that
+        is stored in ``_latest["trades"]``.
+        """
+        rows = data.get("data", [])
+        if not isinstance(rows, list):
+            return
+
+        new_trades: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            try:
+                new_trades.append(
+                    {
+                        "date": str(int(row[1])),
+                        "price": str(row[4]),
+                        "amount": str(row[6]),
+                        "type": str(row[3]),  # "buy" or "sell"
+                    }
+                )
+            except (IndexError, TypeError, ValueError):
+                continue
+
+        if not new_trades:
+            return
+
+        with self._ws_trades_lock:
+            # Prepend newest trades (newest first to match REST API order)
+            self._ws_trades_buf = new_trades + self._ws_trades_buf
+            # Keep only the most recent 200 trades
+            if len(self._ws_trades_buf) > 200:
+                self._ws_trades_buf = self._ws_trades_buf[:200]
+            trades_snapshot = list(self._ws_trades_buf)
+
+        with self._lock:
+            self._latest["trades"] = trades_snapshot
+
     def _run_websocket(self) -> None:
-        assert websocket is not None  # for type checkers
+        """Connect to Indodax market-data WS and subscribe to per-pair channels.
+
+        Uses the official Centrifuge-based protocol documented at:
+        https://github.com/btcid/indodax-official-api-docs/blob/master/Marketdata-websocket.md
+
+        Subscribes to:
+        * ``market:order-book-{pair}``   – real-time orderbook depth
+        * ``market:trade-activity-{pair}`` – real-time trade executions
+
+        If *subscribe_message* is set (legacy / custom WS endpoint), falls back
+        to the old generic behaviour of sending that message verbatim.
+        """
+        assert websocket is not None
         assert self.websocket_url
+
+        pair_nodash = self.pair.replace("_", "")
+        ob_channel = f"market:order-book-{pair_nodash}"
+        ta_channel = f"market:trade-activity-{pair_nodash}"
+
+        auth_msg = json.dumps({"params": {"token": INDODAX_WS_TOKEN}, "id": 1})
+        subscribe_msgs = [
+            json.dumps({"method": 1, "params": {"channel": ob_channel}, "id": 2}),
+            json.dumps({"method": 1, "params": {"channel": ta_channel}, "id": 3}),
+        ]
 
         backoff = _WS_BACKOFF_INITIAL
 
         while not self._stop.is_set():
-            # Each outer iteration represents one connection attempt.
-            _connected = threading.Event()
+            _authenticated = threading.Event()
 
             def _on_open(ws: Any) -> None:
                 nonlocal backoff
-                backoff = _WS_BACKOFF_INITIAL  # reset on successful connect
-                _connected.set()
-                logger.info("WebSocket connected for %s", self.pair)
-                if self.subscribe_message:
-                    try:
+                backoff = _WS_BACKOFF_INITIAL
+                logger.info("RealtimeFeed WS connected for %s", self.pair)
+                try:
+                    if self.subscribe_message:
+                        # Legacy / custom endpoint: send the configured message verbatim.
                         ws.send(self.subscribe_message)
-                        logger.debug("Sent WebSocket subscription: %s", self.subscribe_message)
-                    except Exception:
-                        logger.debug("Failed to send WebSocket subscription", exc_info=True)
+                        logger.debug("Sent custom subscribe message for %s", self.pair)
+                    else:
+                        # Official Indodax Centrifuge protocol: authenticate first.
+                        ws.send(auth_msg)
+                        logger.debug("RealtimeFeed WS auth sent for %s", self.pair)
+                except Exception:
+                    logger.debug("RealtimeFeed WS open handler failed", exc_info=True)
 
-            def _on_message(_: Any, message: str) -> None:
+            def _on_message(_ws: Any, message: str) -> None:
                 try:
                     parsed = json.loads(message)
-                    if isinstance(parsed, dict):
+                    if not isinstance(parsed, dict):
+                        return
+
+                    if self.subscribe_message:
+                        # Legacy path: apply message as-is
                         self._apply_ws_message(parsed)
+                        return
+
+                    # ── Auth response: {"id": 1, "result": {…}} ────────────
+                    if parsed.get("id") == 1 and "result" in parsed:
+                        _authenticated.set()
+                        for sub_msg in subscribe_msgs:
+                            try:
+                                _ws.send(sub_msg)
+                            except Exception:
+                                logger.debug(
+                                    "RealtimeFeed WS subscribe send failed", exc_info=True
+                                )
+                        logger.debug(
+                            "RealtimeFeed WS subscribed to %s and %s",
+                            ob_channel,
+                            ta_channel,
+                        )
+                        return
+
+                    # ── Channel push ────────────────────────────────────────
+                    result = (
+                        parsed.get("result")
+                        or parsed.get("push", {}).get("pub", {})
+                    )
+                    if not isinstance(result, dict):
+                        return
+                    channel = result.get("channel", "")
+                    data = result.get("data", {})
+                    if not isinstance(data, dict):
+                        return
+
+                    if channel == ob_channel:
+                        self._apply_orderbook(data)
+                    elif channel == ta_channel:
+                        self._apply_trade_activity(data)
+
                 except Exception:
-                    logger.debug("Failed to parse WebSocket message", exc_info=True)
+                    logger.debug("RealtimeFeed WS message error", exc_info=True)
 
             def _on_error(_: Any, error: Any) -> None:
-                logger.debug("WebSocket error: %s", error)
+                logger.debug("RealtimeFeed WS error for %s: %s", self.pair, error)
 
             def _on_close(_: Any, code: Any, msg: Any) -> None:
-                logger.info("WebSocket closed for %s (code=%s)", self.pair, code)
+                logger.info("RealtimeFeed WS closed for %s (code=%s)", self.pair, code)
 
-            ws = websocket.WebSocketApp(
+            ws_app = websocket.WebSocketApp(
                 self.websocket_url,
                 on_open=_on_open,
                 on_message=_on_message,
                 on_error=_on_error,
                 on_close=_on_close,
             )
-
-            # run_forever blocks until the connection closes or an error occurs.
-            # suppress_origin=True removes the Origin header which Indodax WS
-            # servers require to be absent (otherwise returns 403 Forbidden).
+            # suppress_origin=True is required by Indodax – the server returns
+            # 403 Forbidden when an Origin header is present.
             wst = threading.Thread(
-                target=ws.run_forever,
+                target=ws_app.run_forever,
                 kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
                 daemon=True,
             )
             wst.start()
-            # Wait for the WS thread to finish (disconnect / error).
-            # Use a generous timeout so a hung thread doesn't block stop() forever.
             wst.join(timeout=30.0)
             if wst.is_alive():
-                logger.debug("WebSocket thread did not finish within timeout; continuing …")
+                logger.debug("RealtimeFeed WS thread did not finish within timeout")
 
             if self._stop.is_set():
-                break  # clean shutdown – do not reconnect
+                break
 
             logger.warning(
-                "WebSocket disconnected for %s; reconnecting in %.0fs …",
+                "RealtimeFeed WS disconnected for %s; reconnecting in %.0fs …",
                 self.pair,
                 backoff,
             )
-            self._stop.wait(backoff)       # interruptible sleep – honours stop()
+            self._stop.wait(backoff)
             backoff = min(backoff * 2, _WS_BACKOFF_MAX)
 
 

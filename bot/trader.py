@@ -651,7 +651,7 @@ class Trader:
                 logger.debug(
                     "OHLC candles for %s: %d candles (tf=%s)", pair, len(candles), tf
                 )
-                if ttl > 0:
+                if use_cache and ttl > 0:
                     self._candle_cache[pair] = (time.time(), candles)
                 return candles
         except Exception as exc:
@@ -659,9 +659,14 @@ class Trader:
                 "OHLC fetch failed for %s (%s); falling back to trades", pair, exc
             )
         # Legacy fallback: build candles by bucketing raw trade ticks.
-        return build_candles(
+        result = build_candles(
             trades, interval_seconds=self.config.interval_seconds, limit=200
         )
+        # Cache the fallback result too so repeated scan calls don't hammer the
+        # OHLC endpoint for pairs that genuinely have no data within the TTL.
+        if use_cache and ttl > 0:
+            self._candle_cache[pair] = (time.time(), result)
+        return result
 
     def _score_snapshot(self, snapshot: Dict[str, Any]) -> float:
         decision: StrategyDecision = snapshot["decision"]
@@ -1141,7 +1146,14 @@ class Trader:
             _rt_snap = None
 
         if _rt_snap is not None:
-            ticker = _rt_snap.get("ticker") or prefetched_ticker or self.client.get_ticker(pair)
+            # Ticker priority: position-feed WS → prefetched (scan) → multi-feed WS → REST
+            _multi_ticker = self._multi_feed.get_ticker(pair) if self._multi_feed else None
+            ticker = (
+                _rt_snap.get("ticker")
+                or prefetched_ticker
+                or _multi_ticker
+                or self.client.get_ticker(pair)
+            )
             if skip_depth:
                 depth = _empty_depth
             else:
@@ -1151,7 +1163,9 @@ class Trader:
             else:
                 trades = _rt_snap.get("trades") or self.client.get_trades(pair, count=self.config.trade_count)
         else:
-            ticker = prefetched_ticker or self.client.get_ticker(pair)
+            # Ticker priority: prefetched (scan) → multi-feed WS → REST
+            _multi_ticker = self._multi_feed.get_ticker(pair) if self._multi_feed else None
+            ticker = prefetched_ticker or _multi_ticker or self.client.get_ticker(pair)
             if skip_depth:
                 depth = _empty_depth
             else:
@@ -2596,6 +2610,7 @@ class Trader:
         pair: str,
         prefetched_ticker: Optional[Dict[str, Any]] = None,
         skip_depth: bool = False,
+        skip_trades: bool = False,
     ) -> Dict[str, Any]:
         """Analyze a single pair with exponential back-off on HTTP 429 responses.
 
@@ -2607,7 +2622,12 @@ class Trader:
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(self._MAX_SCAN_RETRIES):
             try:
-                return self.analyze_market(pair, prefetched_ticker=prefetched_ticker, skip_depth=skip_depth)
+                return self.analyze_market(
+                    pair,
+                    prefetched_ticker=prefetched_ticker,
+                    skip_depth=skip_depth,
+                    skip_trades=skip_trades,
+                )
             except (requests.HTTPError, RuntimeError) as exc:
                 # Detect 429 from both the raw requests.HTTPError (test path) and
                 # from the RuntimeError wrapper that IndodaxClient raises (production).
@@ -2631,6 +2651,9 @@ class Trader:
                     # Don't rely on a stale prefetched ticker on retry; let the
                     # call fetch it fresh via REST.
                     prefetched_ticker = None
+                    # On retry, disable skip_trades so fresh trades data is
+                    # fetched with the fresh ticker.
+                    skip_trades = False
                     # Only sleep when there is a subsequent retry; sleeping after
                     # the final attempt would block the scan for no benefit since
                     # the exception is raised immediately after the loop.
@@ -2792,9 +2815,19 @@ class Trader:
             # which is acceptable for pair selection.  The final trade snapshot
             # (returned by scan_and_choose and used by main.py) already includes
             # depth via the full analyze_market call at the end of this method.
+            # Similarly, skip the per-pair /trades REST call (skip_trades): the
+            # trade-flow filter returns neutral defaults, and candles come from
+            # the OHLC cache instead.  This eliminates 2 REST calls per pair
+            # per scan cycle, substantially reducing rate-limit pressure.
             scan_skip_depth = prefetched_ticker is not None
+            scan_skip_trades = prefetched_ticker is not None
             try:
-                snapshot = self._analyze_with_retry(pair, prefetched_ticker=prefetched_ticker, skip_depth=scan_skip_depth)
+                snapshot = self._analyze_with_retry(
+                    pair,
+                    prefetched_ticker=prefetched_ticker,
+                    skip_depth=scan_skip_depth,
+                    skip_trades=scan_skip_trades,
+                )
             # pragma: no cover - guard for per-pair API/parse failures
             except (requests.RequestException, RuntimeError, ValueError) as exc:
                 logger.warning("Failed to analyze %s: %s", pair, exc)

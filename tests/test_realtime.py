@@ -599,3 +599,219 @@ class PositionFeedLifecycleTests(unittest.TestCase):
         # REST ticker should NOT have been called
         self.assertEqual(client.ticker_calls, 0)
         self.assertEqual(snapshot["price"], 999.0)
+
+
+class IndodaxWsChannelTests(unittest.TestCase):
+    """Tests for the official Indodax per-pair WS channel message handlers."""
+
+    def _make_feed(self, pair: str = "btc_idr") -> RealtimeFeed:
+        client = _ClientStub()
+        return RealtimeFeed(pair, client, websocket_enabled=False, poll_interval=9999)
+
+    # ── _apply_orderbook ──────────────────────────────────────────────────
+
+    def test_apply_orderbook_normalises_to_rest_format(self) -> None:
+        """_apply_orderbook must convert WS bid/ask → REST buy/sell format."""
+        feed = self._make_feed("btc_idr")
+        ws_data = {
+            "data": {
+                "pair": "btcidr",
+                "ask": [
+                    {"btc_volume": "0.5", "idr_volume": "165000000", "price": "330000000"},
+                    {"btc_volume": "0.2", "idr_volume": "66400000",  "price": "332000000"},
+                ],
+                "bid": [
+                    {"btc_volume": "0.8", "idr_volume": "263200000", "price": "329000000"},
+                ],
+            },
+            "offset": 12345,
+        }
+        feed._apply_orderbook(ws_data)
+        snap = feed.snapshot()
+        self.assertIn("depth", snap)
+        depth = snap["depth"]
+        # WS ask (sellers) → REST sell
+        self.assertEqual(depth["sell"][0][0], "330000000")
+        self.assertEqual(depth["sell"][0][1], "0.5")
+        # WS bid (buyers) → REST buy
+        self.assertEqual(depth["buy"][0][0], "329000000")
+        self.assertEqual(depth["buy"][0][1], "0.8")
+
+    def test_apply_orderbook_direct_inner_format(self) -> None:
+        """_apply_orderbook handles data dict passed directly (without nested 'data' key)."""
+        feed = self._make_feed("eth_idr")
+        ws_data = {
+            "pair": "ethidr",
+            "ask": [{"eth_volume": "1.0", "idr_volume": "5000000", "price": "5000000"}],
+            "bid": [{"eth_volume": "2.0", "idr_volume": "9800000", "price": "4900000"}],
+        }
+        feed._apply_orderbook(ws_data)
+        snap = feed.snapshot()
+        self.assertIn("depth", snap)
+        self.assertEqual(snap["depth"]["sell"][0][0], "5000000")
+        self.assertEqual(snap["depth"]["buy"][0][0], "4900000")
+
+    def test_apply_orderbook_ignores_invalid_data(self) -> None:
+        """_apply_orderbook must not raise or update snapshot for malformed data."""
+        feed = self._make_feed()
+        feed._apply_orderbook("not_a_dict")  # type: ignore
+        self.assertFalse(feed.has_snapshot)
+
+    # ── _apply_trade_activity ─────────────────────────────────────────────
+
+    def test_apply_trade_activity_normalises_to_rest_format(self) -> None:
+        """_apply_trade_activity must convert WS trade rows to REST trades format."""
+        feed = self._make_feed("btc_idr")
+        ws_data = {
+            "data": [
+                ["btcidr", 1700000100, 1001, "buy",  330000000, "9900000",    "0.03"],
+                ["btcidr", 1700000090, 1000, "sell", 329900000, "65980000.0", "0.2"],
+            ],
+            "offset": 100,
+        }
+        feed._apply_trade_activity(ws_data)
+        snap = feed.snapshot()
+        self.assertIn("trades", snap)
+        trades = snap["trades"]
+        # Two trades; newest first
+        self.assertEqual(len(trades), 2)
+        self.assertEqual(trades[0]["type"], "buy")
+        self.assertEqual(trades[0]["price"], "330000000")
+        self.assertEqual(trades[0]["amount"], "0.03")
+        self.assertEqual(trades[0]["date"], "1700000100")
+        self.assertEqual(trades[1]["type"], "sell")
+
+    def test_apply_trade_activity_accumulates_across_pushes(self) -> None:
+        """Repeated calls must accumulate trades, newest first, capped at 200."""
+        feed = self._make_feed("eth_idr")
+        row_template = lambda i: ["ethidr", 1700000000 + i, i, "buy", 5000000, "100000", "0.02"]
+        # Push 150 trades in one call
+        feed._apply_trade_activity({"data": [row_template(i) for i in range(150)], "offset": 0})
+        # Push 100 more (should cap at 200 total)
+        feed._apply_trade_activity({"data": [row_template(i + 150) for i in range(100)], "offset": 1})
+        snap = feed.snapshot()
+        self.assertEqual(len(snap["trades"]), 200)
+
+    def test_apply_trade_activity_ignores_malformed_rows(self) -> None:
+        """Rows with fewer than 7 fields are silently skipped."""
+        feed = self._make_feed()
+        ws_data = {
+            "data": [
+                ["btcidr", 1700000000, 1],       # too short – skipped
+                ["btcidr", 1700000001, 2, "buy", 100, "200", "0.5"],  # valid
+            ],
+            "offset": 0,
+        }
+        feed._apply_trade_activity(ws_data)
+        snap = feed.snapshot()
+        # Only the valid row should appear
+        self.assertEqual(len(snap["trades"]), 1)
+        self.assertEqual(snap["trades"][0]["type"], "buy")
+
+
+class SkipTradesAndCandleCacheTests(unittest.TestCase):
+    """Verify that skip_trades and the OHLC candle cache reduce REST calls during scan."""
+
+    def _make_trader(self, cache_ttl: int = 60):
+        from bot.config import BotConfig
+        from bot.trader import Trader
+
+        class _Client:
+            def __init__(self):
+                self.ohlc_calls = 0
+                self.trades_calls = 0
+            def get_ticker(self, pair):
+                return {"ticker": {"last": "100"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                self.trades_calls += 1
+                return []
+            def get_ohlc(self, pair, tf="15", *, limit=200, to_ts=None):
+                self.ohlc_calls += 1
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(
+            api_key=None,
+            real_time=False,
+            dry_run=True,
+            scan_candle_cache_seconds=cache_ttl,
+        )
+        client = _Client()
+        trader = Trader(config, client=client)
+        return trader, client
+
+    def test_skip_trades_omits_rest_trades_call(self) -> None:
+        """analyze_market with skip_trades=True must not call client.get_trades()."""
+        trader, client = self._make_trader()
+        trader.analyze_market("btc_idr", skip_trades=True)
+        self.assertEqual(client.trades_calls, 0, "get_trades() should not be called when skip_trades=True")
+
+    def test_skip_trades_false_calls_trades(self) -> None:
+        """analyze_market with skip_trades=False (default) must call client.get_trades()."""
+        trader, client = self._make_trader()
+        trader.analyze_market("btc_idr", skip_trades=False)
+        self.assertEqual(client.trades_calls, 1, "get_trades() should be called once when skip_trades=False")
+
+    def test_candle_cache_avoids_second_ohlc_call(self) -> None:
+        """_fetch_candles with use_cache=True must reuse cached data within TTL."""
+        trader, client = self._make_trader(cache_ttl=60)
+        # First call: fetches from REST
+        trader.analyze_market("btc_idr", skip_trades=True)
+        first_call_count = client.ohlc_calls
+        # Second call within TTL: should reuse cache
+        trader.analyze_market("btc_idr", skip_trades=True)
+        self.assertEqual(
+            client.ohlc_calls,
+            first_call_count,
+            "get_ohlc() should not be called again when cache is still fresh",
+        )
+
+    def test_candle_cache_disabled_at_zero(self) -> None:
+        """When scan_candle_cache_seconds=0 cache is bypassed every call."""
+        trader, client = self._make_trader(cache_ttl=0)
+        trader.analyze_market("btc_idr", skip_trades=True)
+        trader.analyze_market("btc_idr", skip_trades=True)
+        self.assertEqual(
+            client.ohlc_calls,
+            2,
+            "With TTL=0, get_ohlc() should be called on every analyze_market call",
+        )
+
+    def test_multi_feed_ticker_used_before_rest(self) -> None:
+        """analyze_market must use MultiPairFeed ticker before falling back to REST."""
+        from bot.config import BotConfig
+        from bot.realtime import MultiPairFeed
+        from bot.trader import Trader
+
+        class _Client:
+            def __init__(self):
+                self.ticker_calls = 0
+            def get_ticker(self, pair):
+                self.ticker_calls += 1
+                return {"ticker": {"last": "999"}}
+            def get_depth(self, pair, count=50):
+                return {"buy": [], "sell": []}
+            def get_trades(self, pair, count=200):
+                return []
+            def get_ohlc(self, pair, tf="15", *, limit=200, to_ts=None):
+                return []
+            def get_summaries(self):
+                return {}
+
+        config = BotConfig(api_key=None, real_time=False)
+        client = _Client()
+        trader = Trader(config, client=client)
+
+        # Simulate a seeded MultiPairFeed
+        multi_feed = MultiPairFeed(["btc_idr"], client, websocket_enabled=False, summaries_interval=9999)
+        multi_feed._cache["btc_idr"] = {"last": "12345"}
+        trader._multi_feed = multi_feed
+
+        snapshot = trader.analyze_market("btc_idr", skip_trades=True)
+        # REST ticker must NOT have been called
+        self.assertEqual(client.ticker_calls, 0)
+        # Price must come from the multi-feed cache
+        self.assertEqual(snapshot["price"], 12345.0)

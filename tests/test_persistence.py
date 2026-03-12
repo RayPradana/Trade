@@ -83,7 +83,7 @@ class _FakeClient:
 class _BuyTrader(Trader):
     """Trader that always returns a buy signal for maybe_execute tests."""
 
-    def analyze_market(self, pair=None, prefetched_ticker=None) -> Dict[str, Any]:
+    def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False) -> Dict[str, Any]:
         from bot.strategies import StrategyDecision
         return {
             "pair": pair or "btc_idr",

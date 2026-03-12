@@ -201,7 +201,7 @@ class MainErrorHandlingTests(unittest.TestCase):
             def evaluate_dynamic_tp(self, snapshot):
                 return "target_profit_reached"
 
-            def analyze_market(self, pair=None):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False):
                 return {
                     "pair": pair or "btc_idr",
                     "price": 110.0,
@@ -274,7 +274,7 @@ class MainErrorHandlingTests(unittest.TestCase):
             def evaluate_dynamic_tp(self, snapshot):
                 return "target_profit_reached"
 
-            def analyze_market(self, pair=None):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False):
                 return {
                     "pair": pair or "btc_idr",
                     "price": 110.0,
