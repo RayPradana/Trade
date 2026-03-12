@@ -243,8 +243,10 @@ def analyze_volatility(candles: Sequence[Candle]) -> VolatilityStats:
 def support_resistance(candles: Sequence[Candle], lookback: int = 30) -> SupportResistance:
     if not candles:
         return SupportResistance(0.0, 0.0, lookback)
-    closes = [c.close for c in candles[-lookback:]]
-    return SupportResistance(support=min(closes), resistance=max(closes), lookback=lookback)
+    recent = candles[-lookback:]
+    support = min(c.low for c in recent)
+    resistance = max(c.high for c in recent)
+    return SupportResistance(support=support, resistance=resistance, lookback=lookback)
 
 
 def _ema_series(values: Sequence[float], span: int) -> List[float]:

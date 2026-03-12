@@ -77,8 +77,9 @@ class AnalysisTests(unittest.TestCase):
             Candle(2, 90, 91, 89, 90, 1),
         ]
         levels = support_resistance(candles, lookback=3)
-        self.assertEqual(levels.support, 90)
-        self.assertEqual(levels.resistance, 110)
+        # Support uses candle lows (min low = 89), resistance uses highs (max high = 111)
+        self.assertEqual(levels.support, 89)
+        self.assertEqual(levels.resistance, 111)
 
     def test_indicators_include_rsi_and_macd(self) -> None:
         candles = [
