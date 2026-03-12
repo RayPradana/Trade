@@ -13,6 +13,8 @@ from .analysis import (
     build_candles,
     candles_from_ohlc,
     derive_indicators,
+    detect_flash_dump,
+    detect_spread_anomaly,
     detect_spoofing,
     detect_whale_activity,
     interval_to_ohlc_tf,
@@ -33,6 +35,7 @@ from .grid import GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, make_trade_decision
 from .tracking import PortfolioTracker
+from .journal import TradeJournal
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,12 @@ class Trader:
                 subscribe_message=config.websocket_subscribe_message,
             )
             self.realtime.start()
+        # New feature state
+        self._consecutive_errors: int = 0
+        self._circuit_breaker_until: float = 0.0
+        self._volatility_cooldown_until: float = 0.0
+        self.journal: Optional[TradeJournal] = None
+        self._spread_history: Dict[str, List[float]] = {}
 
     # ------------------------------------------------------------------
     # Auto-resume helpers
@@ -138,6 +147,54 @@ class Trader:
         # For live trading reconcile saved position against real API balance
         if not self.config.dry_run:
             self._reconcile_with_api(str(pair) if pair else self.config.pair)
+
+    def set_journal(self, journal: TradeJournal) -> None:
+        self.journal = journal
+
+    def _validate_balance(self, pair: str, action: str, amount: float, price: float) -> bool:
+        if not self.config.balance_check_enabled:
+            return True
+        try:
+            info = self.client.get_account_info()
+            balance_dict = (info.get("return") or {}).get("balance") or {}
+            if action == "buy":
+                idr_needed = amount * price
+                available_idr = float(balance_dict.get("idr") or "0")
+                if available_idr < idr_needed:
+                    logger.warning(
+                        "Balance check FAILED for buy on %s: need IDR %.2f, have IDR %.2f",
+                        pair, idr_needed, available_idr,
+                    )
+                    return False
+            elif action == "sell":
+                base_coin = pair.split("_")[0].lower()
+                available_coin = float(balance_dict.get(base_coin) or "0")
+                if available_coin < amount:
+                    logger.warning(
+                        "Balance check FAILED for sell on %s: need %.8f %s, have %.8f",
+                        pair, amount, base_coin, available_coin,
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("Balance check failed for %s: %s — proceeding anyway", pair, exc)
+        return True
+
+    def _check_volatility_cooldown(self, current_price: float, pair: str) -> None:
+        if self.config.volatility_cooldown_pct <= 0:
+            return
+        history = self._price_history.get(pair, [])
+        if len(history) < 2:
+            return
+        window_start = history[0][1]
+        if window_start <= 0:
+            return
+        spike = abs(current_price - window_start) / window_start
+        if spike >= self.config.volatility_cooldown_pct:
+            self._volatility_cooldown_until = time.time() + self.config.volatility_cooldown_seconds
+            logger.warning(
+                "Volatility cooldown triggered on %s: spike=%.2f%% — pausing for %.0fs",
+                pair, spike * 100, self.config.volatility_cooldown_seconds,
+            )
 
     def _reconcile_with_api(self, pair: str) -> None:
         """Cross-check the saved position against the real Indodax account balance.
@@ -766,6 +823,17 @@ class Trader:
         decision: StrategyDecision = snapshot["decision"]
         price = snapshot["price"]
 
+        # Circuit breaker
+        if self.config.circuit_breaker_max_errors > 0 and time.time() < self._circuit_breaker_until:
+            return {"status": "circuit_breaker", "reason": "circuit_breaker_active", "portfolio": self.tracker.as_dict(price)}
+
+        # Volatility cooldown
+        if time.time() < self._volatility_cooldown_until:
+            return {"status": "volatility_cooldown", "reason": "volatility_cooldown_active", "portfolio": self.tracker.as_dict(price)}
+
+        # Update volatility cooldown state
+        self._check_volatility_cooldown(price, snapshot["pair"])
+
         # Update trailing stop before checking stop conditions
         if self.config.trailing_stop_pct > 0:
             self.tracker.update_trailing_stop(price, self.config.trailing_stop_pct)
@@ -863,6 +931,22 @@ class Trader:
                     "portfolio": self.tracker.as_dict(price),
                 }
 
+        # Consecutive loss protection
+        if self.config.max_consecutive_losses > 0 and decision.action == "buy":
+            if self.tracker.loss_streak >= self.config.max_consecutive_losses:
+                return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": self.tracker.as_dict(price)}
+
+        # Flash dump protection
+        if self.config.flash_dump_pct > 0 and decision.action == "buy":
+            pair_history = self._price_history.get(snapshot["pair"], [])
+            dump = detect_flash_dump(pair_history, self.config.flash_dump_lookback_seconds, self.config.flash_dump_pct)
+            if dump.detected:
+                return {"status": "skipped", "reason": f"flash_dump drop={dump.drop_pct:.2%}", "portfolio": self.tracker.as_dict(price)}
+
+        # Strategy disabled check
+        if decision.action == "buy" and self.tracker.is_strategy_disabled(decision.mode):
+            return {"status": "skipped", "reason": "strategy_disabled", "portfolio": self.tracker.as_dict(price)}
+
         if self.config.grid_enabled and snapshot.get("grid_plan"):
             return self._execute_grid(snapshot)
 
@@ -915,6 +999,19 @@ class Trader:
                     ),
                     "portfolio": self.tracker.as_dict(price),
                 }
+
+        # Spread anomaly detection
+        if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
+            live_spread_pct = (top_ask - top_bid) / top_bid
+            pair_key = snapshot["pair"]
+            if pair_key not in self._spread_history:
+                self._spread_history[pair_key] = []
+            self._spread_history[pair_key].append(live_spread_pct)
+            self._spread_history[pair_key] = self._spread_history[pair_key][-50:]
+            recent_spreads = self._spread_history[pair_key][:-1]  # exclude current
+            anomaly = detect_spread_anomaly(live_spread_pct, recent_spreads, self.config.spread_anomaly_multiplier)
+            if anomaly.detected:
+                return {"status": "skipped", "reason": f"spread_anomaly ratio={anomaly.ratio:.2f}x", "portfolio": self.tracker.as_dict(price)}
 
         # ── Sell-wall / orderbook wall guard ─────────────────────────────────
         # Skip buy when aggregate ask-side volume dominates bid-side volume by
@@ -1068,6 +1165,11 @@ class Trader:
 
         staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
 
+        if not self._validate_balance(snapshot["pair"], decision.action, effective_amount, reference_price):
+            return {"status": "skipped", "reason": "balance_check_failed", "portfolio": self.tracker.as_dict(price)}
+
+        _pre_trade_avg_cost = self.tracker.avg_cost
+
         executed_steps: List[Dict[str, Any]] = []
         remaining_amount = effective_amount
         if self.config.dry_run:
@@ -1102,6 +1204,28 @@ class Trader:
                 "portfolio": self.tracker.as_dict(reference_price),
             }
             self._persist_after_trade(snapshot["pair"])
+            # Journal logging
+            if self.journal is not None:
+                import datetime as _dt
+                _ts = time.time()
+                _dt_str = _dt.datetime.fromtimestamp(_ts).strftime("%Y-%m-%d %H:%M:%S")
+                _pnl = (reference_price - _pre_trade_avg_cost) * effective_amount if decision.action == "sell" else 0.0
+                self.journal.log_trade(
+                    timestamp=_ts,
+                    datetime_str=_dt_str,
+                    pair=snapshot["pair"],
+                    action=decision.action,
+                    price=reference_price,
+                    amount=sum(step["amount"] for step in executed_steps),
+                    idr_value=reference_price * sum(step["amount"] for step in executed_steps),
+                    pnl=_pnl,
+                    strategy=decision.mode,
+                    confidence=decision.confidence,
+                    reason=decision.reason,
+                    avg_cost=self.tracker.avg_cost,
+                    equity=self.tracker.snapshot(reference_price).equity,
+                )
+            self._consecutive_errors = 0
             return outcome
 
         # live trading path
@@ -1122,7 +1246,15 @@ class Trader:
                     snapshot["pair"],
                 )
                 continue
-            order_resp = self.client.create_order(snapshot["pair"], decision.action, reference_price, step_amount)
+            try:
+                order_resp = self.client.create_order(snapshot["pair"], decision.action, reference_price, step_amount)
+                self._consecutive_errors = 0
+            except Exception as exc:
+                self._consecutive_errors += 1
+                if self.config.circuit_breaker_max_errors > 0 and self._consecutive_errors >= self.config.circuit_breaker_max_errors:
+                    self._circuit_breaker_until = time.time() + self.config.circuit_breaker_pause_seconds
+                    logger.warning("Circuit breaker triggered after %d errors: %s", self._consecutive_errors, exc)
+                raise
             self.tracker.record_trade(decision.action, reference_price, step_amount)
             remaining_amount -= step_amount
             executed_steps.append({"amount": step_amount, "price": reference_price, "order": order_resp})
@@ -1143,6 +1275,34 @@ class Trader:
             "portfolio": self.tracker.as_dict(reference_price),
         }
         self._persist_after_trade(snapshot["pair"])
+        # Journal logging
+        if self.journal is not None:
+            import datetime as _dt
+            _ts = time.time()
+            _dt_str = _dt.datetime.fromtimestamp(_ts).strftime("%Y-%m-%d %H:%M:%S")
+            _pnl = (reference_price - _pre_trade_avg_cost) * effective_amount if decision.action == "sell" else 0.0
+            self.journal.log_trade(
+                timestamp=_ts,
+                datetime_str=_dt_str,
+                pair=snapshot["pair"],
+                action=decision.action,
+                price=reference_price,
+                amount=sum(step["amount"] for step in executed_steps),
+                idr_value=reference_price * sum(step["amount"] for step in executed_steps),
+                pnl=_pnl,
+                strategy=decision.mode,
+                confidence=decision.confidence,
+                reason=decision.reason,
+                avg_cost=self.tracker.avg_cost,
+                equity=self.tracker.snapshot(reference_price).equity,
+            )
+        # Strategy auto-disable after sell
+        if decision.action == "sell" and self.config.strategy_auto_disable_losses > 0:
+            strat_data = self.tracker._strategy_stats.get(decision.mode, {})
+            losses_count = strat_data.get("consecutive_losses", 0)
+            if losses_count >= self.config.strategy_auto_disable_losses:
+                self.tracker.disable_strategy(decision.mode)
+                logger.warning("Strategy %s auto-disabled after %d consecutive losses", decision.mode, losses_count)
         return outcome
 
     def _execute_grid(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:

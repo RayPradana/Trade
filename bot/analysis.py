@@ -852,3 +852,184 @@ def smart_entry_filter(
         whale_pressure=detect_whale_pressure(depth, whale_pressure_min),
         fake_breakout=detect_fake_breakout(candles, current_price, levels, breakout_volume_min),
     )
+
+
+# ---------------------------------------------------------------------------
+# Market Regime Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MarketRegime:
+    regime: str  # "trending_up", "trending_down", "ranging", "volatile"
+    strength: float  # 0..1
+    description: str
+
+
+def detect_market_regime(
+    candles: Sequence[Candle],
+    trend: TrendResult,
+    vol: VolatilityStats,
+) -> MarketRegime:
+    """Classify the current market regime."""
+    if vol.volatility > 0.04:
+        strength = min(1.0, vol.volatility / 0.1)
+        return MarketRegime(
+            regime="volatile",
+            strength=round(strength, 4),
+            description=f"High volatility {vol.volatility:.4f}",
+        )
+    if trend.direction == "up" and trend.strength > 0.01 and vol.volatility < 0.03:
+        strength = min(1.0, trend.strength * 10)
+        return MarketRegime(
+            regime="trending_up",
+            strength=round(strength, 4),
+            description=f"Uptrend strength={trend.strength:.4f}",
+        )
+    if trend.direction == "down" and trend.strength > 0.01 and vol.volatility < 0.03:
+        strength = min(1.0, trend.strength * 10)
+        return MarketRegime(
+            regime="trending_down",
+            strength=round(strength, 4),
+            description=f"Downtrend strength={trend.strength:.4f}",
+        )
+    return MarketRegime(
+        regime="ranging",
+        strength=round(max(0.0, 1.0 - trend.strength * 10), 4),
+        description=f"Ranging/flat trend={trend.direction} vol={vol.volatility:.4f}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Spread Anomaly Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SpreadAnomaly:
+    detected: bool
+    current_spread_pct: float
+    avg_spread_pct: float
+    ratio: float  # current/avg
+
+
+def detect_spread_anomaly(
+    current_spread_pct: float,
+    recent_spreads: Sequence[float],
+    multiplier: float = 3.0,
+) -> SpreadAnomaly:
+    """Detect abnormal spread widening vs recent history."""
+    if not recent_spreads:
+        return SpreadAnomaly(
+            detected=False,
+            current_spread_pct=current_spread_pct,
+            avg_spread_pct=0.0,
+            ratio=0.0,
+        )
+    avg = mean(list(recent_spreads))
+    ratio = current_spread_pct / avg if avg > 0 else 0.0
+    detected = avg > 0 and ratio >= multiplier
+    return SpreadAnomaly(
+        detected=detected,
+        current_spread_pct=current_spread_pct,
+        avg_spread_pct=avg,
+        ratio=round(ratio, 4),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orderbook Absorption Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OrderbookAbsorption:
+    detected: bool
+    side: Optional[str]  # "bid" or "ask"
+    absorption_ratio: float  # how much of the wall has been absorbed
+
+
+def detect_orderbook_absorption(
+    depth_before: Dict[str, object],
+    depth_after: Dict[str, object],
+    threshold: float = 0.5,
+) -> OrderbookAbsorption:
+    """Detect when a large orderbook wall is being consumed by market orders."""
+    no_detection = OrderbookAbsorption(detected=False, side=None, absorption_ratio=0.0)
+
+    def _top_volume(depth: Dict[str, object], key: str) -> float:
+        levels = depth.get(key) or []
+        if not levels:
+            return 0.0
+        try:
+            return float(levels[0][1])
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    bid_before = _top_volume(depth_before, "buy")
+    bid_after = _top_volume(depth_after, "buy")
+    ask_before = _top_volume(depth_before, "sell")
+    ask_after = _top_volume(depth_after, "sell")
+
+    best_ratio = 0.0
+    best_side = None
+
+    if bid_before > 0:
+        bid_absorbed = (bid_before - bid_after) / bid_before
+        if bid_absorbed > best_ratio:
+            best_ratio = bid_absorbed
+            best_side = "bid"
+
+    if ask_before > 0:
+        ask_absorbed = (ask_before - ask_after) / ask_before
+        if ask_absorbed > best_ratio:
+            best_ratio = ask_absorbed
+            best_side = "ask"
+
+    detected = best_ratio >= threshold
+    return OrderbookAbsorption(
+        detected=detected,
+        side=best_side if detected else None,
+        absorption_ratio=round(best_ratio, 4),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Flash Dump Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FlashDumpSignal:
+    detected: bool
+    drop_pct: float  # price drop fraction in lookback window
+    duration_seconds: float
+
+
+def detect_flash_dump(
+    price_history: Sequence[tuple],  # (timestamp, price) pairs
+    lookback_seconds: float = 60.0,
+    min_drop_pct: float = 0.05,
+) -> FlashDumpSignal:
+    """Detect a sudden large price drop (flash dump / crash)."""
+    no_signal = FlashDumpSignal(detected=False, drop_pct=0.0, duration_seconds=0.0)
+    if not price_history:
+        return no_signal
+
+    price_list = list(price_history)
+    now = price_list[-1][0]
+    cutoff = now - lookback_seconds
+    window = [(ts, p) for ts, p in price_list if ts >= cutoff]
+
+    if len(window) < 2:
+        return no_signal
+
+    peak_price = max(p for _, p in window)
+    current_price = window[-1][1]
+    if peak_price <= 0:
+        return no_signal
+
+    drop = (peak_price - current_price) / peak_price
+    duration = window[-1][0] - window[0][0]
+    detected = drop >= min_drop_pct
+    return FlashDumpSignal(
+        detected=detected,
+        drop_pct=round(drop, 4),
+        duration_seconds=round(duration, 2),
+    )

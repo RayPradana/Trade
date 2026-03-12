@@ -347,3 +347,78 @@ class DynamicTpConfigTest(TestCase):
         with patch.dict(os.environ, {"MAX_SPREAD_PCT": "-0.001"}, clear=True):
             with self.assertRaises(ValueError):
                 BotConfig.from_env()
+
+
+class ConfigNewFieldsTest(TestCase):
+    def test_new_fields_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.max_consecutive_losses, 0)
+            self.assertEqual(cfg.volatility_cooldown_pct, 0.0)
+            self.assertEqual(cfg.volatility_cooldown_seconds, 0.0)
+            self.assertEqual(cfg.circuit_breaker_max_errors, 0)
+            self.assertAlmostEqual(cfg.circuit_breaker_pause_seconds, 300.0)
+            self.assertFalse(cfg.balance_check_enabled)
+            self.assertEqual(cfg.stale_order_seconds, 0.0)
+            self.assertEqual(cfg.strategy_auto_disable_losses, 0)
+            self.assertEqual(cfg.partial_tp2_fraction, 0.0)
+            self.assertEqual(cfg.partial_tp2_target_pct, 0.0)
+            self.assertIsNone(cfg.journal_path)
+            self.assertEqual(cfg.max_open_positions, 0)
+            self.assertEqual(cfg.spread_anomaly_multiplier, 0.0)
+            self.assertEqual(cfg.orderbook_absorption_threshold, 0.0)
+            self.assertEqual(cfg.flash_dump_pct, 0.0)
+            self.assertAlmostEqual(cfg.flash_dump_lookback_seconds, 60.0)
+
+    def test_new_fields_from_env(self):
+        env = {
+            "MAX_CONSECUTIVE_LOSSES": "3",
+            "VOLATILITY_COOLDOWN_PCT": "0.05",
+            "VOLATILITY_COOLDOWN_SECONDS": "300",
+            "CIRCUIT_BREAKER_MAX_ERRORS": "5",
+            "CIRCUIT_BREAKER_PAUSE_SECONDS": "600",
+            "BALANCE_CHECK_ENABLED": "true",
+            "STALE_ORDER_SECONDS": "120",
+            "STRATEGY_AUTO_DISABLE_LOSSES": "3",
+            "PARTIAL_TP2_FRACTION": "0.3",
+            "PARTIAL_TP2_TARGET_PCT": "0.05",
+            "JOURNAL_PATH": "/tmp/journal.csv",
+            "MAX_OPEN_POSITIONS": "5",
+            "SPREAD_ANOMALY_MULTIPLIER": "3.0",
+            "ORDERBOOK_ABSORPTION_THRESHOLD": "0.5",
+            "FLASH_DUMP_PCT": "0.05",
+            "FLASH_DUMP_LOOKBACK_SECONDS": "120",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.max_consecutive_losses, 3)
+            self.assertAlmostEqual(cfg.volatility_cooldown_pct, 0.05)
+            self.assertAlmostEqual(cfg.volatility_cooldown_seconds, 300.0)
+            self.assertEqual(cfg.circuit_breaker_max_errors, 5)
+            self.assertAlmostEqual(cfg.circuit_breaker_pause_seconds, 600.0)
+            self.assertTrue(cfg.balance_check_enabled)
+            self.assertAlmostEqual(cfg.stale_order_seconds, 120.0)
+            self.assertEqual(cfg.strategy_auto_disable_losses, 3)
+            self.assertAlmostEqual(cfg.partial_tp2_fraction, 0.3)
+            self.assertAlmostEqual(cfg.partial_tp2_target_pct, 0.05)
+            self.assertEqual(cfg.journal_path, "/tmp/journal.csv")
+            self.assertEqual(cfg.max_open_positions, 5)
+            self.assertAlmostEqual(cfg.spread_anomaly_multiplier, 3.0)
+            self.assertAlmostEqual(cfg.orderbook_absorption_threshold, 0.5)
+            self.assertAlmostEqual(cfg.flash_dump_pct, 0.05)
+            self.assertAlmostEqual(cfg.flash_dump_lookback_seconds, 120.0)
+
+    def test_validation_negative_max_consecutive_losses(self):
+        cfg = BotConfig(api_key=None, max_consecutive_losses=-1)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_validation_invalid_partial_tp2_fraction(self):
+        cfg = BotConfig(api_key=None, partial_tp2_fraction=1.5)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_validation_flash_dump_lookback_zero(self):
+        cfg = BotConfig(api_key=None, flash_dump_lookback_seconds=0.0)
+        with self.assertRaises(ValueError):
+            cfg._validate()

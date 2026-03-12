@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Dict, Optional
+
+if TYPE_CHECKING:
+    from .analysis import MarketRegime
 
 from .analysis import (
     MomentumIndicators,
@@ -42,7 +45,81 @@ class StrategyDecision:
     partial_tp_fraction: float = 0.0
 
 
-def select_strategy(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> str:
+@dataclass
+class StrategyScore:
+    strategy: str
+    score: float
+    enabled: bool
+
+
+def score_strategies(
+    trend: TrendResult,
+    orderbook: OrderbookInsight,
+    vol: VolatilityStats,
+    regime: Optional["MarketRegime"] = None,
+) -> Dict[str, float]:
+    """Score each strategy 0..1 based on current market conditions."""
+    scores: Dict[str, float] = {
+        "scalping": 0.0,
+        "day_trading": 0.0,
+        "swing_trading": 0.0,
+        "position_trading": 0.0,
+    }
+    # Scalping: tight spread, strong imbalance, low volatility
+    if orderbook.spread_pct < SCALP_SPREAD_THRESHOLD:
+        scores["scalping"] += 0.5
+    if abs(orderbook.imbalance) > 0.25:
+        scores["scalping"] += 0.3
+    if vol.volatility < 0.01:
+        scores["scalping"] += 0.2
+
+    # Day trading: trending with moderate volatility
+    if trend.direction != "flat":
+        scores["day_trading"] += 0.4
+    if 0.01 <= vol.volatility <= 0.03:
+        scores["day_trading"] += 0.4
+    if trend.strength > 0.01:
+        scores["day_trading"] += 0.2
+
+    # Swing trading: strong trend with higher volatility
+    if trend.direction != "flat" and trend.strength > 0.01:
+        scores["swing_trading"] += 0.5
+    if vol.volatility > 0.015:
+        scores["swing_trading"] += 0.3
+    if trend.strength > 0.02:
+        scores["swing_trading"] += 0.2
+
+    # Position trading: always gets a baseline
+    scores["position_trading"] = 0.3
+
+    # Regime adjustments
+    if regime is not None:
+        if regime.regime == "volatile":
+            scores["position_trading"] += 0.4
+            scores["scalping"] *= 0.3
+            scores["day_trading"] *= 0.5
+        elif regime.regime == "ranging":
+            scores["scalping"] += 0.3
+            scores["position_trading"] *= 0.7
+
+    # Clamp all scores
+    for k in scores:
+        scores[k] = round(min(1.0, max(0.0, scores[k])), 4)
+    return scores
+
+
+def select_strategy(
+    trend: TrendResult,
+    orderbook: OrderbookInsight,
+    vol: VolatilityStats,
+    regime: Optional["MarketRegime"] = None,
+) -> str:
+    # regime-based override
+    if regime is not None:
+        if regime.regime == "volatile":
+            return "position_trading"
+        if regime.regime == "ranging":
+            return "scalping"
     if (
         orderbook.spread_pct < SCALP_SPREAD_THRESHOLD
         and abs(orderbook.imbalance) > 0.25

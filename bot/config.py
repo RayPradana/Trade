@@ -218,6 +218,34 @@ class BotConfig:
     # The value can be raised above the exchange minimum if desired (e.g. to
     # avoid wasting fees on very small trades).  Must be > 0.
     min_order_idr: float = 10_000.0
+    # Consecutive loss protection
+    max_consecutive_losses: int = 0  # 0=disabled; stop trading after N losing sells in a row
+    # Volatility cooldown
+    volatility_cooldown_pct: float = 0.0  # 0=disabled; e.g. 0.05 = 5% price spike
+    volatility_cooldown_seconds: float = 0.0  # e.g. 300 = 5 min pause after spike
+    # Circuit breaker
+    circuit_breaker_max_errors: int = 0  # 0=disabled; pause after N consecutive API errors
+    circuit_breaker_pause_seconds: float = 300.0  # duration of circuit-breaker pause
+    # Balance validation
+    balance_check_enabled: bool = False
+    # Stale order cancellation
+    stale_order_seconds: float = 0.0
+    # Strategy auto-disable
+    strategy_auto_disable_losses: int = 0
+    # Multi-level partial take profit (2nd level)
+    partial_tp2_fraction: float = 0.0  # fraction to sell at 2nd TP (0=disabled)
+    partial_tp2_target_pct: float = 0.0  # price must rise this % above buy price to trigger 2nd TP
+    # Trade journal path (CSV file path; None = disabled)
+    journal_path: Optional[str] = None
+    # Max open positions across all pairs (0=no limit)
+    max_open_positions: int = 0
+    # Spread anomaly filter
+    spread_anomaly_multiplier: float = 0.0
+    # Orderbook absorption detection threshold (0=disabled)
+    orderbook_absorption_threshold: float = 0.0
+    # Flash dump protection
+    flash_dump_pct: float = 0.0
+    flash_dump_lookback_seconds: float = 60.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -306,6 +334,22 @@ class BotConfig:
             see_breakout_volume_min=float(os.getenv("SEE_BREAKOUT_VOLUME_MIN", "0.7")),
             fake_pump_reversal_pct=float(os.getenv("FAKE_PUMP_REVERSAL_PCT", "0")),
             min_order_idr=float(os.getenv("MIN_ORDER_IDR", "10000")),
+            max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0")),
+            volatility_cooldown_pct=float(os.getenv("VOLATILITY_COOLDOWN_PCT", "0")),
+            volatility_cooldown_seconds=float(os.getenv("VOLATILITY_COOLDOWN_SECONDS", "0")),
+            circuit_breaker_max_errors=int(os.getenv("CIRCUIT_BREAKER_MAX_ERRORS", "0")),
+            circuit_breaker_pause_seconds=float(os.getenv("CIRCUIT_BREAKER_PAUSE_SECONDS", "300")),
+            balance_check_enabled=os.getenv("BALANCE_CHECK_ENABLED", "false").lower() in {"1", "true", "yes"},
+            stale_order_seconds=float(os.getenv("STALE_ORDER_SECONDS", "0")),
+            strategy_auto_disable_losses=int(os.getenv("STRATEGY_AUTO_DISABLE_LOSSES", "0")),
+            partial_tp2_fraction=float(os.getenv("PARTIAL_TP2_FRACTION", "0")),
+            partial_tp2_target_pct=float(os.getenv("PARTIAL_TP2_TARGET_PCT", "0")),
+            journal_path=os.getenv("JOURNAL_PATH") or None,
+            max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "0")),
+            spread_anomaly_multiplier=float(os.getenv("SPREAD_ANOMALY_MULTIPLIER", "0")),
+            orderbook_absorption_threshold=float(os.getenv("ORDERBOOK_ABSORPTION_THRESHOLD", "0")),
+            flash_dump_pct=float(os.getenv("FLASH_DUMP_PCT", "0")),
+            flash_dump_lookback_seconds=float(os.getenv("FLASH_DUMP_LOOKBACK_SECONDS", "60")),
         )
         cfg._validate()
         return cfg
@@ -408,5 +452,33 @@ class BotConfig:
             raise ValueError("FAKE_PUMP_REVERSAL_PCT must be non-negative")
         if self.min_order_idr <= 0:
             raise ValueError("MIN_ORDER_IDR must be positive")
+        if self.max_consecutive_losses < 0:
+            raise ValueError("MAX_CONSECUTIVE_LOSSES must be non-negative")
+        if self.volatility_cooldown_pct < 0:
+            raise ValueError("VOLATILITY_COOLDOWN_PCT must be non-negative")
+        if self.volatility_cooldown_seconds < 0:
+            raise ValueError("VOLATILITY_COOLDOWN_SECONDS must be non-negative")
+        if self.circuit_breaker_max_errors < 0:
+            raise ValueError("CIRCUIT_BREAKER_MAX_ERRORS must be non-negative")
+        if self.circuit_breaker_pause_seconds < 0:
+            raise ValueError("CIRCUIT_BREAKER_PAUSE_SECONDS must be non-negative")
+        if self.stale_order_seconds < 0:
+            raise ValueError("STALE_ORDER_SECONDS must be non-negative")
+        if self.strategy_auto_disable_losses < 0:
+            raise ValueError("STRATEGY_AUTO_DISABLE_LOSSES must be non-negative")
+        if not (0.0 <= self.partial_tp2_fraction < 1.0):
+            raise ValueError("PARTIAL_TP2_FRACTION must be in [0, 1)")
+        if self.partial_tp2_target_pct < 0:
+            raise ValueError("PARTIAL_TP2_TARGET_PCT must be non-negative")
+        if self.max_open_positions < 0:
+            raise ValueError("MAX_OPEN_POSITIONS must be non-negative")
+        if self.spread_anomaly_multiplier < 0:
+            raise ValueError("SPREAD_ANOMALY_MULTIPLIER must be non-negative")
+        if self.orderbook_absorption_threshold < 0:
+            raise ValueError("ORDERBOOK_ABSORPTION_THRESHOLD must be non-negative")
+        if self.flash_dump_pct < 0:
+            raise ValueError("FLASH_DUMP_PCT must be non-negative")
+        if self.flash_dump_lookback_seconds <= 0:
+            raise ValueError("FLASH_DUMP_LOOKBACK_SECONDS must be positive")
         if not self.dry_run and not self.api_key:
             self.require_auth()

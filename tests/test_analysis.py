@@ -10,6 +10,16 @@ from bot.analysis import (
     derive_indicators,
     moving_average,
     support_resistance,
+    detect_market_regime,
+    detect_spread_anomaly,
+    detect_orderbook_absorption,
+    detect_flash_dump,
+    MarketRegime,
+    SpreadAnomaly,
+    OrderbookAbsorption,
+    FlashDumpSignal,
+    TrendResult,
+    VolatilityStats,
 )
 
 
@@ -78,6 +88,57 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(0 <= indicators.rsi <= 100)
         # MACD histogram should be finite
         self.assertFalse(math.isnan(indicators.macd_hist))
+
+    def test_detect_market_regime_trending(self) -> None:
+        candles = [Candle(i, i, i, i, i, 1.0) for i in range(1, 11)]
+        trend = TrendResult(direction="up", fast_ma=10.0, slow_ma=8.0, strength=0.05)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1.0)
+        regime = detect_market_regime(candles, trend, vol)
+        self.assertEqual(regime.regime, "trending_up")
+        self.assertGreater(regime.strength, 0)
+
+    def test_detect_market_regime_volatile(self) -> None:
+        candles = [Candle(i, i, i, i, i, 1.0) for i in range(1, 11)]
+        trend = TrendResult(direction="up", fast_ma=10.0, slow_ma=8.0, strength=0.05)
+        vol = VolatilityStats(volatility=0.06, avg_volume=1.0)
+        regime = detect_market_regime(candles, trend, vol)
+        self.assertEqual(regime.regime, "volatile")
+
+    def test_detect_market_regime_ranging(self) -> None:
+        candles = [Candle(i, i, i, i, i, 1.0) for i in range(1, 11)]
+        trend = TrendResult(direction="flat", fast_ma=10.0, slow_ma=10.0, strength=0.001)
+        vol = VolatilityStats(volatility=0.005, avg_volume=1.0)
+        regime = detect_market_regime(candles, trend, vol)
+        self.assertEqual(regime.regime, "ranging")
+
+    def test_detect_spread_anomaly_detected(self) -> None:
+        recent = [0.001, 0.001, 0.001, 0.001, 0.001]
+        anomaly = detect_spread_anomaly(0.005, recent, multiplier=3.0)
+        self.assertTrue(anomaly.detected)
+        self.assertGreater(anomaly.ratio, 3.0)
+
+    def test_detect_spread_anomaly_normal(self) -> None:
+        recent = [0.001, 0.001, 0.001]
+        anomaly = detect_spread_anomaly(0.001, recent, multiplier=3.0)
+        self.assertFalse(anomaly.detected)
+
+    def test_detect_orderbook_absorption(self) -> None:
+        before = {"buy": [["100", "10.0"]], "sell": [["101", "5.0"]]}
+        after = {"buy": [["100", "1.0"]], "sell": [["101", "5.0"]]}
+        result = detect_orderbook_absorption(before, after, threshold=0.5)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.side, "bid")
+
+    def test_detect_flash_dump_detected(self) -> None:
+        history = [(i * 10.0, 100.0 - i) for i in range(10)]
+        # last entry: (90, 91) - peak is 100 at t=0, drop = 9/100 = 9%
+        result = detect_flash_dump(history, lookback_seconds=100.0, min_drop_pct=0.05)
+        self.assertTrue(result.detected)
+
+    def test_detect_flash_dump_normal(self) -> None:
+        history = [(i * 10.0, 100.0) for i in range(10)]
+        result = detect_flash_dump(history, lookback_seconds=100.0, min_drop_pct=0.05)
+        self.assertFalse(result.detected)
 
 
 class OhlcHelpersTests(unittest.TestCase):

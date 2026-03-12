@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from statistics import mean
+from typing import Dict, List, Optional, Set
 
 
 @dataclass
@@ -74,6 +75,11 @@ class PortfolioTracker:
         self._tp_activated: bool = False
         self._trailing_tp_stop: Optional[float] = None
         self._trailing_tp_peak: Optional[float] = None
+        # Loss streak and strategy stats
+        self.loss_streak: int = 0
+        self._all_sell_pnls: List[float] = []
+        self._strategy_stats: Dict[str, Dict] = {}
+        self._disabled_strategies: Set[str] = set()
 
     @property
     def profit_buffer(self) -> float:
@@ -128,6 +134,13 @@ class PortfolioTracker:
             self.total_sell_count += 1
             if price > self.avg_cost:
                 self.profitable_sells += 1
+            # Track pnl for loss streak and profit metrics
+            _pnl = (price - self.avg_cost) * sell_qty
+            self._all_sell_pnls.append(_pnl)
+            if _pnl > 0:
+                self.loss_streak = 0
+            else:
+                self.loss_streak += 1
             self.base_position -= sell_qty
             self.last_sell_price = price
             self.last_sell_time = time.time()
@@ -245,6 +258,12 @@ class PortfolioTracker:
         ttp_peak = state.get("trailing_tp_peak")
         if ttp_peak is not None:
             self._trailing_tp_peak = float(ttp_peak)
+        # Restore loss streak and strategy stats
+        self.loss_streak = int(state.get("loss_streak", 0))
+        self._all_sell_pnls = list(state.get("all_sell_pnls", []))
+        self._strategy_stats = dict(state.get("strategy_stats", {}))
+        disabled = state.get("disabled_strategies", [])
+        self._disabled_strategies = set(disabled) if disabled else set()
         # target/min equity recomputed from initial_capital to keep guard consistent
 
     def stop_reason(self, mark_price: float) -> Optional[str]:
@@ -325,6 +344,10 @@ class PortfolioTracker:
             "tp_activated": self._tp_activated,
             "trailing_tp_stop": self._trailing_tp_stop,
             "trailing_tp_peak": self._trailing_tp_peak,
+            "loss_streak": self.loss_streak,
+            "all_sell_pnls": self._all_sell_pnls,
+            "strategy_stats": self._strategy_stats,
+            "disabled_strategies": list(self._disabled_strategies),
         }
 
     # ── Daily loss cap helpers ────────────────────────────────────────────
@@ -397,3 +420,55 @@ class PortfolioTracker:
             if current_price > required_price:
                 return False
         return True
+
+    def record_trade_with_strategy(
+        self,
+        action: str,
+        price: float,
+        amount: float,
+        strategy: str,
+        pnl_override: Optional[float] = None,
+    ) -> None:
+        """Record a trade and update per-strategy stats."""
+        saved_avg_cost = self.avg_cost
+        saved_position = self.base_position
+        self.record_trade(action, price, amount)
+        if action == "sell":
+            sell_qty = min(amount, saved_position)
+            pnl = pnl_override if pnl_override is not None else (price - saved_avg_cost) * sell_qty
+            if strategy not in self._strategy_stats:
+                self._strategy_stats[strategy] = {
+                    "wins": 0,
+                    "losses": 0,
+                    "total_pnl": 0.0,
+                    "consecutive_losses": 0,
+                }
+            st = self._strategy_stats[strategy]
+            st["total_pnl"] += pnl
+            if pnl > 0:
+                st["wins"] += 1
+                st["consecutive_losses"] = 0
+            else:
+                st["losses"] += 1
+                st["consecutive_losses"] = st.get("consecutive_losses", 0) + 1
+
+    @property
+    def profit_factor(self) -> float:
+        gross_profit = sum(p for p in self._all_sell_pnls if p > 0)
+        gross_loss = abs(sum(p for p in self._all_sell_pnls if p < 0))
+        return gross_profit / gross_loss if gross_loss > 0 else 0.0
+
+    @property
+    def expectancy(self) -> float:
+        return mean(self._all_sell_pnls) if self._all_sell_pnls else 0.0
+
+    def strategy_stats(self, strategy: str) -> Dict:
+        st = self._strategy_stats.get(strategy, {"wins": 0, "losses": 0, "total_pnl": 0.0})
+        total = st["wins"] + st["losses"]
+        return {**st, "win_rate": st["wins"] / total if total > 0 else 0.0}
+
+    def disable_strategy(self, strategy: str) -> None:
+        self._disabled_strategies.add(strategy)
+
+    def is_strategy_disabled(self, strategy: str) -> bool:
+        return strategy in self._disabled_strategies

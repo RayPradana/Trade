@@ -85,6 +85,45 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(tracker2.total_sell_count, tracker.total_sell_count)
         self.assertAlmostEqual(tracker2._trailing_stop, tracker.trailing_stop)
 
+    def test_loss_streak_increments(self) -> None:
+        tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.5, max_loss_pct=0.5)
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 90, 1)  # loss
+        self.assertEqual(tracker.loss_streak, 1)
+
+    def test_loss_streak_resets_on_win(self) -> None:
+        tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.5, max_loss_pct=0.5)
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 90, 1)  # loss
+        self.assertEqual(tracker.loss_streak, 1)
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 110, 1)  # win
+        self.assertEqual(tracker.loss_streak, 0)
+
+    def test_profit_factor(self) -> None:
+        tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.5, max_loss_pct=0.5)
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 110, 1)  # win +10
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 95, 1)   # loss -5
+        pf = tracker.profit_factor
+        self.assertAlmostEqual(pf, 2.0)
+
+    def test_expectancy(self) -> None:
+        tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.5, max_loss_pct=0.5)
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 110, 1)  # pnl = 10
+        tracker.record_trade("buy", 100, 1)
+        tracker.record_trade("sell", 90, 1)   # pnl = -10
+        self.assertAlmostEqual(tracker.expectancy, 0.0)
+
+    def test_strategy_disable(self) -> None:
+        tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.5, max_loss_pct=0.5)
+        self.assertFalse(tracker.is_strategy_disabled("scalping"))
+        tracker.disable_strategy("scalping")
+        self.assertTrue(tracker.is_strategy_disabled("scalping"))
+        self.assertFalse(tracker.is_strategy_disabled("day_trading"))
+
 
 if __name__ == "__main__":
     unittest.main()

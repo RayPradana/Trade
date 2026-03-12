@@ -13,6 +13,7 @@ import requests
 
 from bot.config import BotConfig
 from bot.trader import Trader
+from bot.journal import TradeJournal
 
 # ── ANSI codes — disabled when stdout is not a terminal ─────────────────
 _USE_COLOR = sys.stdout.isatty()
@@ -599,6 +600,9 @@ def main() -> None:
         config.require_auth()
 
     trader = Trader(config)
+    journal = TradeJournal(config.journal_path) if config.journal_path else TradeJournal()
+    if hasattr(trader, 'set_journal'):
+        trader.set_journal(journal)
     _log_startup_banner(config)
 
     # ── Account info / balance (live mode only) ──────────────────────────
@@ -885,6 +889,7 @@ def main() -> None:
                 portfolio["trade_count"],
                 portfolio["win_rate"] * 100,
             )
+            logging.info("📓 %s", journal.summary_str())
 
         # Periodic state backup every N scan cycles
         if (
@@ -906,4 +911,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _MAX_RESTARTS = 10
+    _RESTART_BACKOFF = [5, 10, 30, 60, 120]
+    _restart_count = 0
+    while _restart_count <= _MAX_RESTARTS:
+        try:
+            main()
+            break
+        except KeyboardInterrupt:
+            break
+        except Exception as _exc:
+            _restart_count += 1
+            _wait = _RESTART_BACKOFF[min(_restart_count - 1, len(_RESTART_BACKOFF) - 1)]
+            logging.getLogger(__name__).error(
+                "Bot crashed (attempt %d): %s — restarting in %ds",
+                _restart_count, _exc, _wait,
+            )
+            time.sleep(_wait)
