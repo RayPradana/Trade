@@ -1861,6 +1861,17 @@ class Trader:
                     best_hold_pair = pair
                     best_hold_snapshot = snapshot
                 continue
+            # A SELL signal is only actionable when we actually hold a position.
+            # Without one, it would be immediately skipped in maybe_execute, so
+            # treat it as "hold" here so the scanner continues looking for BUY
+            # opportunities on other pairs instead of returning early.
+            if decision.action == "sell" and self.tracker.base_position <= 0:
+                score = self._score_snapshot(snapshot)
+                if score > best_hold_score:
+                    best_hold_score = score
+                    best_hold_pair = pair
+                    best_hold_snapshot = snapshot
+                continue
             score = self._score_snapshot(snapshot)
             if score > best_score:
                 best_score = score

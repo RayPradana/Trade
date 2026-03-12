@@ -251,6 +251,57 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(pair, "fallback_idr")
         self.assertEqual(snapshot["decision"].action, "buy")
 
+    def test_scan_and_choose_ignores_sell_when_no_position(self) -> None:
+        """A SELL signal must not be returned by scan_and_choose when the bot
+        holds no open position.  Without this guard the scanner would lock onto
+        the first overbought pair every cycle, skip it as "insufficient
+        position" in maybe_execute, and never look for a BUY opportunity."""
+        config = BotConfig(api_key=None)
+        snapshots = {
+            "sell_idr": {
+                "pair": "sell_idr",
+                "price": 100.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="position_trading",
+                    action="sell",
+                    confidence=0.9,  # high confidence but no position
+                    reason="overbought",
+                    target_price=100,
+                    amount=0.5,
+                    stop_loss=None,
+                    take_profit=None,
+                ),
+            },
+            "buy_idr": {
+                "pair": "buy_idr",
+                "price": 100.0,
+                "trend": None,
+                "orderbook": None,
+                "volatility": None,
+                "levels": None,
+                "decision": StrategyDecision(
+                    mode="day_trading",
+                    action="buy",
+                    confidence=0.55,  # lower confidence but actionable
+                    reason="good entry",
+                    target_price=110,
+                    amount=0.2,
+                    stop_loss=95,
+                    take_profit=115,
+                ),
+            },
+        }
+        trader = StubTrader(config, snapshots)
+        # No position held — sell_idr's SELL should be skipped
+        self.assertEqual(trader.tracker.base_position, 0.0)
+        pair, snapshot = trader.scan_and_choose()
+        self.assertEqual(pair, "buy_idr")
+        self.assertEqual(snapshot["decision"].action, "buy")
+
     def test_scan_and_choose_raises_when_all_pairs_fail(self) -> None:
         config = BotConfig(api_key=None)
         trader = AllFailTrader(config)
