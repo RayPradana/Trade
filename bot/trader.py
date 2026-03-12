@@ -1943,6 +1943,11 @@ class Trader:
                     tick_pct = (top_bid - second_bid) / top_bid
             if tick_pct is None and top_ask > top_bid:
                 tick_pct = (top_ask - top_bid) / top_bid
+            # When the book is flat (e.g. 4 → 4) we still want to approximate
+            # the discrete tick.  Use a 1-unit tick relative to the best bid to
+            # catch tiny integer-priced coins that require outsized moves.
+            if tick_pct is None and top_bid > 0:
+                tick_pct = 1.0 / top_bid
             if tick_pct is not None and tick_pct > self.config.max_tick_move_pct:
                 logger.info(
                     "Tick too large on %s: %.4f%% > %.4f%% — skipping buy",

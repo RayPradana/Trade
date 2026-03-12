@@ -2062,6 +2062,15 @@ class TickMoveFilterTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("tick_too_large", outcome["reason"])
 
+    def test_tick_flat_book_fallback_to_unit_price(self):
+        """Flat book (4 @ bid/ask) should still be treated as 1 IDR tick (~25%)."""
+        bids = [["4", "100"], ["4", "200"]]
+        asks = [["4", "50"], ["4", "25"]]
+        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=4.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("tick_too_large", outcome["reason"])
+
     def test_filter_disabled_when_zero(self):
         """When max_tick_move_pct=0 the tick filter must be disabled."""
         bids = [["5", "100"], ["4", "200"]]
