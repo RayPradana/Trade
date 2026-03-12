@@ -680,7 +680,15 @@ def main() -> None:
                 stop_reason = trader.tracker.stop_reason(held_price)
                 held_decision = held_snapshot["decision"]
 
-                # ── Partial take-profit check ────────────────────────────────
+                # ── Momentum exit (adaptive early exit) ─────────────────────
+                # Exit BEFORE the TP target when momentum weakens (imbalance
+                # drops) while the position is still profitable.  This prevents
+                # the bot from stubbornly waiting for a fixed target while the
+                # market turns bearish.
+                if stop_reason is None and trader.check_momentum_exit(held_snapshot):
+                    stop_reason = "momentum_exit"
+
+                # ── Partial take-profit check (level 1) ──────────────────────
                 # When PARTIAL_TP_FRACTION is set and price has reached the TP
                 # level for the first time, sell a fraction and let the rest run.
                 if (
@@ -716,6 +724,66 @@ def main() -> None:
                             f"Amount: {ptp_outcome.get('amount', 0):.8f}\n"
                             f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                         )
+
+                # ── Partial take-profit check (level 2) ──────────────────────
+                # When PARTIAL_TP2_FRACTION is set and price has risen by
+                # PARTIAL_TP2_TARGET_PCT above the entry price, sell a 2nd
+                # fraction and let the rest continue running.
+                if (
+                    config.partial_tp2_fraction > 0
+                    and not trader.tracker.partial_tp2_taken
+                    and trader.tracker.avg_cost > 0
+                    and config.partial_tp2_target_pct > 0
+                    and held_price >= trader.tracker.avg_cost * (1 + config.partial_tp2_target_pct)
+                ):
+                    ptp2_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp2_fraction)
+                    trader.tracker.partial_tp2_taken = True
+                    portfolio = trader.tracker.as_dict(held_price)
+                    logging.info(
+                        "🎯 PARTIAL-TP2  %s%s%s  %.0f%% @ Rp %s  (+%.1f%%)",
+                        _BOLD, pair, _RESET,
+                        config.partial_tp2_fraction * 100,
+                        f"{held_price:15,.2f}",
+                        config.partial_tp2_target_pct * 100,
+                    )
+                    _log_portfolio(portfolio, config.initial_capital)
+                    _notify(
+                        config,
+                        f"🎯 PARTIAL-TP2 {pair} @ Rp {held_price:,.0f}\n"
+                        f"Fraction: {config.partial_tp2_fraction:.0%}\n"
+                        f"Amount: {ptp2_outcome.get('amount', 0):.8f}\n"
+                        f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
+                    )
+
+                # ── Partial take-profit check (level 3) ──────────────────────
+                # When PARTIAL_TP3_FRACTION is set and price has risen by
+                # PARTIAL_TP3_TARGET_PCT above the entry price, sell a 3rd
+                # fraction and let the remainder run.
+                if (
+                    config.partial_tp3_fraction > 0
+                    and not trader.tracker.partial_tp3_taken
+                    and trader.tracker.avg_cost > 0
+                    and config.partial_tp3_target_pct > 0
+                    and held_price >= trader.tracker.avg_cost * (1 + config.partial_tp3_target_pct)
+                ):
+                    ptp3_outcome = trader.partial_take_profit(held_snapshot, config.partial_tp3_fraction)
+                    trader.tracker.partial_tp3_taken = True
+                    portfolio = trader.tracker.as_dict(held_price)
+                    logging.info(
+                        "🎯 PARTIAL-TP3  %s%s%s  %.0f%% @ Rp %s  (+%.1f%%)",
+                        _BOLD, pair, _RESET,
+                        config.partial_tp3_fraction * 100,
+                        f"{held_price:15,.2f}",
+                        config.partial_tp3_target_pct * 100,
+                    )
+                    _log_portfolio(portfolio, config.initial_capital)
+                    _notify(
+                        config,
+                        f"🎯 PARTIAL-TP3 {pair} @ Rp {held_price:,.0f}\n"
+                        f"Fraction: {config.partial_tp3_fraction:.0%}\n"
+                        f"Amount: {ptp3_outcome.get('amount', 0):.8f}\n"
+                        f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
+                    )
 
                 # Exit if a hard stop fired or the strategy says sell.
                 # For target_profit_reached: give dynamic TP a chance to override.

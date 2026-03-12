@@ -14,6 +14,7 @@ from .analysis import (
     SmartEntryResult,
     SpoofingResult,
     SupportResistance,
+    TradeFlowResult,
     TrendResult,
     VolatilityStats,
     WhaleActivity,
@@ -320,6 +321,7 @@ def make_trade_decision(
     spoofing: Optional[SpoofingResult] = None,
     effective_capital: Optional[float] = None,
     smart_entry: Optional[SmartEntryResult] = None,
+    trade_flow: Optional[TradeFlowResult] = None,
 ) -> StrategyDecision:
     """Produce a :class:`StrategyDecision` incorporating all available signals.
 
@@ -361,6 +363,11 @@ def make_trade_decision(
         Result from the Smart Entry Engine.  When provided, confidence is
         adjusted by pre-pump signals (+), whale pressure (+/-), and fake
         breakout risk (-).
+    trade_flow:
+        Result from recent-trade buy/sell flow analysis.  When
+        ``config.trade_flow_min_buy_ratio > 0`` and the buy ratio is below
+        the threshold, buy signals are converted to ``"hold"`` (entry
+        blocked — aggressive sellers dominate recent trades).
     """
     mode = select_strategy(trend, orderbook, vol)
     conf = _confidence_with_indicators(trend, orderbook, vol, current_price, indicators)
@@ -414,6 +421,50 @@ def make_trade_decision(
                 f"too_close_to_resistance(dist={distance:.2%}"
                 f"<={config.buy_max_resistance_proximity_pct:.2%})"
             )
+
+    # 3. Order-book imbalance entry guard (seller dominance filter)
+    # Block buy when sellers significantly outnumber buyers in the book.
+    if action == "buy" and config.ob_imbalance_min_entry != 0:
+        if orderbook.imbalance < config.ob_imbalance_min_entry:
+            action = "hold"
+            stop_loss = None
+            take_profit = None
+            sr_note = (
+                f"seller_dominant(imbalance={orderbook.imbalance:.3f}"
+                f"<{config.ob_imbalance_min_entry:.3f})"
+            )
+
+    # 4. Trade flow entry guard (aggressive seller filter)
+    # Block buy when the majority of recent trades were sell-initiated.
+    if action == "buy" and config.trade_flow_min_buy_ratio > 0 and trade_flow is not None:
+        if trade_flow.buy_ratio < config.trade_flow_min_buy_ratio:
+            action = "hold"
+            stop_loss = None
+            take_profit = None
+            sr_note = (
+                f"sell_flow_dominant(buy_ratio={trade_flow.buy_ratio:.2f}"
+                f"<{config.trade_flow_min_buy_ratio:.2f})"
+            )
+
+    # 5. Sell-wall TP adjustment
+    # When a large ask wall is detected near or above the computed TP, lower
+    # the TP to just below the wall so the bot takes profit before hitting
+    # strong resistance (sell wall).
+    if (
+        action == "buy"
+        and take_profit is not None
+        and whale is not None
+        and whale.detected
+        and whale.side == "ask"
+    ):
+        # Find the wall price (largest ask level price) from the orderbook.
+        # We approximate it as the top_ask price adjusted for the whale ratio.
+        # A simpler, robust approach: if TP is above current price, cap it
+        # conservatively to avoid the wall. We reduce TP by 1% as a safety margin.
+        adjusted_tp = current_price * (1 + (take_profit / current_price - 1) * 0.7)
+        if adjusted_tp < take_profit:
+            take_profit = adjusted_tp
+            sr_note = (sr_note + " " if sr_note else "") + "sell_wall_tp_adjusted"
 
     if indicators:
         if action == "buy" and indicators.bb_upper:

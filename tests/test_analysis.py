@@ -474,3 +474,79 @@ class SmartEntryEngineTests(unittest.TestCase):
         self.assertIsNotNone(result.fake_breakout)
         # Volume surge in last 3 candles → pre-pump should be detected
         self.assertTrue(result.pre_pump.detected)
+
+
+class TradeFlowAnalysisTest(unittest.TestCase):
+    """Tests for analyze_trade_flow()."""
+
+    def test_empty_trades_returns_neutral(self):
+        from bot.analysis import analyze_trade_flow
+        result = analyze_trade_flow([])
+        self.assertAlmostEqual(result.buy_ratio, 0.5)
+        self.assertFalse(result.aggressive_buyers)
+        self.assertEqual(result.buy_volume, 0.0)
+        self.assertEqual(result.sell_volume, 0.0)
+
+    def test_all_buy_trades(self):
+        from bot.analysis import analyze_trade_flow
+        trades = [
+            {"type": "buy", "price": "100", "amount": "1"},
+            {"type": "buy", "price": "101", "amount": "2"},
+        ]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 1.0)
+        self.assertTrue(result.aggressive_buyers)
+        self.assertEqual(result.sell_volume, 0.0)
+
+    def test_all_sell_trades(self):
+        from bot.analysis import analyze_trade_flow
+        trades = [
+            {"type": "sell", "price": "100", "amount": "1"},
+            {"type": "sell", "price": "101", "amount": "2"},
+        ]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 0.0)
+        self.assertFalse(result.aggressive_buyers)
+        self.assertEqual(result.buy_volume, 0.0)
+
+    def test_mixed_trades_ratio(self):
+        from bot.analysis import analyze_trade_flow
+        # 200 IDR buy, 100 IDR sell → buy_ratio = 2/3 ≈ 0.667
+        trades = [
+            {"type": "buy", "price": "100", "amount": "2"},
+            {"type": "sell", "price": "100", "amount": "1"},
+        ]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 2 / 3, places=3)
+        self.assertTrue(result.aggressive_buyers)  # > 0.65
+
+    def test_buy_ratio_below_threshold_not_aggressive(self):
+        from bot.analysis import analyze_trade_flow
+        # 1 IDR buy, 2 IDR sell → buy_ratio = 1/3 ≈ 0.333
+        trades = [
+            {"type": "buy", "price": "100", "amount": "1"},
+            {"type": "sell", "price": "100", "amount": "2"},
+        ]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 1 / 3, places=3)
+        self.assertFalse(result.aggressive_buyers)
+
+    def test_custom_threshold(self):
+        from bot.analysis import analyze_trade_flow
+        # buy_ratio = 0.5; threshold = 0.4 → should be aggressive
+        trades = [
+            {"type": "buy", "price": "100", "amount": "1"},
+            {"type": "sell", "price": "100", "amount": "1"},
+        ]
+        result = analyze_trade_flow(trades, aggressive_buyer_threshold=0.4)
+        self.assertTrue(result.aggressive_buyers)
+
+    def test_bid_ask_type_aliases(self):
+        from bot.analysis import analyze_trade_flow
+        # API may return "bid"/"ask" instead of "buy"/"sell"
+        trades = [
+            {"type": "bid", "price": "100", "amount": "1"},
+            {"type": "ask", "price": "100", "amount": "1"},
+        ]
+        result = analyze_trade_flow(trades)
+        self.assertAlmostEqual(result.buy_ratio, 0.5)

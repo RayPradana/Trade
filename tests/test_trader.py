@@ -3247,3 +3247,109 @@ class PositionOpenTimeTest(unittest.TestCase):
         restored = PortfolioTracker(500_000.0, 0.2, 0.1)
         restored.load_state(state)
         self.assertEqual(restored.position_open_time, original)
+
+
+class MomentumExitTest(unittest.TestCase):
+    """Tests for Trader.check_momentum_exit()."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _snap(self, price=110.0, imbalance=0.0):
+        from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats
+        trend = TrendResult(direction="up", strength=0.05, fast_ma=105.0, slow_ma=100.0)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=500.0, ask_volume=500.0, imbalance=imbalance)
+        return {
+            "pair": "btc_idr",
+            "price": price,
+            "trend": trend,
+            "orderbook": ob,
+            "volatility": VolatilityStats(volatility=0.01, avg_volume=100.0),
+        }
+
+    def test_disabled_when_thresholds_zero(self):
+        config = BotConfig(api_key=None, momentum_exit_ob_threshold=0.0, momentum_exit_min_profit_pct=0.0)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        # Even with very negative imbalance, exit should not trigger
+        self.assertFalse(trader.check_momentum_exit(self._snap(price=103.0, imbalance=-0.9)))
+
+    def test_exit_triggers_when_imbalance_drops_and_profit_sufficient(self):
+        config = BotConfig(
+            api_key=None,
+            momentum_exit_ob_threshold=0.0,
+            momentum_exit_min_profit_pct=0.02,
+        )
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        # Price is 3% above cost, imbalance = -0.2 (below threshold 0.0)
+        self.assertTrue(trader.check_momentum_exit(self._snap(price=103.0, imbalance=-0.2)))
+
+    def test_no_exit_when_profit_too_low(self):
+        config = BotConfig(
+            api_key=None,
+            momentum_exit_ob_threshold=0.0,
+            momentum_exit_min_profit_pct=0.05,
+        )
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        # Profit is only 2% (below 5% threshold), should not exit
+        self.assertFalse(trader.check_momentum_exit(self._snap(price=102.0, imbalance=-0.3)))
+
+    def test_no_exit_when_imbalance_still_bullish(self):
+        config = BotConfig(
+            api_key=None,
+            momentum_exit_ob_threshold=0.0,
+            momentum_exit_min_profit_pct=0.02,
+        )
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        # Imbalance = 0.2 (still above threshold 0.0), should not exit
+        self.assertFalse(trader.check_momentum_exit(self._snap(price=103.0, imbalance=0.2)))
+
+    def test_no_exit_when_no_position(self):
+        config = BotConfig(
+            api_key=None,
+            momentum_exit_ob_threshold=0.0,
+            momentum_exit_min_profit_pct=0.01,
+        )
+        trader = Trader(config)
+        # No buy recorded; avg_cost = 0
+        self.assertFalse(trader.check_momentum_exit(self._snap(price=103.0, imbalance=-0.3)))
+
+
+class PartialTp2And3TrackingTest(unittest.TestCase):
+    """Tests for partial_tp2_taken and partial_tp3_taken state management."""
+
+    def test_tp2_taken_reset_on_new_buy(self):
+        from bot.tracking import PortfolioTracker
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        tracker.partial_tp2_taken = True
+        tracker.record_trade("sell", 110.0, 1.0)  # full close
+        tracker.record_trade("buy", 105.0, 1.0)   # new position
+        self.assertFalse(tracker.partial_tp2_taken)
+
+    def test_tp3_taken_reset_on_new_buy(self):
+        from bot.tracking import PortfolioTracker
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        tracker.partial_tp3_taken = True
+        tracker.record_trade("sell", 110.0, 1.0)
+        tracker.record_trade("buy", 105.0, 1.0)
+        self.assertFalse(tracker.partial_tp3_taken)
+
+    def test_tp2_and_tp3_persist_via_state_round_trip(self):
+        from bot.tracking import PortfolioTracker
+        tracker = PortfolioTracker(500_000.0, 0.2, 0.1)
+        tracker.record_trade("buy", 100.0, 1.0)
+        tracker.partial_tp2_taken = True
+        tracker.partial_tp3_taken = True
+        state = tracker.to_state()
+        restored = PortfolioTracker(500_000.0, 0.2, 0.1)
+        restored.load_state(state)
+        self.assertTrue(restored.partial_tp2_taken)
+        self.assertTrue(restored.partial_tp3_taken)

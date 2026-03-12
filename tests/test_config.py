@@ -422,3 +422,33 @@ class ConfigNewFieldsTest(TestCase):
         cfg = BotConfig(api_key=None, flash_dump_lookback_seconds=0.0)
         with self.assertRaises(ValueError):
             cfg._validate()
+
+    def test_new_adaptive_fields_defaults(self):
+        """New adaptive/trade-flow fields default to 0 (disabled)."""
+        cfg = BotConfig(api_key=None)
+        self.assertEqual(cfg.ob_imbalance_min_entry, 0.0)
+        self.assertEqual(cfg.trade_flow_min_buy_ratio, 0.0)
+        self.assertEqual(cfg.momentum_exit_ob_threshold, 0.0)
+        self.assertEqual(cfg.momentum_exit_min_profit_pct, 0.0)
+        self.assertEqual(cfg.partial_tp3_fraction, 0.0)
+        self.assertEqual(cfg.partial_tp3_target_pct, 0.0)
+
+    def test_validation_ob_imbalance_min_entry_out_of_range(self):
+        cfg = BotConfig(api_key=None, ob_imbalance_min_entry=1.5)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_validation_trade_flow_min_buy_ratio_out_of_range(self):
+        cfg = BotConfig(api_key=None, trade_flow_min_buy_ratio=1.2)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_validation_partial_tp3_fraction_out_of_range(self):
+        cfg = BotConfig(api_key=None, partial_tp3_fraction=1.0)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_validation_momentum_exit_min_profit_negative(self):
+        cfg = BotConfig(api_key=None, momentum_exit_min_profit_pct=-0.01)
+        with self.assertRaises(ValueError):
+            cfg._validate()

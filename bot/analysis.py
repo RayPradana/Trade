@@ -60,6 +60,27 @@ class MomentumIndicators:
 
 
 @dataclass
+class TradeFlowResult:
+    """Result of recent-trade buy/sell flow analysis.
+
+    ``buy_ratio`` is the fraction of recent trades that were buyer-initiated
+    (``side="buy"``). Range: ``0.0``–``1.0``.
+
+    ``buy_volume`` and ``sell_volume`` are the aggregated trade volumes on
+    each side.
+
+    ``aggressive_buyers`` is ``True`` when the buy ratio exceeds
+    ``0.65`` (i.e., more than 65 % of recent trades were market buys),
+    indicating aggressive buyer participation.
+    """
+
+    buy_ratio: float
+    buy_volume: float
+    sell_volume: float
+    aggressive_buyers: bool
+
+
+@dataclass
 class MultiTimeframeResult:
     """Aggregated directional signal across multiple timeframes.
 
@@ -222,6 +243,65 @@ def analyze_orderbook(depth: Dict[str, object]) -> OrderbookInsight:
         bid_volume=bid_volume,
         ask_volume=ask_volume,
         imbalance=imbalance,
+    )
+
+
+def analyze_trade_flow(
+    trades: Sequence[Dict[str, Any]],
+    aggressive_buyer_threshold: float = 0.65,
+) -> TradeFlowResult:
+    """Analyse recent trades to determine buy/sell flow.
+
+    Examines the ``type`` field of each trade (``"buy"`` or ``"sell"``) and
+    the trade ``price``×``amount`` to compute the fraction of volume that was
+    buyer-initiated.  A high ``buy_ratio`` indicates aggressive buyer
+    participation (market orders hitting the ask), which is a bullish signal.
+
+    Parameters
+    ----------
+    trades:
+        List of recent trade dicts as returned by the exchange API.  Each dict
+        should contain ``"type"`` (``"buy"`` or ``"sell"``) and ``"amount"``
+        (or ``"vol"``) and ``"price"`` fields.
+    aggressive_buyer_threshold:
+        ``buy_ratio`` above which :attr:`TradeFlowResult.aggressive_buyers` is
+        set to ``True``.  Default: ``0.65`` (65 %).
+
+    Returns
+    -------
+    :class:`TradeFlowResult`
+        Always returns a result; if ``trades`` is empty all fields default to
+        neutral values (``buy_ratio=0.5``, ``aggressive_buyers=False``).
+    """
+    if not trades:
+        return TradeFlowResult(
+            buy_ratio=0.5,
+            buy_volume=0.0,
+            sell_volume=0.0,
+            aggressive_buyers=False,
+        )
+
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for t in trades:
+        trade_type = str(t.get("type", "")).lower()
+        # Support both amount and vol field names used by different API
+        # versions.
+        amount = _safe_float(t.get("amount") or t.get("vol", 0))
+        price = _safe_float(t.get("price", 0))
+        notional = amount * price if price else amount
+        if trade_type in ("buy", "bid"):
+            buy_vol += notional
+        elif trade_type in ("sell", "ask"):
+            sell_vol += notional
+
+    total = buy_vol + sell_vol
+    buy_ratio = buy_vol / total if total else 0.5
+    return TradeFlowResult(
+        buy_ratio=round(buy_ratio, 4),
+        buy_volume=buy_vol,
+        sell_volume=sell_vol,
+        aggressive_buyers=buy_ratio >= aggressive_buyer_threshold,
     )
 
 

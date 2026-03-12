@@ -527,3 +527,93 @@ class TestObImbalanceSizeBoost(unittest.TestCase):
         base = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.0)
         boosted = _position_size(price, price * 0.99, cfg, price * 0.01, 0.70, vol, 500_000.0, ob_imbalance=0.5)
         self.assertAlmostEqual(boosted, base * 3.0, places=8)
+
+
+class TradeFlowEntryFilterTest(unittest.TestCase):
+    """Tests for trade_flow_min_buy_ratio entry filter in make_trade_decision."""
+
+    def _make_uptrend(self):
+        from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats
+        trend = TrendResult(direction="up", fast_ma=105.0, slow_ma=100.0, strength=0.05)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=1000.0, ask_volume=500.0, imbalance=0.333)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        return trend, ob, vol
+
+    def test_buy_blocked_when_sell_flow_dominant(self):
+        from bot.analysis import TradeFlowResult
+        from bot.strategies import make_trade_decision
+        from bot.config import BotConfig
+        trend, ob, vol = self._make_uptrend()
+        cfg = BotConfig(api_key=None, trade_flow_min_buy_ratio=0.5)
+        low_buy_flow = TradeFlowResult(buy_ratio=0.3, buy_volume=30.0,
+                                       sell_volume=70.0, aggressive_buyers=False)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg, trade_flow=low_buy_flow)
+        self.assertEqual(dec.action, "hold")
+        self.assertIn("sell_flow_dominant", dec.reason)
+
+    def test_buy_allowed_when_buy_flow_sufficient(self):
+        from bot.analysis import TradeFlowResult
+        from bot.strategies import make_trade_decision
+        from bot.config import BotConfig
+        trend, ob, vol = self._make_uptrend()
+        cfg = BotConfig(api_key=None, trade_flow_min_buy_ratio=0.5)
+        good_flow = TradeFlowResult(buy_ratio=0.7, buy_volume=70.0,
+                                    sell_volume=30.0, aggressive_buyers=True)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg, trade_flow=good_flow)
+        self.assertEqual(dec.action, "buy")
+
+    def test_filter_disabled_when_threshold_zero(self):
+        from bot.analysis import TradeFlowResult
+        from bot.strategies import make_trade_decision
+        from bot.config import BotConfig
+        trend, ob, vol = self._make_uptrend()
+        cfg = BotConfig(api_key=None, trade_flow_min_buy_ratio=0.0)
+        low_flow = TradeFlowResult(buy_ratio=0.1, buy_volume=10.0,
+                                   sell_volume=90.0, aggressive_buyers=False)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg, trade_flow=low_flow)
+        # Filter is disabled → should still buy (uptrend)
+        self.assertEqual(dec.action, "buy")
+
+
+class ObImbalanceEntryFilterTest(unittest.TestCase):
+    """Tests for ob_imbalance_min_entry entry filter in make_trade_decision."""
+
+    def _make_uptrend(self):
+        from bot.analysis import TrendResult, VolatilityStats
+        trend = TrendResult(direction="up", fast_ma=105.0, slow_ma=100.0, strength=0.05)
+        vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
+        return trend, vol
+
+    def test_buy_blocked_when_seller_dominant(self):
+        from bot.analysis import OrderbookInsight
+        from bot.strategies import make_trade_decision
+        from bot.config import BotConfig
+        trend, vol = self._make_uptrend()
+        # Seller dominant: imbalance = -0.3 (ask >> bid)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=350.0, ask_volume=650.0, imbalance=-0.3)
+        cfg = BotConfig(api_key=None, ob_imbalance_min_entry=-0.1)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg)
+        self.assertEqual(dec.action, "hold")
+        self.assertIn("seller_dominant", dec.reason)
+
+    def test_buy_allowed_when_book_bullish(self):
+        from bot.analysis import OrderbookInsight
+        from bot.strategies import make_trade_decision
+        from bot.config import BotConfig
+        trend, vol = self._make_uptrend()
+        # Buyer dominant: imbalance = +0.2
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=600.0, ask_volume=400.0, imbalance=0.2)
+        cfg = BotConfig(api_key=None, ob_imbalance_min_entry=-0.1)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg)
+        self.assertEqual(dec.action, "buy")
+
+    def test_filter_disabled_when_zero(self):
+        from bot.analysis import OrderbookInsight
+        from bot.strategies import make_trade_decision
+        from bot.config import BotConfig
+        trend, vol = self._make_uptrend()
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=100.0, ask_volume=900.0, imbalance=-0.8)
+        cfg = BotConfig(api_key=None, ob_imbalance_min_entry=0.0)
+        dec = make_trade_decision(trend, ob, vol, 100.0, cfg)
+        # Not filtered — uptrend should still produce buy
+        self.assertEqual(dec.action, "buy")

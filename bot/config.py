@@ -411,6 +411,42 @@ class BotConfig:
     #   E.g. 2.0 = double the normal entry size on a whale-bid signal.
     ob_imbalance_boost_threshold: float = 0.0
     ob_imbalance_size_multiplier: float = 2.0
+    # ── Entry imbalance guard ──────────────────────────────────────────────────
+    # Hard-skip BUY when the order-book imbalance is below this threshold
+    # (i.e. when sellers dominate the book).
+    # Imbalance = (bid_vol − ask_vol) / (bid_vol + ask_vol), range −1 … +1.
+    # E.g. −0.1 = skip buy when ask volume exceeds bid volume by ≥ ~11%.
+    # 0 = disabled (default). Typical value: −0.15 to block clear seller dominance.
+    ob_imbalance_min_entry: float = 0.0
+    # ── Trade flow (buy/sell ratio) entry filter ───────────────────────────────
+    # Skip BUY when fewer than this fraction of recent trades were buyer-initiated
+    # (market orders hitting the ask).  Range 0–1.
+    # E.g. 0.45 = skip buy when less than 45% of trades are market buys.
+    # 0 = disabled (default). Typical value: 0.45.
+    trade_flow_min_buy_ratio: float = 0.0
+    # ── Momentum exit (early exit on weakening momentum) ──────────────────────
+    # Exit an open profitable position BEFORE reaching the TP target when
+    # market momentum fades. Two conditions must BOTH be met to trigger the
+    # early exit:
+    #
+    # momentum_exit_ob_threshold:
+    #   Order-book imbalance falls below this level (seller pressure detected).
+    #   Range −1 … +1. E.g. 0.0 = exit when book becomes seller-dominant.
+    #   0 = disabled (default).
+    #
+    # momentum_exit_min_profit_pct:
+    #   Only trigger the early exit when the unrealised profit is at least this
+    #   fraction.  Prevents exiting at a loss on a brief dip.
+    #   E.g. 0.01 = require ≥ 1% profit before early exit.
+    #   0 = disabled (default; requires momentum_exit_ob_threshold > 0 too).
+    momentum_exit_ob_threshold: float = 0.0
+    momentum_exit_min_profit_pct: float = 0.0
+    # ── Multi-level partial take profit (3rd level) ────────────────────────────
+    # Sell a fraction of the position at a third TP target price.
+    # partial_tp3_fraction: fraction to sell (0 = disabled).
+    # partial_tp3_target_pct: price must rise this % above buy price to trigger.
+    partial_tp3_fraction: float = 0.0
+    partial_tp3_target_pct: float = 0.0
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -550,6 +586,12 @@ class BotConfig:
             max_hold_profit_pct=float(os.getenv("MAX_HOLD_PROFIT_PCT", "0.01")),
             ob_imbalance_boost_threshold=float(os.getenv("OB_IMBALANCE_BOOST_THRESHOLD", "0")),
             ob_imbalance_size_multiplier=float(os.getenv("OB_IMBALANCE_SIZE_MULTIPLIER", "2.0")),
+            ob_imbalance_min_entry=float(os.getenv("OB_IMBALANCE_MIN_ENTRY", "0")),
+            trade_flow_min_buy_ratio=float(os.getenv("TRADE_FLOW_MIN_BUY_RATIO", "0")),
+            momentum_exit_ob_threshold=float(os.getenv("MOMENTUM_EXIT_OB_THRESHOLD", "0")),
+            momentum_exit_min_profit_pct=float(os.getenv("MOMENTUM_EXIT_MIN_PROFIT_PCT", "0")),
+            partial_tp3_fraction=float(os.getenv("PARTIAL_TP3_FRACTION", "0")),
+            partial_tp3_target_pct=float(os.getenv("PARTIAL_TP3_TARGET_PCT", "0")),
         )
         cfg._validate()
         return cfg
@@ -730,6 +772,18 @@ class BotConfig:
             raise ValueError("OB_IMBALANCE_BOOST_THRESHOLD must be in [0, 1]")
         if self.ob_imbalance_size_multiplier <= 0:
             raise ValueError("OB_IMBALANCE_SIZE_MULTIPLIER must be positive")
+        if not (-1.0 <= self.ob_imbalance_min_entry <= 1.0):
+            raise ValueError("OB_IMBALANCE_MIN_ENTRY must be in [-1, 1]")
+        if not (0.0 <= self.trade_flow_min_buy_ratio <= 1.0):
+            raise ValueError("TRADE_FLOW_MIN_BUY_RATIO must be in [0, 1]")
+        if not (-1.0 <= self.momentum_exit_ob_threshold <= 1.0):
+            raise ValueError("MOMENTUM_EXIT_OB_THRESHOLD must be in [-1, 1]")
+        if self.momentum_exit_min_profit_pct < 0:
+            raise ValueError("MOMENTUM_EXIT_MIN_PROFIT_PCT must be non-negative")
+        if not (0.0 <= self.partial_tp3_fraction < 1.0):
+            raise ValueError("PARTIAL_TP3_FRACTION must be in [0, 1)")
+        if self.partial_tp3_target_pct < 0:
+            raise ValueError("PARTIAL_TP3_TARGET_PCT must be non-negative")
         if self.confidence_position_sizing_enabled:
             for name, val in (
                 ("CONFIDENCE_TIER_SKIP", self.confidence_tier_skip),

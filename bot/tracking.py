@@ -72,6 +72,9 @@ class PortfolioTracker:
         # Partial TP state: True when the first partial TP has been taken on the
         # current position.  Reset to False on each new buy or full close.
         self.partial_tp_taken: bool = False
+        # 2nd and 3rd partial TP state
+        self.partial_tp2_taken: bool = False
+        self.partial_tp3_taken: bool = False
         # Profit-buffer compounding: track the peak profit buffer for drawdown guard.
         self._peak_profit_buffer: float = 0.0
         # Trailing take-profit: activates once price crosses the initial TP level and
@@ -130,6 +133,8 @@ class PortfolioTracker:
             self.trade_count += 1
             # A new buy resets the partial-TP flag for the fresh position
             self.partial_tp_taken = False
+            self.partial_tp2_taken = False
+            self.partial_tp3_taken = False
             # Record when this position was first opened (first buy only)
             if self.position_open_time == 0.0:
                 self.position_open_time = time.time()
@@ -158,6 +163,8 @@ class PortfolioTracker:
             if self.base_position <= 0:
                 self.avg_cost = 0.0
                 self.partial_tp_taken = False
+                self.partial_tp2_taken = False
+                self.partial_tp3_taken = False
                 # Reset trailing stop when position is fully closed
                 self._trailing_stop = None
                 self._peak_price = None
@@ -188,6 +195,8 @@ class PortfolioTracker:
         self.base_position = 0.0
         self.avg_cost = 0.0
         self.partial_tp_taken = False
+        self.partial_tp2_taken = False
+        self.partial_tp3_taken = False
         self._trailing_stop = None
         self._peak_price = None
         self._tp_activated = False
@@ -290,6 +299,12 @@ class PortfolioTracker:
         ptt = state.get("partial_tp_taken")
         if ptt is not None:
             self.partial_tp_taken = bool(ptt)
+        ptt2 = state.get("partial_tp2_taken")
+        if ptt2 is not None:
+            self.partial_tp2_taken = bool(ptt2)
+        ptt3 = state.get("partial_tp3_taken")
+        if ptt3 is not None:
+            self.partial_tp3_taken = bool(ptt3)
         pot = state.get("position_open_time")
         if pot is not None:
             self.position_open_time = float(pot)
@@ -388,6 +403,8 @@ class PortfolioTracker:
             "last_sell_price": self.last_sell_price,
             "last_sell_time": self.last_sell_time,
             "partial_tp_taken": self.partial_tp_taken,
+            "partial_tp2_taken": self.partial_tp2_taken,
+            "partial_tp3_taken": self.partial_tp3_taken,
             "position_open_time": self.position_open_time,
             "peak_profit_buffer": self._peak_profit_buffer,
             # Trailing TP

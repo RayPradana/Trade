@@ -8,6 +8,7 @@ import requests
 
 from .analysis import (
     analyze_orderbook,
+    analyze_trade_flow,
     analyze_trend,
     analyze_volatility,
     build_candles,
@@ -26,6 +27,7 @@ from .analysis import (
     RugPullRisk,
     SmartEntryResult,
     SpoofingResult,
+    TradeFlowResult,
     WhaleActivity,
     support_resistance,
 )
@@ -934,6 +936,19 @@ class Trader:
                     pair, smart_entry.fake_breakout.volume_ratio, smart_entry.fake_breakout.score,
                 )
 
+        # ── Trade flow analysis ───────────────────────────────────────────────
+        trade_flow: TradeFlowResult = analyze_trade_flow(trades)
+        if trade_flow.aggressive_buyers:
+            logger.debug(
+                "Trade flow on %s: buy_ratio=%.2f (aggressive buyers)",
+                pair, trade_flow.buy_ratio,
+            )
+        else:
+            logger.debug(
+                "Trade flow on %s: buy_ratio=%.2f sell_vol=%.2f",
+                pair, trade_flow.buy_ratio, trade_flow.sell_volume,
+            )
+
         grid_plan: Optional[GridPlan] = None
         decision: StrategyDecision
         if self.config.grid_enabled:
@@ -955,6 +970,7 @@ class Trader:
                 mtf=mtf, whale=whale, spoofing=spoofing,
                 effective_capital=self.tracker.effective_capital(),
                 smart_entry=smart_entry,
+                trade_flow=trade_flow,
             )
             # Apply correlated-pair confidence boost when reference trend aligns
             if reference_trend == "up" and decision.action == "buy":
@@ -980,6 +996,7 @@ class Trader:
             "spoofing": spoofing,
             "reference_trend": reference_trend,
             "smart_entry": smart_entry,
+            "trade_flow": trade_flow,
         }
 
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -1739,6 +1756,61 @@ class Trader:
         }
         self._persist_after_trade(pair)
         return outcome
+
+    def check_momentum_exit(self, snapshot: Dict[str, Any]) -> bool:
+        """Return ``True`` when weakening momentum justifies an early exit.
+
+        This is the *adaptive* counterpart to the conditional-TP logic: instead
+        of deciding whether to *hold past* a profit target, this method decides
+        whether to *exit early* (before the target) when market conditions
+        deteriorate.  It protects open profits by closing the position as soon
+        as the book turns bearish, even if the fixed TP has not been reached.
+
+        Both thresholds must be configured for the check to activate.
+        ``momentum_exit_min_profit_pct > 0`` is the enabling condition;
+        ``momentum_exit_ob_threshold`` may be ``0.0`` (exit when imbalance
+        turns negative, i.e. seller dominant).
+
+        Parameters
+        ----------
+        snapshot:
+            Market snapshot as returned by :meth:`analyze_market`.
+
+        Returns
+        -------
+        bool
+            ``True`` when momentum has faded and the position has enough
+            unrealised profit to justify an early close.  ``False`` otherwise
+            (hold, or feature disabled).
+        """
+        config = self.config
+        # Feature is off unless the minimum-profit threshold is configured.
+        # momentum_exit_ob_threshold can be 0.0 (meaning exit when imbalance
+        # goes negative / seller dominant), so only the profit guard enables/
+        # disables the feature.
+        if config.momentum_exit_min_profit_pct == 0:
+            return False
+
+        price = snapshot.get("price", 0.0)
+        orderbook = snapshot.get("orderbook")
+        if not price or self.tracker.avg_cost == 0:
+            return False
+
+        # Require minimum unrealised profit before triggering
+        unrealised_pct = (price - self.tracker.avg_cost) / self.tracker.avg_cost
+        if unrealised_pct < config.momentum_exit_min_profit_pct:
+            return False
+
+        # Check order-book imbalance — exit when sellers have taken over
+        imbalance = getattr(orderbook, "imbalance", 0.0) if orderbook else 0.0
+        if imbalance < config.momentum_exit_ob_threshold:
+            logger.info(
+                "Momentum exit: imbalance=%.3f < threshold=%.3f at profit=%.2f%% — exiting early",
+                imbalance, config.momentum_exit_ob_threshold, unrealised_pct * 100,
+            )
+            return True
+
+        return False
 
     def _conditions_allow_holding(self, snapshot: Dict[str, Any]) -> bool:
         """Return ``True`` when market indicators suggest holding past the TP target.
