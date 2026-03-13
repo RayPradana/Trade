@@ -11,6 +11,7 @@ from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
 from bot.tracking import PortfolioTracker
+from bot.grid import GridPlan, GridOrder
 
 
 class VolStub:
@@ -3708,6 +3709,89 @@ class RiskHoldCancellationTests(unittest.TestCase):
         # Placeholder tracker should be released so the bot can allocate elsewhere.
         self.assertIsNone(trader.multi_manager.get_tracker("pixel_idr"))
         self.assertAlmostEqual(trader.multi_manager.cash, initial_cash, places=2)
+
+
+class GridMinOrderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def test_grid_skips_orders_below_minimum(self) -> None:
+        placed: list[tuple[str, float, float]] = []
+
+        class _GridClient(GuardedTrader._Client):
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                placed.append((order_type, price, amount))
+                return {"success": 1}
+
+        config = BotConfig(api_key="key", api_secret="secret", dry_run=False, grid_enabled=True, min_order_idr=30_000.0)
+        trader = GuardedTrader(config)
+        trader.client = _GridClient()
+
+        # Two grid orders: one below Rp30k, one above.
+        plan = GridPlan(
+            anchor_price=1000.0,
+            buy_orders=[GridOrder("buy", 1000.0, 10.0)],   # 10k IDR → below min
+            sell_orders=[GridOrder("sell", 1000.0, 40.0)],  # 40k IDR → valid
+        )
+        snapshot = {
+            "pair": "btc_idr",
+            "price": 1000.0,
+            "decision": StrategyDecision(
+                mode="grid",
+                action="grid",
+                confidence=1.0,
+                reason="grid_test",
+                target_price=1000.0,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+            "grid_plan": plan,
+        }
+
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "grid_placed")
+        # Only the order above the minimum should be placed.
+        self.assertEqual(placed, [("sell", 1000.0, 40.0)])
+
+    def test_grid_all_below_minimum_skips(self) -> None:
+        class _GridClient(GuardedTrader._Client):
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                raise AssertionError("create_order should not be called when all orders below minimum")
+
+        config = BotConfig(api_key="key", api_secret="secret", dry_run=False, grid_enabled=True, min_order_idr=30_000.0)
+        trader = GuardedTrader(config)
+        trader.client = _GridClient()
+
+        plan = GridPlan(
+            anchor_price=500.0,
+            buy_orders=[GridOrder("buy", 500.0, 20.0)],   # 10k
+            sell_orders=[GridOrder("sell", 500.0, 10.0)],  # 5k
+        )
+        snapshot = {
+            "pair": "eth_idr",
+            "price": 500.0,
+            "decision": StrategyDecision(
+                mode="grid",
+                action="grid",
+                confidence=1.0,
+                reason="grid_test",
+                target_price=500.0,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+            "grid_plan": plan,
+        }
+
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("all_grid_orders_below_min_order", outcome["reason"])
 
 
 class BuyPendingFillTests(unittest.TestCase):

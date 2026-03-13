@@ -37,7 +37,7 @@ from .config import BotConfig
 from .persistence import StatePersistence
 from .rate_limit import RateLimitedOrderQueue
 from .realtime import MultiPairFeed, RealtimeFeed
-from .grid import GridPlan, build_grid_plan
+from .grid import GridOrder, GridPlan, build_grid_plan
 from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, adaptive_max_positions, adaptive_risk_per_trade, make_trade_decision
 from .tracking import MultiPositionManager, PortfolioTracker
@@ -2555,7 +2555,30 @@ class Trader:
             raise ValueError("API credentials required for live trading")
 
         executed: List[Dict[str, Any]] = []
+        min_idr = self.config.min_order_idr
+        filtered_orders: List[GridOrder] = []
         for order in orders:
+            order_value_idr = order.amount * order.price
+            if min_idr > 0 and order_value_idr < min_idr:
+                logger.debug(
+                    "Skipping grid order %s %s @ %s: Rp%.0f < min Rp%.0f",
+                    order.side,
+                    order.amount,
+                    order.price,
+                    order_value_idr,
+                    min_idr,
+                )
+                continue
+            filtered_orders.append(order)
+
+        if not filtered_orders:
+            return {
+                "status": "skipped",
+                "reason": f"all_grid_orders_below_min_order (min=Rp{min_idr:.0f})",
+                "portfolio": self.tracker.as_dict(price),
+            }
+
+        for order in filtered_orders:
             resp = self.client.create_order(pair, order.side, order.price, order.amount)
             executed.append({"side": order.side, "price": order.price, "amount": order.amount, "response": resp})
             logger.info("Placed grid order %s %s @ %s resp=%s", order.side, order.amount, order.price, resp)
