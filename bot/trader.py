@@ -539,7 +539,7 @@ class Trader:
         try:
             info = self.client.get_account_info()
             # Indodax returns {"success": 1, "return": {"balance": {"btc": "0.001", ...}}}
-            if info.get("success") not in (None, 1):
+            if info.get("success") != 1:
                 logger.warning("Reconciliation skipped for %s: API success=%s", pair, info.get("success"))
                 return
             balance_dict = (info.get("return") or {}).get("balance") or {}
