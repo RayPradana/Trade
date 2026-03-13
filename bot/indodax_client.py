@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from .rate_limit import RateLimitedOrderQueue
+from .rate_limit import ApiRequestScheduler, RateLimitedOrderQueue
 from .analysis import _TF_SECONDS as _OHLC_TF_SECONDS  # shared timeframe → seconds map
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,9 @@ class IndodaxClient:
         enable_queue: bool = True,
         *,
         public_min_interval: float = 0.15,
+        request_scheduler: Optional[ApiRequestScheduler] = None,
+        request_min_interval: float = 0.2,
+        enable_request_scheduler: bool = True,
         public_time_provider=None,
         public_sleeper=None,
     ) -> None:
@@ -47,6 +50,14 @@ class IndodaxClient:
         )
         if self.order_queue is None and enable_queue:
             self.order_queue = RateLimitedOrderQueue(min_interval=order_min_interval)
+        # Generic REST scheduler (public + private) to smooth out bursts
+        self._request_scheduler = (
+            request_scheduler
+            if enable_request_scheduler
+            else None
+        )
+        if self._request_scheduler is None and enable_request_scheduler:
+            self._request_scheduler = ApiRequestScheduler(min_interval=request_min_interval)
         # Public REST rate-limit (serialize calls across threads).
         self.public_min_interval = max(0.0, public_min_interval)
         self._public_time = public_time_provider or time.monotonic
@@ -333,6 +344,11 @@ class IndodaxClient:
 
     # -------------------- helpers -------------------- #
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        if self._request_scheduler is not None:
+            return self._request_scheduler.submit(self._perform_get, path, params).result()
+        return self._perform_get(path, params)
+
+    def _perform_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         # Serialize public REST calls to avoid hitting Indodax per-IP limits
         # when multiple positions trigger concurrent fetches (depth/trades).
         min_interval = getattr(self, "public_min_interval", 0.0)
@@ -356,6 +372,11 @@ class IndodaxClient:
         return self._handle_response(response)
 
     def _post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if self._request_scheduler is not None:
+            return self._request_scheduler.submit(self._perform_post_private, method, params).result()
+        return self._perform_post_private(method, params)
+
+    def _perform_post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not self.api_key:
             raise ValueError("API key is required for private endpoints")
         if not self.api_secret:

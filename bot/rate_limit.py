@@ -84,3 +84,65 @@ class RateLimitedOrderQueue:
             except BaseException as exc:  # pragma: no cover - propagate via result
                 result.set_exception(exc)
             self._last_exec = self._time()
+
+
+class ApiRequestScheduler:
+    """Generic worker queue that spaces REST calls to honor rate limits.
+
+    This is similar to :class:`RateLimitedOrderQueue` but is intentionally
+    protocol-agnostic so it can be reused for both public and private REST
+    endpoints (GET/POST) without duplicating queueing logic.
+    """
+
+    def __init__(
+        self,
+        min_interval: float = 0.2,
+        *,
+        time_provider: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.min_interval = max(0.0, float(min_interval))
+        self._time = time_provider
+        self._sleep = sleeper
+        self._queue: "Queue[Optional[Tuple[Callable[..., Any], tuple, dict, QueuedResult]]]" = Queue()
+        self._last_exec: Optional[float] = None
+        self._stop = Event()
+        self._worker: Optional[Thread] = None
+
+    def start(self) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+        self._stop.clear()
+        self._worker = Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._queue.put(None)
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=1.0)
+
+    def submit(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> QueuedResult:
+        result = QueuedResult()
+        self.start()
+        self._queue.put((func, args, kwargs, result))
+        return result
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            item = self._queue.get()
+            if item is None:
+                break
+            func, args, kwargs, result = item
+            now = self._time()
+            if self._last_exec is not None:
+                elapsed = now - self._last_exec
+                wait_for = self.min_interval - elapsed
+                if wait_for > 0:
+                    self._sleep(wait_for)
+            try:
+                value = func(*args, **kwargs)
+                result.set_result(value)
+            except BaseException as exc:  # pragma: no cover - propagate via result
+                result.set_exception(exc)
+            self._last_exec = self._time()

@@ -3,6 +3,8 @@ import unittest
 
 import requests
 
+from bot.rate_limit import ApiRequestScheduler, RateLimitedOrderQueue
+
 from bot.rate_limit import RateLimitedOrderQueue
 
 
@@ -33,6 +35,24 @@ class RateLimitQueueTests(unittest.TestCase):
         self.assertEqual(res2.result(timeout=1.0), "second")
         self.assertGreaterEqual(executed_at[1] - executed_at[0], 1.0)
         queue.stop()
+
+
+class ApiRequestSchedulerTests(unittest.TestCase):
+    def test_scheduler_respects_min_interval(self) -> None:
+        clock = _FakeClock()
+        scheduler = ApiRequestScheduler(min_interval=1.0, time_provider=clock.time, sleeper=clock.sleep)
+        executed_at: list[float] = []
+
+        def task(label: str) -> str:
+            executed_at.append(clock.time())
+            return label
+
+        res1 = scheduler.submit(task, "first")
+        res2 = scheduler.submit(task, "second")
+        self.assertEqual(res1.result(timeout=1.0), "first")
+        self.assertEqual(res2.result(timeout=1.0), "second")
+        self.assertGreaterEqual(executed_at[1] - executed_at[0], 1.0)
+        scheduler.stop()
 
 
 if __name__ == "__main__":
@@ -205,6 +225,62 @@ class IndodaxPublicRateLimitTests(unittest.TestCase):
             calls[1] - calls[0],
             1.0,
             "second public call must be delayed to respect min interval",
+        )
+
+
+class IndodaxSchedulerIntegrationTests(unittest.TestCase):
+    """Public REST calls can be scheduled via ApiRequestScheduler to smooth bursts."""
+
+    def test_public_calls_are_scheduled(self):
+        from bot.indodax_client import IndodaxClient
+
+        clock = _FakeClock()
+        calls: list[float] = []
+
+        class _Resp:
+            def __init__(self, status=200):
+                self.status_code = status
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise requests.HTTPError(f"{self.status_code} error")
+
+            def json(self):
+                return {}
+
+        class _Session:
+            def get(self, url, params=None, timeout=None):
+                calls.append(clock.time())
+                return _Resp()
+
+        scheduler = ApiRequestScheduler(min_interval=1.0, time_provider=clock.time, sleeper=clock.sleep)
+        client = IndodaxClient(
+            api_key=None,
+            api_secret=None,
+            enable_queue=False,
+            enable_request_scheduler=True,
+            request_scheduler=scheduler,
+            public_min_interval=0.0,  # handled by scheduler in this test
+        )
+        client.session = _Session()
+        client.base_url = "https://indodax.com"
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futs = [
+                    pool.submit(client.get_depth, "btc_idr"),
+                    pool.submit(client.get_trades, "eth_idr"),
+                ]
+                for fut in futs:
+                    fut.result(timeout=1.0)
+        finally:
+            scheduler.stop()
+
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(
+            calls[1] - calls[0],
+            1.0,
+            "second scheduled call must be delayed to respect min interval",
         )
 
 
