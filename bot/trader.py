@@ -2414,6 +2414,41 @@ class Trader:
         if self.config.api_key is None:
             raise ValueError("API credentials required for live trading")
 
+        base_coin = snapshot["pair"].split("_")[0].lower()
+        receive_key = f"receive_{base_coin}"
+
+        def _calc_received_amount(order_resp: Dict[str, Any], pre_step_position: float) -> float:
+            if decision.action != "buy":
+                return step_amount
+            received = step_amount
+            try:
+                received = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
+            except (TypeError, ValueError):
+                received = 0.0
+
+            if received <= 0:
+                # Fallback: some exchange responses return receive_<coin>=0
+                # even when the order is filled.  Verify the live balance
+                # and treat any increase as a filled amount so we don't
+                # abandon a real position.
+                try:
+                    acct_info = self.client.get_account_info()
+                    balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+                    actual_balance = float(balance_dict.get(base_coin) or "0")
+                    balance_delta = actual_balance - pre_step_position
+                    if balance_delta > 0:
+                        received = min(step_amount, balance_delta)
+                        logger.info(
+                            "Buy response showed receive_%s=0 but account balance increased by %.8f — "
+                            "recording filled buy",
+                            base_coin.upper(),
+                            received,
+                        )
+                except Exception:
+                    # Do not block the trade; fall back to pending logic below.
+                    pass
+            return received
+
         for amt in staged:
             step_amount = min(amt, remaining_amount)
             if step_amount <= 0:
@@ -2442,44 +2477,43 @@ class Trader:
 
             # Indodax returns ``receive_<coin>`` in the trade response.  When a
             # buy limit order is merely placed (not filled) this value is 0.
-            # Avoid opening a phantom position in that case.
-            received_amount = step_amount
-            if decision.action == "buy":
-                base_coin = snapshot["pair"].split("_")[0].lower()
-                receive_key = f"receive_{base_coin}"
-                try:
-                    received_amount = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
-                except (TypeError, ValueError):
-                    received_amount = 0.0
+            # Avoid opening a phantom position in that case; cancel and retry
+            # once with a slightly more aggressive price to avoid missing the move.
+            received_amount = _calc_received_amount(order_resp, pre_step_position)
 
-                if received_amount <= 0:
-                    # Fallback: some exchange responses return receive_<coin>=0
-                    # even when the order is filled.  Verify the live balance
-                    # and treat any increase as a filled amount so we don't
-                    # abandon a real position.
+            if decision.action == "buy" and received_amount <= 0:
+                order_id = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                if order_id:
                     try:
-                        acct_info = self.client.get_account_info()
-                        balance_dict = (acct_info.get("return") or {}).get("balance") or {}
-                        actual_balance = float(balance_dict.get(base_coin) or "0")
-                        balance_delta = actual_balance - pre_step_position
-                        if balance_delta > 0:
-                            received_amount = min(step_amount, balance_delta)
-                            logger.info(
-                                "Buy response showed receive_%s=0 but account balance increased by %.8f — "
-                                "recording filled buy",
-                                base_coin.upper(),
-                                received_amount,
-                            )
-                    except Exception:
-                        # Do not block the trade; fall back to pending logic below.
-                        pass
+                        self.client.cancel_order(snapshot["pair"], order_id, decision.action)
+                        logger.info("Cancelled unfilled buy order %s on %s before retrying", order_id, snapshot["pair"])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning("Failed to cancel unfilled buy order %s on %s: %s", order_id, snapshot["pair"], exc)
+
+                retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct)
+                retry_price = reference_price
+                if retry_bump > 0:
+                    retry_price = min(reference_price * (1 + retry_bump), allowed_max)
+                    _fmt_price = getattr(self.client, "format_price", None)
+                    if callable(_fmt_price):
+                        retry_price = _fmt_price(snapshot["pair"], retry_price)
+                if retry_price > reference_price:
+                    logger.info(
+                        "Retrying buy at more aggressive price: %.10f → %.10f (pair=%s)",
+                        reference_price,
+                        retry_price,
+                        snapshot["pair"],
+                    )
+                    order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, step_amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    reference_price = retry_price
+                    received_amount = _calc_received_amount(order_resp, pre_step_position)
 
                 if received_amount <= 0:
                     logger.info(
-                        "Buy order placed but not filled yet (receive_%s=0) — leaving position unchanged",
-                        base_coin.upper(),
+                        "Buy order not filled after retry (pair=%s) — will re-evaluate on next cycle",
+                        snapshot["pair"],
                     )
-                    _tracker.mark_pending_buy(step_amount, reference_price)
                     remaining_amount -= step_amount
                     executed_steps.append(
                         {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}

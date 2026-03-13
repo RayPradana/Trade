@@ -4039,6 +4039,7 @@ class BuyPendingFillTests(unittest.TestCase):
             dry_run=False,
             multi_position_enabled=False,
             max_slippage_pct=1.0,  # allow buy path without slippage skip
+            min_order_idr=1,  # keep test focused on pending-fill handling
         )
         trader = Trader(config, client=_LiveClient())
 
@@ -4121,6 +4122,76 @@ class BuyPendingFillTests(unittest.TestCase):
         self.assertIsNone(outcome["executed_steps"][0].get("pending"))
         # Fallback should have queried the live balance
         self.assertGreater(trader.client.balance_calls, 0)
+
+    def test_buy_zero_receive_retries_more_aggressively(self) -> None:
+        """When a buy is unfilled, the bot must cancel and retry at a higher price."""
+
+        class _LiveClient:
+            def __init__(self) -> None:
+                self.calls: list[float] = []
+                self.cancelled: tuple[str, str] | None = None
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["24.5", "10"]], "sell": [["25", "10"]]}
+
+            def get_summaries(self) -> dict:
+                return {}
+
+            def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+                return {"min_coin": 0.0, "min_idr": 0.0}
+
+            def load_pair_min_orders(self) -> None:
+                pass
+
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                self.calls.append(price)
+                coin = pair.split("_")[0]
+                if len(self.calls) == 1:
+                    return {"success": 1, "return": {f"receive_{coin}": "0", "order_id": "111"}}
+                return {"success": 1, "return": {f"receive_{coin}": str(amount), "order_id": "222"}}
+
+            def cancel_order(self, pair: str, order_id: str, order_type: str):
+                self.cancelled = (order_id, order_type)
+
+            def invalidate_account_info_cache(self) -> None:
+                pass
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            multi_position_enabled=False,
+            max_slippage_pct=1.0,
+            entry_aggressiveness_pct=0.0,  # force first price to match ask
+            entry_retry_aggressiveness_pct=0.01,  # bump retry by 1%
+            min_order_idr=1,
+            min_buy_price_idr=0,
+            min_coin_price_idr=0,
+        )
+        client = _LiveClient()
+        trader = Trader(config, client=client)
+
+        decision = StrategyDecision(
+            mode="scalping",
+            action="buy",
+            confidence=0.9,
+            reason="entry",
+            target_price=25.0,
+            amount=100.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        depth = {"buy": [["24.5", "10"]], "sell": [["25", "10"]]}
+        snapshot = {"pair": "pixel_idr", "price": 25.0, "decision": decision, "depth": depth, "orderbook": None}
+
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "placed")
+        self.assertAlmostEqual(trader.tracker.base_position, 100.0)
+        self.assertGreater(len(client.calls), 1)
+        self.assertGreater(client.calls[1], client.calls[0])
+        self.assertIsNotNone(client.cancelled)
+        self.assertIsNone(outcome["executed_steps"][0].get("pending"))
 
 
 class RugPullFilterTests(unittest.TestCase):

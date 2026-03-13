@@ -119,6 +119,8 @@ class BotConfig:
     # Small aggressiveness bump to make limit orders more likely to fill by
     # crossing the top of book while staying within slippage guards.
     entry_aggressiveness_pct: float = 0.0005
+    # Extra bump used for a one-off retry when the first buy attempt isn't filled.
+    entry_retry_aggressiveness_pct: float = 0.001
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
@@ -670,6 +672,7 @@ class BotConfig:
             slow_window=_env_int("SLOW_WINDOW", "48"),
             max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", "0.001"),
             entry_aggressiveness_pct=_env_float("ENTRY_AGGRESSIVENESS_PCT", "0.0005"),
+            entry_retry_aggressiveness_pct=_env_float("ENTRY_RETRY_AGGRESSIVENESS_PCT", "0.001"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
             target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
             max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),
@@ -860,6 +863,8 @@ class BotConfig:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
         if self.entry_aggressiveness_pct < 0:
             raise ValueError("ENTRY_AGGRESSIVENESS_PCT must be non-negative")
+        if self.entry_retry_aggressiveness_pct < 0:
+            raise ValueError("ENTRY_RETRY_AGGRESSIVENESS_PCT must be non-negative")
         if self.initial_capital <= 0:
             raise ValueError("INITIAL_CAPITAL must be positive (e.g. INITIAL_CAPITAL=1000000)")
         if self.staged_entry_steps <= 0:
