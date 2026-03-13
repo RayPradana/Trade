@@ -2351,6 +2351,31 @@ class Trader:
                     self._circuit_breaker_until = time.time() + self.config.circuit_breaker_pause_seconds
                     logger.warning("Circuit breaker triggered after %d errors: %s", self._consecutive_errors, exc)
                 raise
+
+            # Indodax returns ``receive_<coin>`` in the trade response.  When a
+            # buy limit order is merely placed (not filled) this value is 0.
+            # Avoid opening a phantom position in that case.
+            received_amount = step_amount
+            if decision.action == "buy":
+                base_coin = snapshot["pair"].split("_")[0].lower()
+                receive_key = f"receive_{base_coin}"
+                try:
+                    received_amount = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
+                except (TypeError, ValueError):
+                    received_amount = 0.0
+
+                if received_amount <= 0:
+                    logger.info(
+                        "Buy order placed but not filled yet (receive_%s=0) — leaving position unchanged",
+                        base_coin.upper(),
+                    )
+                    remaining_amount -= step_amount
+                    executed_steps.append(
+                        {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
+                    )
+                    continue
+
+            step_amount = min(step_amount, received_amount)
             _tracker.record_trade(decision.action, reference_price, step_amount)
             remaining_amount -= step_amount
             executed_steps.append({"amount": step_amount, "price": reference_price, "order": order_resp})

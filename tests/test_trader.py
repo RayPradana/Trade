@@ -3597,6 +3597,60 @@ class ForceSellDustTests(unittest.TestCase):
         self.assertEqual(trader.tracker.base_position, 0.0)
 
 
+class BuyPendingFillTests(unittest.TestCase):
+    def test_buy_with_zero_receive_does_not_open_position(self) -> None:
+        """A buy order that isn't filled (receive_<coin>=0) must not mark the bot as holding."""
+
+        class _LiveClient:
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["224", "10"]], "sell": [["225", "10"]]}
+
+            def get_summaries(self) -> dict:
+                return {}
+
+            def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+                return {"min_coin": 0.0, "min_idr": 0.0}
+
+            def load_pair_min_orders(self) -> None:
+                pass
+
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                self.pair = pair
+                self.order_type = order_type
+                self.amount = amount
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": "0", "order_id": "123"}}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            multi_position_enabled=False,
+            max_slippage_pct=1.0,  # allow buy path without slippage skip
+        )
+        trader = Trader(config, client=_LiveClient())
+
+        decision = StrategyDecision(
+            mode="scalping",
+            action="buy",
+            confidence=0.9,
+            reason="entry",
+            target_price=224.0,
+            amount=100.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        depth = {"buy": [["224", "10"]], "sell": [["225", "10"]]}
+        snapshot = {"pair": "pixel_idr", "price": 224.0, "decision": decision, "depth": depth, "orderbook": None}
+
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "placed")
+        self.assertAlmostEqual(outcome["amount"], 0.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertTrue(outcome["executed_steps"][0].get("pending"))
+
+
 class RugPullFilterTests(unittest.TestCase):
     """Tests for the rug-pull / dead-coin filter in analyze_market."""
 
