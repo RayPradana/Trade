@@ -1644,6 +1644,52 @@ class Trader:
             return f"small_coin_low_trades {trades_24h} < {min_trades}"
         return None
 
+    def _cancel_open_buy_orders(
+        self,
+        pair: str,
+        tracker: "PortfolioTracker",
+        reason: Optional[str] = None,
+    ) -> int:
+        """Cancel any open BUY orders for *pair* when conditions turn unfavourable.
+
+        Returns the number of cancelled orders.  When no position is held the
+        per-pair tracker is rolled back and its capital slice (if any) is
+        returned to the multi-position pool so the bot can seek another pair.
+        """
+        if self.config.dry_run or self.config.api_key is None:
+            return 0
+        try:
+            open_resp = self.client.open_orders(pair)
+            orders = (open_resp.get("return") or {}).get("orders") or []
+        except Exception as exc:
+            logger.warning("Unable to fetch open orders for %s: %s", pair, exc)
+            return 0
+
+        cancelled = 0
+        for order in orders if isinstance(orders, list) else []:
+            if str(order.get("type", "")).lower() != "buy":
+                continue
+            order_id = str(order.get("order_id"))
+            try:
+                self.client.cancel_order(pair, order_id, "buy")
+                cancelled += 1
+                logger.info(
+                    "Cancelled open buy order %s for %s%s",
+                    order_id,
+                    pair,
+                    f" ({reason})" if reason else "",
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to cancel order %s for %s: %s", order_id, pair, exc)
+
+        if cancelled:
+            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
+            if tracker.base_position <= 0:
+                tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+        return cancelled
+
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         _pair = snapshot["pair"]
         decision: StrategyDecision = snapshot["decision"]
@@ -1864,6 +1910,7 @@ class Trader:
             return self._execute_grid(snapshot)
 
         if decision.action == "hold":
+            self._cancel_open_buy_orders(_pair, _tracker, decision.reason)
             _portfolio = self.portfolio_snapshot(_pair, price)
             logger.info("Hold action | reason=%s | portfolio=%s", decision.reason, _portfolio)
             outcome = {"status": "hold", "reason": decision.reason, "portfolio": _portfolio}

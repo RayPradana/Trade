@@ -3645,6 +3645,71 @@ class ForceSellDustTests(unittest.TestCase):
         self.assertAlmostEqual(trader.tracker.base_position, 3000.0)
 
 
+class RiskHoldCancellationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
+    def test_hold_cancels_open_buy_orders_and_returns_placeholder_cash(self) -> None:
+        class _LiveClient(GuardedTrader._Client):
+            def __init__(self) -> None:
+                self.cancelled: list[str] = []
+                self.invalidated = False
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": [{"order_id": "111", "type": "buy"}, {"order_id": "222", "type": "sell"}]}}
+
+            def cancel_order(self, pair: str, order_id: str, order_type: str | None = None):
+                self.cancelled.append(str(order_id))
+                return {"success": 1}
+
+            def invalidate_open_orders_cache(self, pair: str | None = None):
+                self.invalidated = True
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=True,
+            multi_position_max=2,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+
+        initial_cash = trader.multi_manager.cash
+        tracker = trader.multi_manager.allocate_capital("pixel_idr")
+        # Allocation reduces the shared cash pool until the position is cancelled/closed.
+        self.assertAlmostEqual(trader.multi_manager.cash, initial_cash - tracker.cash, places=2)
+
+        snapshot = {
+            "pair": "pixel_idr",
+            "price": 255.0,
+            "decision": StrategyDecision(
+                mode="swing_trading",
+                action="hold",
+                confidence=0.0,
+                reason="risk_management",
+                target_price=255.0,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "hold")
+        # Only the BUY order should be cancelled.
+        self.assertEqual(trader.client.cancelled, ["111"])
+        self.assertTrue(trader.client.invalidated)
+        # Placeholder tracker should be released so the bot can allocate elsewhere.
+        self.assertIsNone(trader.multi_manager.get_tracker("pixel_idr"))
+        self.assertAlmostEqual(trader.multi_manager.cash, initial_cash, places=2)
+
+
 class BuyPendingFillTests(unittest.TestCase):
     def test_buy_with_zero_receive_does_not_open_position(self) -> None:
         """A buy order that isn't filled (receive_<coin>=0) must not mark the bot as holding."""
