@@ -3645,6 +3645,59 @@ class ForceSellDustTests(unittest.TestCase):
         # Position should remain intact because we did not clear dust
         self.assertAlmostEqual(trader.tracker.base_position, 3000.0)
 
+    def test_force_sell_uses_idr_minimum_not_coin_amount(self) -> None:
+        """Ensure force_sell validates IDR value so sells proceed when rupiah minimum is met even if coin amount is below a coin threshold."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def __init__(self) -> None:
+                self.placed: list[tuple[str, str, float, float]] = []
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "1.0", "idr": "1000000"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["50000", "1"]]}
+
+            def get_pair_min_order(self, pair: str):
+                # Coin minimum is above our amount, but IDR minimum is satisfied.
+                return {"min_coin": 5.0, "min_idr": 10_000.0}
+
+            def create_order(self, pair, order_type, price, amount):
+                self.placed.append((pair, order_type, price, amount))
+                return {"order_id": "123"}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+            min_order_idr=30_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 50_000.0, 1.0)  # position = 1 BTC @ 50,000 IDR
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=50_000.0,
+            amount=1.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 50_000.0, "decision": decision}
+
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertEqual(len(trader.client.placed), 1)
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
 
 class RiskHoldCancellationTests(unittest.TestCase):
     def setUp(self) -> None:

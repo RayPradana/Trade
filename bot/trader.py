@@ -2932,23 +2932,21 @@ class Trader:
         # would raise "Minimum order X COIN" and cause repeated error loops).
         _get_min = getattr(self.client, "get_pair_min_order", None)
         min_info = _get_min(pair) if callable(_get_min) else {}
-        min_coin = min_info.get("min_coin", 0.0)
         min_idr_per_pair = min_info.get("min_idr", 0.0)
         sell_idr_value = amount * reference_price
 
-        # Compute effective minimum from both per-pair info and global config.
+        # Indodax enforces minimum order size by total IDR value, not coin amount.
+        # Keep the effective threshold in rupiah to mirror that rule.
         effective_min_idr = max(self.config.min_order_idr, min_idr_per_pair)
-        is_below_coin_min = min_coin > 0 and amount < min_coin
         is_below_idr_min = effective_min_idr > 0 and sell_idr_value < effective_min_idr
 
-        if is_below_coin_min or is_below_idr_min:
+        if is_below_idr_min:
             logger.warning(
                 "force_sell: sell amount %.8f %s (Rp %.0f) is below exchange minimum "
-                "(min_coin=%.8f  min_idr=%.0f) — clearing dust position without order",
+                "(min_idr=%.0f) — clearing dust position without order",
                 amount,
                 pair.split("_")[0].upper(),
                 sell_idr_value,
-                min_coin,
                 effective_min_idr,
             )
             _tracker.cancel_pending_buy()
@@ -2983,33 +2981,37 @@ class Trader:
                         parsed_min = float(_m.group(1))
                     except ValueError:
                         pass
-            if parsed_min is not None and amount < parsed_min:
-                logger.warning(
-                    "force_sell: caught minimum order error for %s "
-                    "(amount=%.8f < min=%.8f) — clearing dust position",
-                    pair,
-                    amount,
-                    parsed_min,
-                )
-                # Update the cache with the exchange-reported minimum so
-                # future attempts won't hit the same error.
-                _cache = getattr(self.client, "_pair_min_order", None)
-                if isinstance(_cache, dict):
-                    cached = _cache.setdefault(pair.lower(), {})
-                    if parsed_min > cached.get("min_coin", 0.0):
-                        cached["min_coin"] = parsed_min
-                _tracker.cancel_pending_buy()
-                if self.multi_manager is not None:
-                    self.multi_manager.return_position_cash(pair)
-                outcome = {
-                    "status": "dust_cleared",
-                    "pair": pair,
-                    "price": reference_price,
-                    "amount": amount,
-                    "portfolio": _tracker.as_dict(reference_price),
-                }
-                self._persist_after_trade(pair)
-                return outcome
+            if parsed_min is not None:
+                parsed_min_idr = parsed_min * reference_price
+                if parsed_min_idr > 0:
+                    effective_min_idr = max(effective_min_idr, parsed_min_idr)
+                    if sell_idr_value < parsed_min_idr:
+                        logger.warning(
+                            "force_sell: caught minimum order error for %s "
+                            "(value=Rp%.0f < min_idr=Rp%.0f) — clearing dust position",
+                            pair,
+                            sell_idr_value,
+                            parsed_min_idr,
+                        )
+                        # Update the cache with the exchange-reported minimum so
+                        # future attempts won't hit the same error.
+                        _cache = getattr(self.client, "_pair_min_order", None)
+                        if isinstance(_cache, dict):
+                            cached = _cache.setdefault(pair.lower(), {})
+                            if parsed_min_idr > cached.get("min_idr", 0.0):
+                                cached["min_idr"] = parsed_min_idr
+                        _tracker.cancel_pending_buy()
+                        if self.multi_manager is not None:
+                            self.multi_manager.return_position_cash(pair)
+                        outcome = {
+                            "status": "dust_cleared",
+                            "pair": pair,
+                            "price": reference_price,
+                            "amount": amount,
+                            "portfolio": _tracker.as_dict(reference_price),
+                        }
+                        self._persist_after_trade(pair)
+                        return outcome
             # Amount was not below the parsed minimum — bubble up so the caller
             # sees the real failure instead of silently clearing the position.
             raise
