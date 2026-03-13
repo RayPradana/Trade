@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 import re
+import threading
 import time
 from urllib.parse import urlencode
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,10 @@ class IndodaxClient:
         order_queue: Optional[RateLimitedOrderQueue] = None,
         order_min_interval: float = 0.25,
         enable_queue: bool = True,
+        *,
+        public_min_interval: float = 0.15,
+        public_time_provider=None,
+        public_sleeper=None,
     ) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
@@ -42,6 +47,12 @@ class IndodaxClient:
         )
         if self.order_queue is None and enable_queue:
             self.order_queue = RateLimitedOrderQueue(min_interval=order_min_interval)
+        # Public REST rate-limit (serialize calls across threads).
+        self.public_min_interval = max(0.0, public_min_interval)
+        self._public_time = public_time_provider or time.monotonic
+        self._public_sleep = public_sleeper or time.sleep
+        self._public_lock = threading.Lock()
+        self._last_public_request: float = 0.0
         # Per-pair minimum order cache:
         #   keys are pair names (e.g. "btc_idr")
         #   values are dicts with "min_coin" (min base currency amount)
@@ -322,6 +333,22 @@ class IndodaxClient:
 
     # -------------------- helpers -------------------- #
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        # Serialize public REST calls to avoid hitting Indodax per-IP limits
+        # when multiple positions trigger concurrent fetches (depth/trades).
+        min_interval = getattr(self, "public_min_interval", 0.0)
+        if min_interval > 0:
+            lock = getattr(self, "_public_lock", None) or threading.Lock()
+            self._public_lock = lock
+            time_fn = getattr(self, "_public_time", time.monotonic)
+            sleep_fn = getattr(self, "_public_sleep", time.sleep)
+            last_ts = getattr(self, "_last_public_request", 0.0)
+            with lock:
+                now = time_fn()
+                wait = last_ts + min_interval - now
+                if wait > 0:
+                    sleep_fn(wait)
+                    now = time_fn()
+                self._last_public_request = now
         url = f"{self.base_url}{path}"
         response = self.session.get(url, params=params, timeout=self.timeout)
         return self._handle_response(response)

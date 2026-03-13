@@ -1,4 +1,7 @@
+import concurrent.futures
 import unittest
+
+import requests
 
 from bot.rate_limit import RateLimitedOrderQueue
 
@@ -151,6 +154,58 @@ class IndodaxClientCacheTests(unittest.TestCase):
         client.open_orders("btc_idr")
         client.open_orders("btc_idr")
         self.assertEqual(len(calls), 2)
+
+
+class IndodaxPublicRateLimitTests(unittest.TestCase):
+    """Public REST calls must be serialized to avoid 429 when multi-position threads run."""
+
+    def test_public_calls_are_serialized(self):
+        from bot.indodax_client import IndodaxClient
+
+        clock = _FakeClock()
+        calls: list[float] = []
+
+        class _Resp:
+            def __init__(self, status=200):
+                self.status_code = status
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise requests.HTTPError(f"{self.status_code} error")
+
+            def json(self):
+                return {}
+
+        class _Session:
+            def get(self, url, params=None, timeout=None):
+                calls.append(clock.time())
+                return _Resp()
+
+        client = IndodaxClient(
+            api_key=None,
+            api_secret=None,
+            enable_queue=False,
+            public_min_interval=1.0,
+            public_time_provider=clock.time,
+            public_sleeper=clock.sleep,
+        )
+        client.session = _Session()
+        client.base_url = "https://indodax.com"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futs = [
+                pool.submit(client.get_depth, "btc_idr"),
+                pool.submit(client.get_trades, "eth_idr"),
+            ]
+            for fut in futs:
+                fut.result(timeout=1.0)
+
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(
+            calls[1] - calls[0],
+            1.0,
+            "second public call must be delayed to respect min interval",
+        )
 
 
 class LoadPairMinOrdersFromDataTests(unittest.TestCase):
