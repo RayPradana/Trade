@@ -59,6 +59,55 @@ from .strategies import StrategyDecision, adaptive_max_positions, adaptive_risk_
 from .tracking import MultiPositionManager, PortfolioTracker
 from .journal import TradeJournal
 from .market_data import MarketDataFeed
+from .scanning import (
+    scan_multiple_markets,
+    scan_momentum,
+    scan_trends,
+    filter_by_volume,
+    filter_by_volatility,
+)
+from .execution import (
+    analyze_slippage,
+    plan_market_order,
+    monitor_execution_quality,
+    plan_order_retry,
+)
+from .risk_management import (
+    check_circuit_breaker as rm_check_circuit_breaker,
+    check_daily_loss_limit,
+    check_max_drawdown,
+    adjust_risk_dynamically,
+    check_anomaly_shutdown,
+    calculate_position_size,
+    size_by_volatility,
+)
+from .portfolio_management import (
+    evaluate_multi_asset_portfolio,
+    plan_rebalance,
+    assess_diversification,
+)
+from .ml_models import (
+    detect_regime,
+    predict_market,
+    recognize_patterns_ai,
+    detect_anomalies as ml_detect_anomalies,
+    engineer_features,
+)
+from .advanced_strategies import (
+    trend_following_signal,
+    mean_reversion_signal,
+    momentum_signal as adv_momentum_signal,
+    breakout_signal,
+    hybrid_signal,
+)
+from .orderbook import (
+    analyze_spread as ob_analyze_spread,
+    detect_imbalance as ob_detect_imbalance,
+    detect_whale_orders as ob_detect_whale_orders,
+    predict_slippage as ob_predict_slippage,
+    analyze_pressure as ob_analyze_pressure,
+    detect_spoofing_enhanced,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -856,6 +905,346 @@ class Trader:
             spread_bonus = max(0.0, 0.001 - orderbook.spread_pct) * 50
             score += spread_bonus
         return max(0.0, min(1.5, score))
+
+    def _enhanced_score_snapshot(self, snapshot: Dict[str, Any]) -> float:
+        """Enhanced scoring using ML models and advanced strategies.
+
+        Augments the base score from ``_score_snapshot`` with signals from the
+        ML prediction engine, advanced strategy module, and enhanced orderbook
+        analysis.  The extra signals contribute up to ±0.15 to the base score
+        so they **refine** pair selection without dominating it.
+        """
+        score = self._score_snapshot(snapshot)
+        candles = snapshot.get("candles", [])
+        depth = snapshot.get("raw_depth")
+
+        # ── ML regime detection ──────────────────────────────────────────────
+        if candles and len(candles) >= 10:
+            try:
+                regime = detect_regime(candles, lookback=min(30, len(candles)))
+                if regime.regime == "trending_up" and regime.confidence > 0.5:
+                    score += 0.05
+                elif regime.regime == "trending_down" and regime.confidence > 0.5:
+                    score -= 0.05
+            except Exception:
+                pass
+
+        # ── ML market prediction ─────────────────────────────────────────────
+        if candles and len(candles) >= 20:
+            try:
+                prediction = predict_market(candles)
+                if prediction.predicted_direction == "up" and prediction.model_agreement > 0.6:
+                    score += 0.05
+                elif prediction.predicted_direction == "down" and prediction.model_agreement > 0.6:
+                    score -= 0.05
+            except Exception:
+                pass
+
+        # ── Advanced strategy hybrid signal ──────────────────────────────────
+        if candles and len(candles) >= 30:
+            try:
+                votes = []
+                tf_signal = trend_following_signal(candles)
+                votes.append({
+                    "strategy": "trend_following",
+                    "action": tf_signal.action,
+                    "confidence": tf_signal.strength,
+                    "weight": 1.0,
+                })
+                mr_signal = mean_reversion_signal(candles)
+                votes.append({
+                    "strategy": "mean_reversion",
+                    "action": mr_signal.action,
+                    "confidence": abs(mr_signal.z_score) / 3.0,
+                    "weight": 0.8,
+                })
+                mom_signal = adv_momentum_signal(candles)
+                votes.append({
+                    "strategy": "momentum",
+                    "action": mom_signal.action,
+                    "confidence": mom_signal.strength,
+                    "weight": 0.9,
+                })
+                hybrid = hybrid_signal(votes)
+                if hybrid.action == "buy" and hybrid.consensus_score > 0.3:
+                    score += 0.05
+                elif hybrid.action == "sell" and hybrid.consensus_score > 0.3:
+                    score -= 0.05
+            except Exception:
+                pass
+
+        # ── Enhanced orderbook analysis ──────────────────────────────────────
+        if depth:
+            try:
+                pressure = ob_analyze_pressure(depth, snapshot.get("raw_trades", []))
+                if pressure.signal == "buy" and pressure.pressure > 0.3:
+                    score += 0.03
+                elif pressure.signal == "sell" and pressure.pressure > 0.3:
+                    score -= 0.03
+            except Exception:
+                pass
+
+        return max(0.0, min(1.5, score))
+
+    def _check_risk_management(self, snapshot: Dict[str, Any], tracker: "PortfolioTracker") -> Optional[Dict[str, Any]]:
+        """Run comprehensive risk management checks before trade execution.
+
+        Returns a skip/block dict when a risk check fails, or ``None`` when
+        all checks pass and trading may proceed.
+        """
+        price = snapshot["price"]
+        decision: StrategyDecision = snapshot["decision"]
+
+        if decision.action != "buy":
+            return None
+
+        # ── Circuit breaker (risk_management module) ─────────────────────────
+        try:
+            daily_loss = tracker.daily_loss_pct(price) * 100
+            equity_history = tracker.equity_history if hasattr(tracker, "equity_history") else []
+            drawdown_pct = 0.0
+            if equity_history and len(equity_history) >= 2:
+                peak = max(equity_history)
+                current = equity_history[-1]
+                drawdown_pct = ((peak - current) / peak * 100) if peak > 0 else 0.0
+
+            cb = rm_check_circuit_breaker(
+                daily_loss_pct=daily_loss,
+                drawdown_pct=drawdown_pct,
+                consecutive_losses=tracker.loss_streak,
+                api_errors=self._consecutive_errors,
+            )
+            if cb.is_tripped:
+                logger.warning(
+                    "🛑 Risk management circuit breaker tripped: %s (severity=%s, cooldown=%.0fs)",
+                    cb.triggers, cb.severity, cb.cooldown_seconds,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"rm_circuit_breaker: {cb.triggers}",
+                    "portfolio": tracker.as_dict(price),
+                }
+        except Exception as exc:
+            logger.debug("Risk management circuit breaker check failed: %s", exc)
+
+        # ── Anomaly detection ────────────────────────────────────────────────
+        candles = snapshot.get("candles", [])
+        if candles and len(candles) >= 10:
+            try:
+                anomaly = check_anomaly_shutdown(
+                    recent_returns=[
+                        (candles[i].close - candles[i - 1].close) / candles[i - 1].close
+                        for i in range(1, len(candles))
+                        if candles[i - 1].close > 0
+                    ],
+                )
+                if anomaly.should_shutdown:
+                    logger.warning(
+                        "🛑 Anomaly detected — blocking trade (score=%.2f, action=%s)",
+                        anomaly.anomaly_score, anomaly.recommended_action,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": f"anomaly_shutdown: score={anomaly.anomaly_score:.2f}",
+                        "portfolio": tracker.as_dict(price),
+                    }
+            except Exception as exc:
+                logger.debug("Anomaly shutdown check failed: %s", exc)
+
+        return None
+
+    def _analyze_orderbook_enhanced(self, depth: Optional[Dict], trades: Optional[list]) -> Dict[str, Any]:
+        """Run enhanced orderbook analysis using the orderbook module.
+
+        Returns a dict of additional insights that can be merged into the
+        market snapshot.
+        """
+        result: Dict[str, Any] = {}
+        if not depth:
+            return result
+
+        try:
+            spread = ob_analyze_spread(depth)
+            result["ob_spread"] = spread
+        except Exception:
+            pass
+
+        try:
+            imbalance = ob_detect_imbalance(depth)
+            result["ob_imbalance"] = imbalance
+        except Exception:
+            pass
+
+        try:
+            whales = ob_detect_whale_orders(depth)
+            result["ob_whales"] = whales
+        except Exception:
+            pass
+
+        try:
+            spoofing = detect_spoofing_enhanced(depth)
+            result["ob_spoofing"] = spoofing
+        except Exception:
+            pass
+
+        if trades:
+            try:
+                pressure = ob_analyze_pressure(depth, trades)
+                result["ob_pressure"] = pressure
+            except Exception:
+                pass
+
+        return result
+
+    def _get_ml_signals(self, candles: list) -> Dict[str, Any]:
+        """Run ML model analysis on candle data.
+
+        Returns a dict of ML signals to be included in the market snapshot.
+        """
+        result: Dict[str, Any] = {}
+        if not candles or len(candles) < 10:
+            return result
+
+        try:
+            regime = detect_regime(candles, lookback=min(30, len(candles)))
+            result["ml_regime"] = regime
+        except Exception:
+            pass
+
+        if len(candles) >= 20:
+            try:
+                prediction = predict_market(candles)
+                result["ml_prediction"] = prediction
+            except Exception:
+                pass
+
+            try:
+                patterns = recognize_patterns_ai(candles)
+                result["ml_patterns"] = patterns
+            except Exception:
+                pass
+
+            try:
+                anomalies = ml_detect_anomalies(candles)
+                result["ml_anomalies"] = anomalies
+            except Exception:
+                pass
+
+            try:
+                features = engineer_features(candles)
+                result["ml_features"] = features
+            except Exception:
+                pass
+
+        return result
+
+    def _get_advanced_strategy_signals(self, candles: list) -> Dict[str, Any]:
+        """Run advanced strategy analysis on candle data.
+
+        Returns a dict of strategy signals for the market snapshot.
+        """
+        result: Dict[str, Any] = {}
+        if not candles or len(candles) < 10:
+            return result
+
+        try:
+            result["adv_trend"] = trend_following_signal(candles)
+        except Exception:
+            pass
+
+        if len(candles) >= 20:
+            try:
+                result["adv_mean_reversion"] = mean_reversion_signal(candles)
+            except Exception:
+                pass
+
+            try:
+                result["adv_momentum"] = adv_momentum_signal(candles)
+            except Exception:
+                pass
+
+            try:
+                result["adv_breakout"] = breakout_signal(candles)
+            except Exception:
+                pass
+
+        return result
+
+    def _check_execution_quality(self, snapshot: Dict[str, Any], side: str, quantity: float) -> Dict[str, Any]:
+        """Analyze execution quality before placing an order.
+
+        Uses the execution module to predict slippage and assess execution risk.
+        Returns analysis results dict.
+        """
+        result: Dict[str, Any] = {}
+        depth = snapshot.get("raw_depth")
+        if not depth:
+            return result
+
+        try:
+            bids = [(float(b[0]), float(b[1])) for b in (depth.get("buy") or [])[:50]]
+            asks = [(float(a[0]), float(a[1])) for a in (depth.get("sell") or [])[:50]]
+            slippage = analyze_slippage(
+                side=side,
+                quantity=quantity,
+                orderbook_bids=bids,
+                orderbook_asks=asks,
+            )
+            result["slippage_analysis"] = slippage
+            if not slippage.is_safe:
+                result["slippage_warning"] = True
+                logger.warning(
+                    "⚠️ Slippage warning: estimated %.3f%% > max %.3f%% (recommended: %s)",
+                    slippage.estimated_slippage_pct * 100,
+                    slippage.max_acceptable_pct * 100,
+                    slippage.recommended_order_type,
+                )
+        except Exception as exc:
+            logger.debug("Slippage analysis failed: %s", exc)
+
+        # ── Orderbook slippage prediction ────────────────────────────────────
+        if depth:
+            try:
+                ob_slip = ob_predict_slippage(depth, quantity, side=side)
+                result["ob_slippage"] = ob_slip
+            except Exception:
+                pass
+
+        return result
+
+    def _get_portfolio_analysis(self) -> Dict[str, Any]:
+        """Run portfolio management analysis on current holdings.
+
+        Returns portfolio analysis results dict.
+        """
+        result: Dict[str, Any] = {}
+        positions = self.active_positions
+        if not positions:
+            return result
+
+        try:
+            holdings = {}
+            for pair, tracker in positions.items():
+                holdings[pair] = tracker.base_position
+            if holdings:
+                portfolio = evaluate_multi_asset_portfolio(holdings)
+                result["portfolio_eval"] = portfolio
+        except Exception:
+            pass
+
+        try:
+            if len(positions) >= 2:
+                weights = {}
+                total_value = sum(t.base_position for t in positions.values())
+                if total_value > 0:
+                    for pair, tracker in positions.items():
+                        weights[pair] = tracker.base_position / total_value
+                    diversification = assess_diversification(weights)
+                    result["diversification"] = diversification
+        except Exception:
+            pass
+
+        return result
 
     def _pair_volume(self, pair: str) -> float:
         """Return the cached 24-h IDR trading volume for *pair*, or 0.0.
@@ -1722,7 +2111,7 @@ class Trader:
                     **{**decision.__dict__, "confidence": round(boosted_conf, 3),
                        "reason": decision.reason + " corr_confirm"}
                 )
-        return {
+        _snapshot_base = {
             "pair": pair,
             "price": price,
             "trend": trend,
@@ -1749,7 +2138,13 @@ class Trader:
             "micro_trend": micro_trend,
             "volume_24h_idr": self._extract_volume_idr(ticker),
             "trades_24h": trades_24h,
+            "raw_depth": depth,
+            "raw_trades": trades,
         }
+        _snapshot_base.update(self._get_ml_signals(candles))
+        _snapshot_base.update(self._get_advanced_strategy_signals(candles))
+        _snapshot_base.update(self._analyze_orderbook_enhanced(depth, trades))
+        return _snapshot_base
 
     def _check_small_coin_ob_quality(
         self,
@@ -2098,6 +2493,11 @@ class Trader:
         if self.config.max_consecutive_losses > 0 and decision.action == "buy":
             if _tracker.loss_streak >= self.config.max_consecutive_losses:
                 return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": _tracker.as_dict(price)}
+
+        # ── Enhanced risk management (risk_management module) ────────────────
+        _rm_block = self._check_risk_management(snapshot, _tracker)
+        if _rm_block is not None:
+            return _rm_block
 
         # ── Per-pair trade cooldown ───────────────────────────────────────────
         if self.config.pair_cooldown_seconds > 0 and decision.action == "buy":
@@ -2761,6 +3161,17 @@ class Trader:
                     # Do not block the trade; fall back to pending logic below.
                     pass
             return received
+
+        # ── Pre-trade execution quality analysis ─────────────────────────────
+        if decision.action == "buy":
+            _exec_quality = self._check_execution_quality(
+                snapshot, side=decision.action, quantity=effective_amount,
+            )
+            if _exec_quality.get("slippage_warning"):
+                logger.info(
+                    "Execution quality warning for %s — proceeding with caution",
+                    snapshot["pair"],
+                )
 
         for amt in staged:
             step_amount = min(amt, remaining_amount)
@@ -3805,7 +4216,7 @@ class Trader:
             if decision.action == "hold":
                 # Keep the best hold so we can return real data in the fallback
                 # instead of triggering another REST round-trip.
-                score = self._score_snapshot(snapshot)
+                score = self._enhanced_score_snapshot(snapshot)
                 if score > best_hold_score:
                     best_hold_score = score
                     best_hold_pair = pair
@@ -3816,13 +4227,13 @@ class Trader:
             # treat it as "hold" here so the scanner continues looking for BUY
             # opportunities on other pairs instead of returning early.
             if decision.action == "sell" and self._active_tracker(pair).base_position <= 0:
-                score = self._score_snapshot(snapshot)
+                score = self._enhanced_score_snapshot(snapshot)
                 if score > best_hold_score:
                     best_hold_score = score
                     best_hold_pair = pair
                     best_hold_snapshot = snapshot
                 continue
-            score = self._score_snapshot(snapshot)
+            score = self._enhanced_score_snapshot(snapshot)
             if score > best_score:
                 best_score = score
                 best_snapshot = snapshot
