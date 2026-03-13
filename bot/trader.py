@@ -2883,7 +2883,7 @@ class Trader:
                         parsed_min = float(_m.group(1))
                     except ValueError:
                         pass
-            if parsed_min is not None:
+            if parsed_min is not None and amount < parsed_min:
                 logger.warning(
                     "force_sell: caught minimum order error for %s "
                     "(amount=%.8f < min=%.8f) — clearing dust position",
@@ -2910,6 +2910,8 @@ class Trader:
                 }
                 self._persist_after_trade(pair)
                 return outcome
+            # Amount was not below the parsed minimum — bubble up so the caller
+            # sees the real failure instead of silently clearing the position.
             raise
 
         _tracker.record_trade("sell", reference_price, amount)

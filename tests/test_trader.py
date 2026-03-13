@@ -3596,6 +3596,54 @@ class ForceSellDustTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "dust_cleared")
         self.assertEqual(trader.tracker.base_position, 0.0)
 
+    def test_force_sell_does_not_clear_when_amount_meets_minimum(self) -> None:
+        """Minimum-order error with amount >= min must bubble up instead of clearing dust."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"wtec": "3000", "idr": "459125"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_pair_min_order(self, pair: str):
+                # min_coin is well below the amount to sell
+                return {"min_coin": 0.1, "min_idr": 0.0}
+
+            def create_order(self, pair, order_type, price, amount):
+                raise RuntimeError(
+                    "API error: {'success': 0, 'error': 'Minimum order 0.1 WTEC', 'error_code': ''}"
+                )
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+            min_order_idr=1.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 1.0, 3000.0)  # position = 3000 WTEC @ 1 IDR
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=1.0,
+            amount=3000.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "wtec_idr", "price": 1.0, "decision": decision}
+
+        with self.assertRaises(RuntimeError):
+            trader.force_sell(snapshot)
+        # Position should remain intact because we did not clear dust
+        self.assertAlmostEqual(trader.tracker.base_position, 3000.0)
+
 
 class BuyPendingFillTests(unittest.TestCase):
     def test_buy_with_zero_receive_does_not_open_position(self) -> None:
