@@ -219,8 +219,22 @@ class IndodaxClient:
     def get_summaries(self) -> Dict[str, Any]:
         return self._get("/api/summaries")
 
+    def get_server_time(self) -> Dict[str, Any]:
+        """Return the Indodax server time from ``/api/server_time``.
+
+        :returns: ``{"server_time": <unix_timestamp>}``
+        """
+        return self._get("/api/server_time")
+
     def get_ticker(self, pair: str) -> Dict[str, Any]:
         return self._get(f"/api/ticker/{pair}")
+
+    def get_ticker_all(self) -> Dict[str, Any]:
+        """Return tickers for all pairs from ``/api/ticker_all``.
+
+        :returns: ``{"tickers": {"btc_idr": {...}, ...}}``
+        """
+        return self._get("/api/ticker_all")
 
     def get_depth(self, pair: str, count: int = 50) -> Dict[str, Any]:
         return self._get(f"/api/depth/{pair}", params={"count": count})
@@ -442,6 +456,184 @@ class IndodaxClient:
             payload["type"] = order_type
         return self._enqueue_private("cancelOrder", payload)
 
+    def cancel_by_client_order_id(self, client_order_id: str) -> Dict[str, Any]:
+        """Cancel an open order by its ``client_order_id``.
+
+        Rate-limited to 30 requests/second on the Indodax side.
+
+        :param client_order_id: The client-supplied order ID.
+        :returns: Response dict with ``order_id``, ``client_order_id``, ``type``, ``pair``, ``balance``.
+        """
+        return self._enqueue_private("cancelByClientOrderId", {"client_order_id": client_order_id})
+
+    def get_order(self, pair: str, order_id: str) -> Dict[str, Any]:
+        """Get specific order details using ``getOrder``.
+
+        :param pair: Trading pair (e.g. ``btc_idr``).
+        :param order_id: The exchange-assigned order ID.
+        :returns: Response dict containing order details.
+        """
+        return self._post_private("getOrder", {"pair": pair, "order_id": order_id})
+
+    def get_order_by_client_id(self, client_order_id: str) -> Dict[str, Any]:
+        """Get specific order details by ``client_order_id`` using ``getOrderByClientOrderId``.
+
+        :param client_order_id: The client-supplied order ID.
+        :returns: Response dict containing order details.
+        """
+        return self._post_private("getOrderByClientOrderId", {"client_order_id": client_order_id})
+
+    def order_history(self, pair: str, count: int = 1000, from_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get order history (buy and sell) via the legacy ``orderHistory`` TAPI method.
+
+        .. note:: This endpoint is scheduled for decommission on April 7, 2026.
+           Use :meth:`get_order_history_v2` for the replacement endpoint.
+
+        :param pair: Trading pair (e.g. ``btc_idr``).
+        :param count: Number of orders to return (default 1000).
+        :param from_id: Starting order ID for pagination.
+        """
+        payload: Dict[str, Any] = {"pair": pair, "count": count}
+        if from_id is not None:
+            payload["from"] = from_id
+        return self._post_private("orderHistory", payload)
+
+    def withdraw_fee(self, currency: str, network: Optional[str] = None) -> Dict[str, Any]:
+        """Check withdrawal fee for a currency.
+
+        Requires withdraw permission on the API key.
+
+        :param currency: Currency code (e.g. ``btc``, ``eth``).
+        :param network: Optional network (e.g. ``erc20``, ``trc20``, ``bep20``).
+        :returns: ``{"server_time": ..., "withdraw_fee": ..., "currency": ...}``
+        """
+        payload: Dict[str, Any] = {"currency": currency}
+        if network:
+            payload["network"] = network
+        return self._post_private("withdrawFee", payload)
+
+    def withdraw_coin(
+        self,
+        currency: str,
+        withdraw_address: str,
+        withdraw_amount: float,
+        request_id: str,
+        *,
+        network: Optional[str] = None,
+        withdraw_memo: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Withdraw cryptocurrency assets.
+
+        Requires withdraw permission on the API key and a configured Callback URL.
+
+        :param currency: Currency to withdraw (e.g. ``btc``, ``eth``).
+        :param withdraw_address: Receiver address.
+        :param withdraw_amount: Amount to send.
+        :param request_id: Unique alphanumeric ID to identify this request (max 255 chars).
+        :param network: Network if required (e.g. ``erc20``, ``trc20``).
+        :param withdraw_memo: Optional memo/destination tag.
+        """
+        payload: Dict[str, Any] = {
+            "currency": currency,
+            "withdraw_address": withdraw_address,
+            "withdraw_amount": f"{withdraw_amount:.8f}",
+            "request_id": request_id,
+        }
+        if network:
+            payload["network"] = network
+        if withdraw_memo:
+            payload["withdraw_memo"] = withdraw_memo
+        return self._post_private("withdrawCoin", payload)
+
+    def trans_history(self) -> Dict[str, Any]:
+        """Retrieve full deposit and withdrawal history via ``transHistory``.
+
+        :returns: Response dict containing withdrawal and deposit records.
+        """
+        return self._post_private("transHistory")
+
+    def check_server_time_drift(self) -> float:
+        """Compare local time against the Indodax server clock.
+
+        :returns: Drift in seconds (positive = local is ahead of server).
+        :raises RuntimeError: when the server-time endpoint fails.
+        """
+        local_before = time.time()
+        data = self.get_server_time()
+        local_after = time.time()
+        server_ts = data.get("server_time", 0)
+        if not server_ts:
+            raise RuntimeError("server_time not found in response")
+        local_mid = (local_before + local_after) / 2.0
+        drift = local_mid - float(server_ts)
+        if abs(drift) > 5.0:
+            logger.warning(
+                "Significant clock drift detected: %.2fs (local %s server)",
+                drift,
+                "ahead of" if drift > 0 else "behind",
+            )
+        return drift
+
+    # -------------------- Trade API v2 (signed GET) -------------------- #
+    def get_order_history_v2(
+        self,
+        symbol: str,
+        *,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+        sort: str = "desc",
+    ) -> Dict[str, Any]:
+        """Retrieve order history via the new ``GET /api/v2/order/histories`` endpoint.
+
+        This replaces the legacy ``orderHistory`` TAPI method with improved
+        stability and reliability.
+
+        :param symbol: Trading pair symbol without underscore (e.g. ``btcidr``).
+        :param start_time: Start of range (Unix ms). Default: last 24h.
+        :param end_time: End of range (Unix ms). Default: last 24h.
+        :param limit: Number of orders (10–1000, default 100).
+        :param sort: ``asc`` or ``desc`` (default ``desc``).
+        :returns: ``{"data": [{"orderId": ..., "symbol": ..., ...}, ...]}``
+        """
+        params: Dict[str, Any] = {"symbol": symbol, "limit": limit, "sort": sort}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        return self._get_signed("/api/v2/order/histories", params)
+
+    def get_trade_history_v2(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 500,
+        sort: str = "desc",
+    ) -> Dict[str, Any]:
+        """Retrieve trade execution history via ``GET /api/v2/myTrades``.
+
+        This replaces the legacy ``tradeHistory`` TAPI method.
+
+        :param symbol: Trading pair symbol without underscore (e.g. ``btcidr``).
+        :param order_id: Optional filter by order ID.
+        :param start_time: Start of range (Unix ms). Default: last 24h.
+        :param end_time: End of range (Unix ms). Default: last 24h.
+        :param limit: Number of trades (10–1000, default 500).
+        :param sort: ``asc`` or ``desc`` (default ``desc``).
+        :returns: ``{"data": [{"tradeId": ..., "orderId": ..., ...}, ...]}``
+        """
+        params: Dict[str, Any] = {"symbol": symbol, "limit": limit, "sort": sort}
+        if order_id is not None:
+            params["orderId"] = order_id
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        return self._get_signed("/api/v2/myTrades", params)
+
     @staticmethod
     def parse_minimum_order_error(error_message: str) -> Optional[float]:
         """Extract the minimum required coin amount from a 'Minimum order' error.
@@ -469,6 +661,46 @@ class IndodaxClient:
         if scheduler is not None:
             return scheduler.submit(self._perform_get, path, params).result()
         return self._perform_get(path, params)
+
+    def _get_signed(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Perform a signed GET request for Trade API v2 endpoints.
+
+        Trade API v2 (``/api/v2/...``) uses ``X-APIKEY`` and ``Sign`` headers
+        with HMAC-SHA512 over the query string, as described in the Indodax
+        Trade API v2 documentation.
+        """
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None:
+            return scheduler.submit(self._perform_get_signed, path, params).result()
+        return self._perform_get_signed(path, params)
+
+    def _perform_get_signed(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        if not self.api_key:
+            raise ValueError("API key is required for signed endpoints")
+        if not self.api_secret:
+            raise ValueError("API secret is required for signed endpoints")
+
+        if params is None:
+            params = {}
+        # Add nonce and timestamp for replay protection
+        params.setdefault("timestamp", int(time.time() * 1000))
+        query_string = urlencode(params)
+        sign = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha512,
+        ).hexdigest()
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-APIKEY": self.api_key,
+            "Sign": sign,
+        }
+        url = f"{self.base_url}{path}"
+        response = self.session.get(
+            url, params=params, headers=headers, timeout=self.timeout
+        )
+        return self._handle_v2_response(response)
 
     def _perform_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         # Serialize public REST calls to avoid hitting Indodax per-IP limits
@@ -545,4 +777,33 @@ class IndodaxClient:
         # Private API success flag
         if isinstance(data, dict) and ("success" in data) and not data.get("success"):
             raise RuntimeError(f"API error: {data}")
+        return data
+
+    @staticmethod
+    def _handle_v2_response(response: requests.Response) -> Any:
+        """Handle responses from Trade API v2 endpoints.
+
+        V2 endpoints use a different error format: ``{"code": <int>, "error": "..."}``
+        instead of the TAPI ``{"success": 0, "error": "..."}``.
+        """
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            # Try to extract structured error from the body
+            try:
+                data = response.json()
+                code = data.get("code", response.status_code)
+                error = data.get("error", str(exc))
+                raise RuntimeError(f"API v2 error ({code}): {error}") from exc
+            except (ValueError, AttributeError):
+                raise RuntimeError(f"HTTP error: {exc}") from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Failed to parse JSON response") from exc
+
+        # V2 error responses include a "code" key
+        if isinstance(data, dict) and "code" in data and "error" in data:
+            raise RuntimeError(f"API v2 error ({data['code']}): {data['error']}")
         return data
