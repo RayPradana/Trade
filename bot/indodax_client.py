@@ -51,11 +51,7 @@ class IndodaxClient:
         if self.order_queue is None and enable_queue:
             self.order_queue = RateLimitedOrderQueue(min_interval=order_min_interval)
         # Generic REST scheduler (public + private) to smooth out bursts
-        self._request_scheduler = (
-            request_scheduler
-            if enable_request_scheduler
-            else None
-        )
+        self._request_scheduler = request_scheduler if (enable_request_scheduler and request_scheduler) else None
         if self._request_scheduler is None and enable_request_scheduler:
             self._request_scheduler = ApiRequestScheduler(min_interval=request_min_interval)
         # Public REST rate-limit (serialize calls across threads).
