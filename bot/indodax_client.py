@@ -6,8 +6,9 @@ import logging
 import re
 import threading
 import time
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import urlencode
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -70,6 +71,11 @@ class IndodaxClient:
         # the cache is eventually refreshed when the bot runs for multiple days.
         self._pair_min_order_cache_ttl: float = 3600.0
         self._pair_min_order_expires: float = 0.0
+        # Price increment cache (tick size per pair) from /api/price_increments.
+        # keys are pair names (e.g. "btc_idr"), values are Decimal-compatible strings.
+        self._price_increments: Dict[str, str] = {}
+        self._price_increments_ttl: float = 3600.0
+        self._price_increments_expires: float = 0.0
         # ── Private API response caches ───────────────────────────────────────
         # TTL-based in-memory caches for expensive private REST endpoints.
         # Each entry is (cached_value, expiry_timestamp).
@@ -162,6 +168,36 @@ class IndodaxClient:
         logger.info("load_pair_min_orders: cached minimum orders for %d pairs", loaded)
         ttl = getattr(self, "_pair_min_order_cache_ttl", 3600.0)
         self._pair_min_order_expires = time.time() + ttl
+
+    def load_price_increments(self, increments: Optional[Dict[str, Any]] = None) -> None:
+        """Fetch price increments (/api/price_increments) and cache tick sizes.
+
+        The API returns a mapping ``{"increments": {"btc_idr": "1000", ...}}``.
+        We keep the raw string to preserve the original decimal precision and
+        later quantize prices accordingly before sending orders.
+        """
+        if increments is None:
+            try:
+                increments = self._get("/api/price_increments")
+            except Exception as exc:
+                logger.warning("load_price_increments: failed to fetch price increments: %s", exc)
+                return
+        if not isinstance(increments, dict):
+            logger.warning("load_price_increments: unexpected response format")
+            return
+        inc_map = increments.get("increments") if isinstance(increments.get("increments"), dict) else increments
+        if not isinstance(inc_map, dict):
+            logger.warning("load_price_increments: missing increments map")
+            return
+        self._price_increments = {k.lower(): str(v) for k, v in inc_map.items() if v is not None}
+        self._price_increments_expires = time.time() + getattr(self, "_price_increments_ttl", 3600.0)
+
+    def is_price_increment_cache_stale(self) -> bool:
+        return time.time() >= getattr(self, "_price_increments_expires", 0.0)
+
+    def get_price_increment(self, pair: str) -> Optional[str]:
+        """Return cached tick size string for *pair*, or ``None`` if unknown."""
+        return self._price_increments.get(pair.lower())
 
     def get_pair_min_order(self, pair: str) -> Dict[str, float]:
         """Return the cached minimum order sizes for *pair*.
@@ -302,23 +338,56 @@ class IndodaxClient:
             raise RuntimeError(f"Failed to obtain private WS token: {data}")
         return {"connToken": ret["connToken"], "channel": ret["channel"]}
 
-    def format_price(self, pair: str, price: float) -> float:
-        """Round *price* to the precision expected by the exchange for *pair*.
+    def _maybe_refresh_price_increments(self) -> None:
+        if not self._price_increments or self.is_price_increment_cache_stale():
+            self.load_price_increments()
 
-        Indodax IDR pairs reject prices with excessive decimal places (e.g.,
-        ``"decimal number for price is 3"``).  Round IDR pairs to 2 decimals
-        and leave others at the default 8-decimal precision.
+    def format_price(self, pair: str, price: float) -> Tuple[float, int]:
+        """Round *price* to the tick size expected by the exchange for *pair*.
+
+        Uses ``/api/price_increments`` when available to quantize prices so
+        Indodax does not reject orders with messages like "decimal number for
+        price is 3". Returns the rounded price plus the decimal precision used
+        for string formatting.
         """
-        precision = 2 if pair.endswith("_idr") else 8
-        return round(price, precision)
+        precision = 8  # default
+        quantized_price = price
+        used_increment = False
+
+        try:
+            self._maybe_refresh_price_increments()
+            inc_str = self.get_price_increment(pair)
+            if inc_str:
+                step = Decimal(str(inc_str))
+                if step > 0:
+                    precision = max(0, -step.as_tuple().exponent)
+                    quantized_price = float(
+                        (Decimal(price) / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step
+                    )
+                    used_increment = True
+        except (InvalidOperation, ValueError):
+            pass
+
+        # Fallback when increment is unavailable: IDR pairs default to integer prices.
+        if not used_increment:
+            if pair.endswith("_idr"):
+                precision = 0
+                quantized_price = round(price)
+            else:
+                precision = 8
+                quantized_price = round(price, precision)
+
+        return quantized_price, precision
 
     def create_order(self, pair: str, order_type: str, price: float, amount: float) -> Dict[str, Any]:
-        price = self.format_price(pair, price)
-        payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": f"{price:.8f}"}
+        price, precision = self.format_price(pair, price)
+        price_str = f"{price:.{precision}f}"
+        payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": price_str, "order_type": "limit"}
         is_idr_pair = pair.endswith("_idr")
         if order_type == "buy":
             if is_idr_pair:
-                payload["idr"] = f"{price * amount:.8f}"
+                idr_total = round(price * amount)
+                payload["idr"] = f"{idr_total:.0f}"
             else:
                 payload["amount"] = f"{amount:.8f}"
         else:
