@@ -2331,6 +2331,7 @@ class Trader:
             step_amount = min(amt, remaining_amount)
             if step_amount <= 0:
                 continue
+            pre_step_position = _tracker.base_position
             # Skip steps whose IDR value would be rejected by the exchange.
             if step_amount * reference_price < self.config.min_order_idr:
                 logger.info(
@@ -2363,6 +2364,28 @@ class Trader:
                     received_amount = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
                 except (TypeError, ValueError):
                     received_amount = 0.0
+
+                if received_amount <= 0:
+                    # Fallback: some exchange responses return receive_<coin>=0
+                    # even when the order is filled.  Verify the live balance
+                    # and treat any increase as a filled amount so we don't
+                    # abandon a real position.
+                    try:
+                        acct_info = self.client.get_account_info()
+                        balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+                        actual_balance = float(balance_dict.get(base_coin) or "0")
+                        balance_delta = actual_balance - pre_step_position
+                        if balance_delta > 0:
+                            received_amount = min(step_amount, balance_delta)
+                            logger.info(
+                                "Buy response showed receive_%s=0 but account balance increased by %.8f — "
+                                "recording filled buy",
+                                base_coin.upper(),
+                                received_amount,
+                            )
+                    except Exception:
+                        # Do not block the trade; fall back to pending logic below.
+                        pass
 
                 if received_amount <= 0:
                     logger.info(

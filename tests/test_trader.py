@@ -3698,6 +3698,66 @@ class BuyPendingFillTests(unittest.TestCase):
         self.assertAlmostEqual(trader.tracker.base_position, 0.0)
         self.assertTrue(outcome["executed_steps"][0].get("pending"))
 
+    def test_buy_zero_receive_but_balance_increases_records_position(self) -> None:
+        """If receive_<coin>=0 but live balance increases, treat buy as filled."""
+
+        class _LiveClient:
+            def __init__(self) -> None:
+                self.balance_calls = 0
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["300", "10"]], "sell": [["301", "10"]]}
+
+            def get_summaries(self) -> dict:
+                return {}
+
+            def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+                return {"min_coin": 0.0, "min_idr": 0.0}
+
+            def load_pair_min_orders(self) -> None:
+                pass
+
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": "0", "order_id": "123"}}
+
+            def get_account_info(self):
+                self.balance_calls += 1
+                # Exchange reflects the filled amount even though receive_<coin> was 0
+                return {"return": {"balance": {"pixel": "100", "idr": "900000"}}}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            multi_position_enabled=False,
+            max_slippage_pct=1.0,
+        )
+        trader = Trader(config, client=_LiveClient())
+
+        decision = StrategyDecision(
+            mode="scalping",
+            action="buy",
+            confidence=0.9,
+            reason="entry",
+            target_price=300.0,
+            amount=100.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        depth = {"buy": [["300", "10"]], "sell": [["301", "10"]]}
+        snapshot = {"pair": "pixel_idr", "price": 300.0, "decision": decision, "depth": depth, "orderbook": None}
+
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "placed")
+        self.assertAlmostEqual(outcome["amount"], 100.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 100.0)
+        self.assertEqual(trader.tracker.trade_count, 1)
+        self.assertIsNone(outcome["executed_steps"][0].get("pending"))
+        # Fallback should have queried the live balance
+        self.assertGreater(trader.client.balance_calls, 0)
+
 
 class RugPullFilterTests(unittest.TestCase):
     """Tests for the rug-pull / dead-coin filter in analyze_market."""
