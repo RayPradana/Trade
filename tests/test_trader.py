@@ -619,6 +619,70 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(outcome["amount"], 5000.0, places=2)
         self.assertEqual(placed_sell_amount, [5000.0])
 
+    def test_force_sell_cancels_existing_orders_before_selling(self) -> None:
+        """force_sell must cancel pending buy/sell orders so exits don't loop."""
+        cancelled: list = []
+        created: list = []
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair: str):
+                return {
+                    "return": {
+                        "orders": [
+                            {"order_id": "11", "type": "sell"},
+                            {"order_id": "22", "type": "buy"},
+                        ]
+                    }
+                }
+
+            def cancel_order(self, pair: str, order_id: str, order_type: str | None = None):
+                cancelled.append((order_id, order_type))
+                return {"success": 1}
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["105.0", "1"]]}
+
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                created.append((pair, order_type, price, amount))
+                return {"success": 1, "return": {}}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=105.0,
+            amount=5.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": decision}
+
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertEqual(trader.tracker.base_position, 0.0)
+        self.assertCountEqual(cancelled, [("11", "sell"), ("22", "buy")])
+        self.assertEqual(len(created), 1)
+        _, order_type, _, amount = created[0]
+        self.assertEqual(order_type, "sell")
+        self.assertAlmostEqual(amount, 5.0)
+
     def test_force_sell_below_minimum_keeps_position(self) -> None:
         """When sell value is below min IDR, force_sell must keep the position instead of clearing dust."""
 

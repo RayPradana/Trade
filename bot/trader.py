@@ -2861,6 +2861,34 @@ class Trader:
         if amount <= 0:
             return {"status": "no_position", "pair": pair, "price": price}
 
+        # Cancel any open orders (buy or sell) for this pair to avoid conflicts
+        # that would make the exit loop retry without actually liquidating.
+        try:
+            open_resp = self.client.open_orders(pair)
+            orders = (open_resp.get("return") or {}).get("orders") or []
+            for order in (orders if isinstance(orders, list) else []):
+                order_id = str(order.get("order_id") or "")
+                order_type = str(order.get("type", "")).lower()
+                if order_id and order_type in ("buy", "sell"):
+                    try:
+                        self.client.cancel_order(pair, order_id, order_type)
+                        logger.info(
+                            "force_sell: cancelled pending %s order %s for %s",
+                            order_type,
+                            order_id,
+                            pair,
+                        )
+                    except Exception as exc:  # pragma: no cover - log & continue
+                        logger.warning(
+                            "force_sell: failed to cancel %s order %s for %s: %s",
+                            order_type,
+                            order_id,
+                            pair,
+                            exc,
+                        )
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.debug("force_sell: could not fetch open orders for %s: %s", pair, exc)
+
         # Use top-of-book bid as reference price for the sell; fall back to
         # the snapshot price if the order-book fetch fails.
         reference_price = price
