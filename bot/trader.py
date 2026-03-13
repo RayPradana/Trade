@@ -2985,21 +2985,21 @@ class Trader:
                 parsed_min_idr = parsed_min * reference_price
                 if parsed_min_idr > 0:
                     effective_min_idr = max(effective_min_idr, parsed_min_idr)
-                    if sell_idr_value < parsed_min_idr:
+                    if sell_idr_value < effective_min_idr:
                         logger.warning(
                             "force_sell: caught minimum order error for %s "
                             "(value=Rp%.0f < min_idr=Rp%.0f) — clearing dust position",
                             pair,
                             sell_idr_value,
-                            parsed_min_idr,
+                            effective_min_idr,
                         )
                         # Update the cache with the exchange-reported minimum so
                         # future attempts won't hit the same error.
                         _cache = getattr(self.client, "_pair_min_order", None)
                         if isinstance(_cache, dict):
                             cached = _cache.setdefault(pair.lower(), {})
-                            if parsed_min_idr > cached.get("min_idr", 0.0):
-                                cached["min_idr"] = parsed_min_idr
+                            if effective_min_idr > cached.get("min_idr", 0.0):
+                                cached["min_idr"] = effective_min_idr
                         _tracker.cancel_pending_buy()
                         if self.multi_manager is not None:
                             self.multi_manager.return_position_cash(pair)

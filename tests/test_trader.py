@@ -3698,6 +3698,52 @@ class ForceSellDustTests(unittest.TestCase):
         self.assertEqual(len(trader.client.placed), 1)
         self.assertAlmostEqual(trader.tracker.base_position, 0.0)
 
+    def test_force_sell_clears_when_parsed_coin_min_implies_higher_idr_min(self) -> None:
+        """Parsed coin minimum should be converted to IDR and enforced to clear dust."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"arkm": "1.0", "idr": "1000000"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["10000", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                raise RuntimeError(
+                    "API error: {'success': 0, 'error': 'Minimum order 5.0 ARKM', 'error_code': ''}"
+                )
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+            min_order_idr=30_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 10_000.0, 1.0)  # 1 ARKM @ 10,000 IDR
+
+        decision = StrategyDecision(
+            mode="swing_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=10_000.0,
+            amount=1.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "arkm_idr", "price": 10_000.0, "decision": decision}
+
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "dust_cleared")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
 
 class RiskHoldCancellationTests(unittest.TestCase):
     def setUp(self) -> None:
