@@ -36,6 +36,9 @@ class IndodaxClientPrecisionTest(unittest.TestCase):
         self.assertEqual(resp["price"], "146")
         # IDR total should use the rounded price
         self.assertEqual(resp["idr"], "14600")
+        # IDR buys should also include base coin quantity
+        self.assertEqual(resp["dupe"], "100.00000000")
+        self.assertEqual(resp["amount"], "100.00000000")
 
     def test_non_idr_price_keeps_eight_decimals(self):
         resp = self.client.create_order("btc_usdt", "sell", 12345.67890123, 0.1)
