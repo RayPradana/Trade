@@ -1,4 +1,5 @@
 import logging
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -4397,6 +4398,44 @@ class MomentumExitTest(unittest.TestCase):
         trader = Trader(config)
         # No buy recorded; avg_cost = 0
         self.assertFalse(trader.check_momentum_exit(self._snap(price=103.0, imbalance=-0.3)))
+
+
+class PostEntryDumpExitTest(unittest.TestCase):
+    """Tests for Trader.check_post_entry_dump()."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_exit_triggers_on_fresh_dump_within_window(self):
+        config = BotConfig(
+            api_key=None,
+            post_entry_dump_pct=0.02,
+            post_entry_dump_window_seconds=120,
+        )
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        self.assertTrue(trader.check_post_entry_dump(trader.tracker, 95.0))
+
+    def test_exit_ignored_when_window_passed(self):
+        config = BotConfig(
+            api_key=None,
+            post_entry_dump_pct=0.02,
+            post_entry_dump_window_seconds=60,
+        )
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        # Age the position beyond the window
+        trader.tracker.position_open_time = time.time() - 120
+        self.assertFalse(trader.check_post_entry_dump(trader.tracker, 90.0))
+
+    def test_exit_disabled_when_threshold_zero(self):
+        config = BotConfig(api_key=None, post_entry_dump_pct=0.0)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        self.assertFalse(trader.check_post_entry_dump(trader.tracker, 90.0))
 
 
 class PartialTp2And3TrackingTest(unittest.TestCase):

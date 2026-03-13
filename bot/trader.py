@@ -1948,8 +1948,17 @@ class Trader:
         except (ValueError, TypeError):
             top_ask = price
         reference_price = top_ask if decision.action == "buy" else top_bid
+        # Make entries slightly more aggressive (within slippage guard) to
+        # improve the likelihood of an immediate fill instead of sitting at the
+        # back of the queue at the same best price.
+        entry_aggr = max(0.0, self.config.entry_aggressiveness_pct)
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
+        if entry_aggr > 0:
+            if decision.action == "buy" and top_ask > 0:
+                reference_price = min(top_ask * (1 + entry_aggr), allowed_max)
+            elif decision.action == "sell" and top_bid > 0:
+                reference_price = max(top_bid * (1 - entry_aggr), allowed_min)
 
         # ── Spread filter ─────────────────────────────────────────────────────
         # Skip any trade (buy or sell) when the bid-ask spread is too wide.
@@ -2717,6 +2726,27 @@ class Trader:
             return True
 
         return False
+
+    def check_post_entry_dump(self, tracker: "PortfolioTracker", price: float) -> bool:
+        """Return ``True`` when price dumps shortly after entry and an immediate exit is desired."""
+        cfg = self.config
+        if cfg.post_entry_dump_pct <= 0 or tracker.avg_cost <= 0 or tracker.base_position <= 0:
+            return False
+        drop_pct = (tracker.avg_cost - price) / tracker.avg_cost
+        if drop_pct < cfg.post_entry_dump_pct:
+            return False
+        window = cfg.post_entry_dump_window_seconds
+        if window > 0 and tracker.position_hold_seconds > window:
+            return False
+        logger.info(
+            "Post-entry dump detected: price=%.6g avg_cost=%.6g drop=%.2f%% age=%.0fs window=%.0fs",
+            price,
+            tracker.avg_cost,
+            drop_pct * 100,
+            tracker.position_hold_seconds,
+            window,
+        )
+        return True
 
     def _conditions_allow_holding(self, snapshot: Dict[str, Any]) -> bool:
         """Return ``True`` when market indicators suggest holding past the TP target.

@@ -51,9 +51,12 @@ Semua konfigurasi diambil dari variabel lingkungan (bisa diset di `.env`):
 | `FAST_WINDOW` | Periode MA cepat | `12` |
 | `SLOW_WINDOW` | Periode MA lambat | `48` |
 | `MAX_SLIPPAGE_PCT` | Batas slippage relatif | `0.001` |
+| `ENTRY_AGGRESSIVENESS_PCT` | Naikkan harga limit sedikit agar order lebih cepat terserap (tetap dibatasi slippage) | `0.0005` |
 | `INITIAL_CAPITAL` | Modal awal (quote currency, mis. IDR) | `1000000` |
 | `TARGET_PROFIT_PCT` | Target profit relatif (0.2 = 20%) | `0.2` |
 | `MAX_LOSS_PCT` | Batas kerugian relatif (0.1 = 10%) | `0.1` |
+| `POST_ENTRY_DUMP_PCT` | Keluar cepat bila harga turun sekian % segera setelah entry (0 = nonaktif) | `0` |
+| `POST_ENTRY_DUMP_WINDOW_SECONDS` | Window waktu (detik) untuk mendeteksi dump pasca entry | `120` |
 | `STAGED_ENTRY_STEPS` | Jumlah maksimum langkah entry bertahap (mis. 3 langkah 50/30/20%) | `3` |
 | `POSITION_CHECK_INTERVAL` | Interval (detik) polling saat sedang memegang posisi | `60` |
 | `CYCLE_SUMMARY_INTERVAL` | Cetak ringkasan performa setiap N siklus scan penuh | `10` |

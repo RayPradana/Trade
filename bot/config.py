@@ -116,6 +116,9 @@ class BotConfig:
     fast_window: int = 12
     slow_window: int = 48
     max_slippage_pct: float = 0.001
+    # Small aggressiveness bump to make limit orders more likely to fill by
+    # crossing the top of book while staying within slippage guards.
+    entry_aggressiveness_pct: float = 0.0005
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
@@ -395,6 +398,9 @@ class BotConfig:
     # Flash dump protection
     flash_dump_pct: float = 0.0
     flash_dump_lookback_seconds: float = 60.0
+    # Immediate dump exit: sell early when price dumps shortly after entry.
+    post_entry_dump_pct: float = 0.0  # 0=disabled; e.g. 0.02 = exit after 2% drop soon after buy
+    post_entry_dump_window_seconds: float = 120.0
     # ── Adaptive position sizing ──────────────────────────────────────────────
     # When enabled, risk_per_trade and max_open_positions are automatically
     # adjusted based on current equity (effective_capital), making the bot more
@@ -663,6 +669,7 @@ class BotConfig:
             fast_window=_env_int("FAST_WINDOW", "12"),
             slow_window=_env_int("SLOW_WINDOW", "48"),
             max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", "0.001"),
+            entry_aggressiveness_pct=_env_float("ENTRY_AGGRESSIVENESS_PCT", "0.0005"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
             target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
             max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),
@@ -749,6 +756,8 @@ class BotConfig:
             orderbook_absorption_threshold=_env_float("ORDERBOOK_ABSORPTION_THRESHOLD", "0"),
             flash_dump_pct=_env_float("FLASH_DUMP_PCT", "0"),
             flash_dump_lookback_seconds=_env_float("FLASH_DUMP_LOOKBACK_SECONDS", "60"),
+            post_entry_dump_pct=_env_float("POST_ENTRY_DUMP_PCT", "0"),
+            post_entry_dump_window_seconds=_env_float("POST_ENTRY_DUMP_WINDOW_SECONDS", "120"),
             adaptive_sizing_enabled=os.getenv("ADAPTIVE_SIZING_ENABLED", "false").lower() in {"1", "true", "yes"},
             adaptive_tier1_equity=float(os.getenv("ADAPTIVE_TIER1_EQUITY", "2000000")),
             adaptive_tier2_equity=float(os.getenv("ADAPTIVE_TIER2_EQUITY", "5000000")),
@@ -849,6 +858,8 @@ class BotConfig:
             raise ValueError("INTERVAL_SECONDS must be positive")
         if self.max_slippage_pct < 0:
             raise ValueError("MAX_SLIPPAGE_PCT must be non-negative")
+        if self.entry_aggressiveness_pct < 0:
+            raise ValueError("ENTRY_AGGRESSIVENESS_PCT must be non-negative")
         if self.initial_capital <= 0:
             raise ValueError("INITIAL_CAPITAL must be positive (e.g. INITIAL_CAPITAL=1000000)")
         if self.staged_entry_steps <= 0:
@@ -986,6 +997,10 @@ class BotConfig:
             raise ValueError("FLASH_DUMP_PCT must be non-negative")
         if self.flash_dump_lookback_seconds <= 0:
             raise ValueError("FLASH_DUMP_LOOKBACK_SECONDS must be positive")
+        if self.post_entry_dump_pct < 0:
+            raise ValueError("POST_ENTRY_DUMP_PCT must be non-negative")
+        if self.post_entry_dump_window_seconds < 0:
+            raise ValueError("POST_ENTRY_DUMP_WINDOW_SECONDS must be non-negative")
         if self.adaptive_tier1_equity <= 0:
             raise ValueError("ADAPTIVE_TIER1_EQUITY must be positive")
         if self.adaptive_tier2_equity <= self.adaptive_tier1_equity:

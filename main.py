@@ -778,6 +778,10 @@ def main() -> None:
                 if stop_reason is None and trader.check_momentum_exit(held_snapshot):
                     stop_reason = "momentum_exit"
 
+                # ── Immediate dump exit (protect against post-entry dumps) ────
+                if stop_reason is None and trader.check_post_entry_dump(held_tracker, held_price):
+                    stop_reason = "post_entry_dump"
+
                 # ── Partial take-profit check (level 1) ───────────────────
                 if (
                     config.partial_tp_fraction > 0
