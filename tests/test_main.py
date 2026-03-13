@@ -1,5 +1,6 @@
 import io
 import logging
+import re
 import os
 import unittest
 import unittest.mock
@@ -442,8 +443,8 @@ class TrailDisplayTests(unittest.TestCase):
             root.removeHandler(handler)
 
         log_text = buf.getvalue()
-        self.assertIn("trail     : — (disabled)", log_text)
-        self.assertIn("trail-TP: — (disabled)", log_text)
+        self.assertRegex(log_text, r"trail\s*:\s*— \(disabled\)")
+        self.assertRegex(log_text, r"trail-TP:\s*— \(disabled\)")
 
 
 if __name__ == "__main__":
