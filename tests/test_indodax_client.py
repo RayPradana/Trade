@@ -41,6 +41,7 @@ class IndodaxClientPrecisionTest(unittest.TestCase):
         resp = self.client.create_order("btc_usdt", "sell", 12345.67890123, 0.1)
         self.assertEqual(resp["price"], "12345.67890123")
         self.assertEqual(resp["amount"], "0.10000000")
+        self.assertEqual(resp["btc"], "0.10000000")
 
     def test_price_uses_increment_when_cached(self):
         self.client._price_increments = {"dupe_idr": "0.01"}
@@ -48,6 +49,18 @@ class IndodaxClientPrecisionTest(unittest.TestCase):
         resp = self.client.create_order("dupe_idr", "buy", 146.1234, 10)
         self.assertEqual(resp["price"], "146.12")
         self.assertEqual(resp["idr"], "1461")
+
+    def test_client_order_id_and_time_in_force_pass_through(self):
+        resp = self.client.create_order(
+            "btc_usdt",
+            "buy",
+            100.0,
+            1.0,
+            client_order_id="clientx-123",
+            time_in_force="GTC",
+        )
+        self.assertEqual(resp["client_order_id"], "clientx-123")
+        self.assertEqual(resp["time_in_force"], "GTC")
 
 
 if __name__ == "__main__":

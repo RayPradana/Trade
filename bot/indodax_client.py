@@ -379,19 +379,55 @@ class IndodaxClient:
 
         return quantized_price, precision
 
-    def create_order(self, pair: str, order_type: str, price: float, amount: float) -> Dict[str, Any]:
+    def create_order(
+        self,
+        pair: str,
+        order_type: str,
+        price: float,
+        amount: float,
+        *,
+        order_kind: str = "limit",
+        client_order_id: Optional[str] = None,
+        time_in_force: Optional[str] = None,
+        idr: Optional[float] = None,
+        btc: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Place a trade order according to Indodax Private REST API docs.
+
+        Supports documented optional parameters:
+        - order_type (``order_kind``) : ``limit`` / ``market`` (default ``limit``)
+        - client_order_id            : user-supplied id (<= 36 chars, [A-Za-z0-9_-])
+        - time_in_force              : currently ``GTC`` or ``MOC`` for limit
+        - idr / btc                  : explicit amount fields per API docs
+        """
         price, precision = self.format_price(pair, price)
         price_str = f"{price:.{precision}f}"
-        payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": price_str, "order_type": "limit"}
+        payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": price_str, "order_type": order_kind}
+        base_coin = pair.split("_", 1)[0]
         is_idr_pair = pair.endswith("_idr")
+
         if order_type == "buy":
-            if is_idr_pair:
+            if idr is not None:
+                payload["idr"] = f"{float(idr):.0f}"
+            elif is_idr_pair:
                 idr_total = round(price * amount)
                 payload["idr"] = f"{idr_total:.0f}"
             else:
-                payload["amount"] = f"{amount:.8f}"
+                coin_amt = btc if btc is not None else amount
+                payload[base_coin] = f"{coin_amt:.8f}"
+                payload["amount"] = f"{coin_amt:.8f}"
         else:
-            payload["amount"] = f"{amount:.8f}"
+            coin_amt = btc if btc is not None else amount
+            payload[base_coin] = f"{coin_amt:.8f}"
+            payload["amount"] = f"{coin_amt:.8f}"
+
+        if client_order_id:
+            if len(client_order_id) > 36:
+                raise ValueError("client_order_id must be <= 36 characters")
+            payload["client_order_id"] = client_order_id
+        if time_in_force:
+            payload["time_in_force"] = time_in_force
+
         return self._enqueue_private("trade", payload)
 
     def cancel_order(self, pair: str, order_id: str, order_type: Optional[str] = None) -> Dict[str, Any]:
