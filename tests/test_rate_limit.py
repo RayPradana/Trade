@@ -5,8 +5,6 @@ import requests
 
 from bot.rate_limit import ApiRequestScheduler, RateLimitedOrderQueue
 
-from bot.rate_limit import RateLimitedOrderQueue
-
 
 class _FakeClock:
     def __init__(self) -> None:
