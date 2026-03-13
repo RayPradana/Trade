@@ -1379,11 +1379,11 @@ class Trader:
                 min_trades_24h=self.config.rug_pull_min_trades_24h,
             )
             if rug_pull_risk.detected:
-                logger.warning(
-                    "Rug-pull/dead-coin risk on %s: %s — skipping",
-                    pair,
-                    rug_pull_risk.reason,
-                )
+                # logger.warning(
+                #     "Rug-pull/dead-coin risk on %s: %s — skipping",
+                #     pair,
+                #     rug_pull_risk.reason,
+                # )
                 price = self._extract_price(ticker)
                 _hold_decision = StrategyDecision(
                     mode="hold",
