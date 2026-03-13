@@ -337,8 +337,10 @@ class IndodaxClient:
         # when multiple positions trigger concurrent fetches (depth/trades).
         min_interval = getattr(self, "public_min_interval", 0.0)
         if min_interval > 0:
-            lock = getattr(self, "_public_lock", None) or threading.Lock()
-            self._public_lock = lock
+            lock = getattr(self, "_public_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._public_lock = lock
             time_fn = getattr(self, "_public_time", time.monotonic)
             sleep_fn = getattr(self, "_public_sleep", time.sleep)
             last_ts = getattr(self, "_last_public_request", 0.0)
