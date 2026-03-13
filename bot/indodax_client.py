@@ -302,7 +302,18 @@ class IndodaxClient:
             raise RuntimeError(f"Failed to obtain private WS token: {data}")
         return {"connToken": ret["connToken"], "channel": ret["channel"]}
 
+    def format_price(self, pair: str, price: float) -> float:
+        """Round *price* to the precision expected by the exchange for *pair*.
+
+        Indodax IDR pairs reject prices with excessive decimal places (e.g.,
+        ``"decimal number for price is 3"``).  Round IDR pairs to 2 decimals
+        and leave others at the default 8-decimal precision.
+        """
+        precision = 2 if pair.endswith("_idr") else 8
+        return round(price, precision)
+
     def create_order(self, pair: str, order_type: str, price: float, amount: float) -> Dict[str, Any]:
+        price = self.format_price(pair, price)
         payload: Dict[str, Any] = {"pair": pair, "type": order_type, "price": f"{price:.8f}"}
         is_idr_pair = pair.endswith("_idr")
         if order_type == "buy":
