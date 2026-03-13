@@ -81,6 +81,7 @@ class NewConfigFieldsTest(TestCase):
         from unittest.mock import patch
         with patch.dict(__import__("os").environ, {}, clear=True):
             cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_coin_price_idr, 50.0)
             self.assertEqual(cfg.small_coin_min_volume_24h_idr, 1_000_000.0)
             self.assertEqual(cfg.small_coin_min_trades_24h, 50)
 
@@ -88,10 +89,11 @@ class NewConfigFieldsTest(TestCase):
         from unittest.mock import patch
         with patch.dict(
             __import__("os").environ,
-            {"SMALL_COIN_MIN_VOLUME_24H_IDR": "2500000", "SMALL_COIN_MIN_TRADES_24H": "75"},
+            {"MIN_COIN_PRICE_IDR": "25", "SMALL_COIN_MIN_VOLUME_24H_IDR": "2500000", "SMALL_COIN_MIN_TRADES_24H": "75"},
             clear=True,
         ):
             cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_coin_price_idr, 25.0)
             self.assertEqual(cfg.small_coin_min_volume_24h_idr, 2_500_000.0)
             self.assertEqual(cfg.small_coin_min_trades_24h, 75)
 

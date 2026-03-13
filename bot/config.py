@@ -267,6 +267,13 @@ class BotConfig:
     # fraction of the best bid price.
     # E.g. 0.002 = skip when spread > 0.2%.  0 = disabled (default).
     max_spread_pct: float = 0.0
+    # ── Minimum price filter (hard + soft) ───────────────────────────────────
+    # Hard floor: skip any *new buy* when the coin price is below this IDR
+    # threshold, regardless of orderbook quality.  Protects against ultra-cheap
+    # coins (e.g. <50 IDR) that rarely trade and clutter scan results.
+    # 0 = disabled.
+    min_coin_price_idr: float = 50.0
+    # Soft floor:
     # ── Minimum price filter (soft) ──────────────────────────────────────────
     # When set, coins priced below this IDR threshold trigger an orderbook
     # quality check instead of being skipped outright.  Quiet/stuck coins
@@ -702,6 +709,7 @@ class BotConfig:
             pump_protection_pct=_env_float("PUMP_PROTECTION_PCT", "0"),
             pump_lookback_seconds=_env_float("PUMP_LOOKBACK_SECONDS", "60"),
             max_spread_pct=_env_float("MAX_SPREAD_PCT", "0"),
+            min_coin_price_idr=_env_float("MIN_COIN_PRICE_IDR", "50"),
             min_buy_price_idr=_env_float("MIN_BUY_PRICE_IDR", "100"),
             small_coin_min_volume_24h_idr=_env_float("SMALL_COIN_MIN_VOLUME_24H_IDR", "1000000"),
             small_coin_min_trades_24h=_env_int("SMALL_COIN_MIN_TRADES_24H", "50"),
@@ -907,6 +915,8 @@ class BotConfig:
             raise ValueError("PUMP_LOOKBACK_SECONDS must be positive")
         if self.max_spread_pct < 0:
             raise ValueError("MAX_SPREAD_PCT must be non-negative")
+        if not (0 <= self.min_coin_price_idr < 1e9):
+            raise ValueError("MIN_COIN_PRICE_IDR must be between 0 and 1e9")
         if not (0 <= self.min_buy_price_idr < 1e9):
             raise ValueError("MIN_BUY_PRICE_IDR must be between 0 and 1e9")
         if self.small_coin_min_volume_24h_idr < 0:

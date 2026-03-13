@@ -1897,6 +1897,26 @@ class Trader:
                     "portfolio": _tracker.as_dict(price),
                 }
 
+        # ── Minimum price filter (hard floor) ────────────────────────────────
+        if (
+            self.config.min_coin_price_idr > 0
+            and decision.action == "buy"
+            and price < self.config.min_coin_price_idr
+        ):
+            logger.info(
+                "Price below hard floor on %s: %.6g IDR < %.6g — skipping buy",
+                snapshot["pair"],
+                price,
+                self.config.min_coin_price_idr,
+            )
+            return {
+                "status": "skipped",
+                "reason": (
+                    f"price_below_min_coin {price:.6g} < {self.config.min_coin_price_idr:.6g}"
+                ),
+                "portfolio": _tracker.as_dict(price),
+            }
+
         # ── Minimum price filter (soft quality check) ────────────────────────
         # When price is below min_buy_price_idr, evaluate orderbook quality
         # instead of hard-skipping.  Coins with a thin/stuck book are blocked;
@@ -3078,6 +3098,20 @@ class Trader:
             if prefetched_ticker is None and feed_seeded:
                 skipped_pairs.append(pair)
                 continue
+            # ── Hard floor: drop ultra-cheap coins before analysis ────────────
+            if prefetched_ticker is not None and self.config.min_coin_price_idr > 0:
+                try:
+                    _last_price = float(
+                        prefetched_ticker.get("last")
+                        or prefetched_ticker.get("last_price")
+                        or 0
+                    )
+                    if 0 < _last_price < self.config.min_coin_price_idr:
+                        skipped_pairs.append(pair)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
             # ── Pre-scan cheap coin filter ────────────────────────────────────
             # For coins priced below min_buy_price_idr, check real-time WS
             # orderbook quality before running the full analysis.  Sepi/stuck

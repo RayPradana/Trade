@@ -1792,8 +1792,14 @@ class MinBuyPriceFilterTest(unittest.TestCase):
     def tearDown(self):
         logging.disable(logging.NOTSET)
 
-    def _trader(self, min_price: float, coin_price: float, bids=None, asks=None, **cfg) -> Trader:
-        config = BotConfig(api_key=None, min_buy_price_idr=min_price, dry_run=True, **cfg)
+    def _trader(self, min_price: float, coin_price: float, bids=None, asks=None, min_coin_price: float = 0.0, **cfg) -> Trader:
+        config = BotConfig(
+            api_key=None,
+            min_coin_price_idr=min_coin_price,
+            min_buy_price_idr=min_price,
+            dry_run=True,
+            **cfg,
+        )
         trader = Trader(config)
         _bids = bids if bids is not None else [[str(coin_price), "100"]]
         _asks = asks if asks is not None else [[str(coin_price * 1.001), "100"]]
@@ -1875,6 +1881,13 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("small_coin_wide_spread", outcome["reason"])
 
+    def test_price_below_hard_floor_blocked(self):
+        """Coins below min_coin_price_idr are skipped outright (no quality checks)."""
+        trader = self._trader(min_price=10.0, min_coin_price=50.0, coin_price=4.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("price_below_min_coin", outcome["reason"])
+
     def test_price_exactly_at_threshold_allowed(self):
         """Coin priced exactly at the threshold must NOT trigger the quality check."""
         trader = self._trader(min_price=10.0, coin_price=10.0)
@@ -1899,6 +1912,13 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         trader.tracker.record_trade("buy", 4.0, 1000.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0, action="sell"))
         self.assertNotIn("small_coin", outcome.get("reason", ""))
+
+    def test_sell_not_blocked_by_hard_floor(self):
+        """Hard floor must not block sells so existing positions can exit."""
+        trader = self._trader(min_price=10.0, min_coin_price=50.0, coin_price=4.0)
+        trader.tracker.record_trade("buy", 4.0, 1000.0)
+        outcome = trader.maybe_execute(_make_buy_snap(price=4.0, action="sell"))
+        self.assertNotEqual(outcome["status"], "skipped")
 
 
 class PreScanCheapCoinFilterTest(unittest.TestCase):
@@ -1989,6 +2009,68 @@ class PreScanCheapCoinFilterTest(unittest.TestCase):
         # meme_idr must have been skipped by the pre-scan filter (not analyzed)
         self.assertNotIn("meme_idr", analyzed_pairs)
         # btc_idr (above threshold) must still be analyzed normally
+        self.assertIn("btc_idr", analyzed_pairs)
+
+    def test_hard_floor_skips_ultra_cheap_coin_pre_scan(self):
+        """Coins below min_coin_price_idr are dropped before analysis."""
+        from bot.realtime import MultiPairFeed
+
+        analyzed_pairs: list[str] = []
+
+        class ScanClient:
+            def get_pairs(self) -> list[dict]:
+                return [{"name": "shan_idr"}, {"name": "btc_idr"}]
+
+            def get_summaries(self) -> dict:
+                return {
+                    "tickers": {
+                        "shanidr": {"last": "2", "high": "3", "low": "2"},
+                        "btcidr": {"last": "1000000000", "high": "1100000000", "low": "900000000"},
+                    }
+                }
+
+        config = BotConfig(
+            api_key=None,
+            min_coin_price_idr=50.0,
+            min_buy_price_idr=100.0,
+            small_coin_min_bid_levels=3,
+            small_coin_min_depth_idr=50000.0,
+            small_coin_max_spread_pct=0.05,
+            dry_run=True,
+        )
+
+        class ScanTrader(Trader):
+            def analyze_market(self, pair=None, prefetched_ticker=None, skip_depth=False, skip_trades=False):
+                analyzed_pairs.append(pair)
+                return {
+                    "pair": pair, "price": 1000000000.0, "trend": None,
+                    "orderbook": None, "volatility": None, "levels": None, "indicators": None,
+                    "decision": StrategyDecision(
+                        mode="scalping", action="hold", confidence=0.0, reason="wait",
+                        target_price=1000000000, amount=0, stop_loss=0, take_profit=0,
+                    ),
+                }
+
+        trader = ScanTrader(config, client=ScanClient())
+
+        trader._multi_feed = MultiPairFeed(
+            pairs=["shan_idr", "btc_idr"],
+            client=ScanClient(),
+            websocket_enabled=False,
+        )
+        trader._multi_feed._apply_ws_message_for_pair(
+            "shan_idr",
+            {"last": "2", "high": "3", "low": "2", "vol_idr": "200000", "trade_count": "10"},
+        )
+        trader._multi_feed._apply_ws_message_for_pair(
+            "btc_idr",
+            {"last": "1000000000", "high": "1100000000", "low": "900000000", "vol_idr": "5000000000", "trade_count": "5000"},
+        )
+        trader._all_pairs = ["shan_idr", "btc_idr"]
+
+        trader.scan_and_choose()
+
+        self.assertNotIn("shan_idr", analyzed_pairs)
         self.assertIn("btc_idr", analyzed_pairs)
 
     def test_active_cheap_coin_not_skipped(self):
