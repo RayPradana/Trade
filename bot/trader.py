@@ -153,7 +153,12 @@ class Trader:
         self._candle_cache: Dict[str, Tuple[float, List[Any]]] = {}
 
     def _min_confidence_threshold(self, snapshot: Dict[str, Any]) -> float:
-        """Return the effective minimum confidence, applying adaptive rules."""
+        """Return the effective minimum confidence threshold for a snapshot.
+
+        Starts from the configured minimum (respecting confidence-tier skip when
+        enabled) and lowers the threshold when a trend strength value is present
+        to make the bot more responsive during stronger momentum.
+        """
         base_min = (
             min(self.config.min_confidence, self.config.confidence_tier_skip)
             if self.config.confidence_position_sizing_enabled
