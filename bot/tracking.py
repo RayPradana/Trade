@@ -94,6 +94,9 @@ class PortfolioTracker:
         self._strategy_stats: Dict[str, Dict] = {}
         self._disabled_strategies: Set[str] = set()
         self.continue_after_target = continue_after_target
+        # Track live pending buy orders (placed but not yet filled) so they can
+        # be monitored and persisted.
+        self.pending_orders: List[Dict[str, float]] = []
 
     @property
     def profit_buffer(self) -> float:
@@ -133,6 +136,8 @@ class PortfolioTracker:
     def record_trade(self, action: str, price: float, amount: float) -> None:
         notional = price * amount
         if action == "buy":
+            # A filled buy clears any pending markers for this tracker.
+            self.pending_orders.clear()
             self.cash -= notional
             total_cost = self.avg_cost * self.base_position + price * amount
             self.base_position += amount
@@ -210,6 +215,16 @@ class PortfolioTracker:
         self._trailing_tp_stop = None
         self._trailing_tp_peak = None
         self.position_open_time = 0.0
+        self.pending_orders.clear()
+
+    @property
+    def has_pending_buy(self) -> bool:
+        """``True`` when a buy order was placed but not yet filled."""
+        return bool(self.pending_orders)
+
+    def mark_pending_buy(self, amount: float, price: float) -> None:
+        """Record a placed-but-unfilled buy so it can be monitored and resumed."""
+        self.pending_orders.append({"amount": amount, "price": price})
 
     def activate_trailing_tp(self, mark_price: float, trailing_tp_pct: float) -> None:
         """Activate or tighten the trailing take-profit floor.
@@ -335,6 +350,22 @@ class PortfolioTracker:
         self._strategy_stats = dict(state.get("strategy_stats", {}))
         disabled = state.get("disabled_strategies", [])
         self._disabled_strategies = set(disabled) if disabled else set()
+        pending = state.get("pending_orders")
+        if isinstance(pending, list):
+            normalised: List[Dict[str, float]] = []
+            for entry in pending:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    amt = float(entry.get("amount", 0.0))
+                    price = float(entry.get("price", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if amt > 0 and price > 0:
+                    normalised.append({"amount": amt, "price": price})
+            self.pending_orders = normalised
+        else:
+            self.pending_orders = []
         # target/min equity recomputed from initial_capital to keep guard consistent
 
     def stop_reason(self, mark_price: float) -> Optional[str]:
@@ -422,6 +453,7 @@ class PortfolioTracker:
             "all_sell_pnls": self._all_sell_pnls,
             "strategy_stats": self._strategy_stats,
             "disabled_strategies": list(self._disabled_strategies),
+            "pending_orders": self.pending_orders,
         }
 
     # ── Daily loss cap helpers ────────────────────────────────────────────
@@ -593,13 +625,13 @@ class MultiPositionManager:
         return self._trackers.get(pair)
 
     def has_position(self, pair: str) -> bool:
-        """``True`` when *pair* has a non-zero open position."""
+        """``True`` when *pair* has a non-zero open position or pending buy."""
         t = self._trackers.get(pair)
-        return t is not None and t.base_position > 0
+        return t is not None and (t.base_position > 0 or t.has_pending_buy)
 
     def position_count(self) -> int:
-        """Number of pairs with a non-zero open position."""
-        return sum(1 for t in self._trackers.values() if t.base_position > 0)
+        """Number of pairs with an active position or pending buy."""
+        return sum(1 for t in self._trackers.values() if t.base_position > 0 or t.has_pending_buy)
 
     def can_open_position(self) -> bool:
         """``True`` when a new position can be opened (below *max_positions* and cash > 0)."""
@@ -607,8 +639,12 @@ class MultiPositionManager:
 
     @property
     def active_positions(self) -> Dict[str, PortfolioTracker]:
-        """``{pair: tracker}`` for all pairs currently holding a non-zero position."""
-        return {p: t for p, t in self._trackers.items() if t.base_position > 0}
+        """``{pair: tracker}`` for all pairs currently holding or awaiting fills."""
+        return {
+            p: t
+            for p, t in self._trackers.items()
+            if t.base_position > 0 or t.has_pending_buy
+        }
 
     def allocate_capital(self, pair: str) -> PortfolioTracker:
         """Allocate a capital slice from the cash pool and create a tracker for *pair*.
@@ -735,7 +771,9 @@ class MultiPositionManager:
         restored: List[str] = []
         for pair, state in positions.items():
             base_pos = float(state.get("base_position", 0))  # type: ignore[arg-type]
-            if base_pos <= 0:
+            pending_list = state.get("pending_orders") or []
+            has_pending = isinstance(pending_list, list) and len(pending_list) > 0
+            if base_pos <= 0 and not has_pending:
                 continue
             tracker = PortfolioTracker(
                 initial_capital=float(state.get("cash", 0)),  # type: ignore[arg-type]

@@ -250,7 +250,7 @@ class Trader:
         """
         if self.multi_manager is not None:
             return self.multi_manager.active_positions
-        if self.tracker.base_position > 0:
+        if self.tracker.base_position > 0 or getattr(self.tracker, "has_pending_buy", False):
             return {self.config.pair: self.tracker}
         return {}
 
@@ -263,7 +263,7 @@ class Trader:
         """
         if self.multi_manager is not None:
             return not self.multi_manager.can_open_position()
-        return self.tracker.base_position > 0
+        return self.tracker.base_position > 0 or getattr(self.tracker, "has_pending_buy", False)
 
     def portfolio_snapshot(self, pair: str, price: float) -> Dict[str, object]:
         """Return a portfolio dict suitable for logging and display.
@@ -462,7 +462,9 @@ class Trader:
             return
         # Check position BEFORE mutating tracker to avoid partial load of stale state
         saved_pos = float((portfolio.get("base_position") or 0))
-        if saved_pos <= 0:
+        pending = portfolio.get("pending_orders") or []
+        has_pending = isinstance(pending, list) and len(pending) > 0
+        if saved_pos <= 0 and not has_pending:
             # Stale state with no open position — remove to keep things clean
             self.persistence.clear()
             return
@@ -598,7 +600,7 @@ class Trader:
                 payload["multi_positions"] = {
                     p: t.to_state()
                     for p, t in self.multi_manager._trackers.items()
-                    if t.base_position > 0
+                    if t.base_position > 0 or t.has_pending_buy
                 }
                 payload["multi_cash"] = self.multi_manager.cash
             self.persistence.save(payload)
@@ -629,10 +631,11 @@ class Trader:
                 self._save_state(pair)
             else:
                 self._clear_state()
-        elif self.tracker.base_position <= 0:
-            self._clear_state()
         else:
-            self._save_state(pair)
+            if self.tracker.base_position <= 0 and not getattr(self.tracker, "has_pending_buy", False):
+                self._clear_state()
+            else:
+                self._save_state(pair)
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
@@ -2455,6 +2458,7 @@ class Trader:
                         "Buy order placed but not filled yet (receive_%s=0) — leaving position unchanged",
                         base_coin.upper(),
                     )
+                    _tracker.mark_pending_buy(step_amount, reference_price)
                     remaining_amount -= step_amount
                     executed_steps.append(
                         {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}

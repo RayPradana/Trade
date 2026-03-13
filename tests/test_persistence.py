@@ -197,6 +197,19 @@ class TraderAutoResumeTests(unittest.TestCase):
             self.assertEqual(fresh_trader.restored_pair, "eth_idr")
             self.assertAlmostEqual(fresh_trader.tracker.base_position, 0.5, places=6)
 
+    def test_single_position_pending_buy_is_restored(self) -> None:
+        """Pending live buy must be restored and kept for monitoring."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "bot_state.json"
+            tracker = PortfolioTracker(initial_capital=1_000_000, target_profit_pct=0.2, max_loss_pct=0.1)
+            tracker.mark_pending_buy(0.25, 10_000.0)
+            StatePersistence(state_path).save({"portfolio": tracker.to_state(), "pair": "btc_idr", "dry_run": True})
+            config = BotConfig(api_key=None, dry_run=True, state_path=state_path, multi_position_enabled=False)
+            fresh = Trader(config, client=_FakeClient())
+            self.assertEqual(fresh.restored_pair, "btc_idr")
+            self.assertTrue(fresh.tracker.has_pending_buy)
+            self.assertEqual(fresh.tracker.base_position, 0)
+
     def test_trader_no_restore_when_dry_run_mismatch(self) -> None:
         """State saved under dry_run=True must NOT be loaded when running live (dry_run=False)."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,6 +367,30 @@ class MultiPositionPersistenceTests(unittest.TestCase):
             )
             # State file must be cleared to avoid re-loading stale data
             self.assertIsNone(StatePersistence(state_path).load())
+
+    def test_pending_multi_position_is_persisted_and_restored(self) -> None:
+        """Pending live buys must be persisted and restored even with base_position=0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            config = self._make_config(state_path, max_pos=3)
+            trader = _BuyTrader(config, client=_FakeClient())
+            tracker = trader.multi_manager.allocate_capital("btc_idr")
+            tracker.mark_pending_buy(1.0, 100_000.0)
+            trader._persist_after_trade("btc_idr")
+
+            state = StatePersistence(state_path).load()
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertIn("multi_positions", state)
+            self.assertIn("btc_idr", state["multi_positions"])
+            self.assertEqual(state["multi_positions"]["btc_idr"]["base_position"], 0)
+            self.assertGreater(len(state["multi_positions"]["btc_idr"].get("pending_orders", [])), 0)
+
+            fresh = Trader(config, client=_FakeClient())
+            active = fresh.active_positions
+            self.assertIn("btc_idr", active)
+            self.assertTrue(active["btc_idr"].has_pending_buy)
+            self.assertEqual(active["btc_idr"].base_position, 0)
 
 
 class TempFileCleanupTests(unittest.TestCase):
