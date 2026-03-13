@@ -2313,7 +2313,7 @@ class TickMoveFilterTest(unittest.TestCase):
         logging.disable(logging.NOTSET)
 
     def _trader(self, max_tick: float, bids: list, asks: list, price: float) -> Trader:
-        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, min_buy_price_idr=0, dry_run=True)
+        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, min_buy_price_idr=0, min_coin_price_idr=0, dry_run=True)
         trader = Trader(config)
         trader.client = type("_C", (), {
             "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},

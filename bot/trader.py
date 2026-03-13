@@ -3026,31 +3026,62 @@ class Trader:
         _get_min = getattr(self.client, "get_pair_min_order", None)
         min_info = _get_min(pair) if callable(_get_min) else {}
         min_idr_per_pair = min_info.get("min_idr", 0.0)
+        min_coin_per_pair = min_info.get("min_coin", 0.0)
         sell_idr_value = amount * reference_price
 
         # Indodax enforces minimum order size by total IDR value, not coin amount.
         # Keep the effective threshold in rupiah to mirror that rule.
         effective_min_idr = max(self.config.min_order_idr, min_idr_per_pair)
+        is_below_coin_min = min_coin_per_pair > 0 and amount < min_coin_per_pair
         is_below_idr_min = effective_min_idr > 0 and sell_idr_value < effective_min_idr
 
-        if is_below_idr_min:
-            # Instead of discarding the position as "dust", keep it for monitoring
-            # so the bot can aggregate or retry later once the position is large
-            # enough. Surface the condition to the caller and leave state intact.
+        # ── Dust check (coin + IDR) ─────────────────────────────────────
+        # When both the coin amount and the IDR value are below their
+        # respective minimums, the position is truly unsellable dust —
+        # clear it so the bot can move on.
+        if is_below_coin_min and is_below_idr_min:
+            logger.warning(
+                "force_sell: amount %.8f %s (Rp %.0f) is below exchange minimums "
+                "(min_coin=%.8f, min_idr=%.0f) — clearing dust position",
+                amount,
+                pair.split("_")[0].upper(),
+                sell_idr_value,
+                min_coin_per_pair,
+                effective_min_idr,
+            )
+            _tracker.cancel_pending_buy()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            outcome = {
+                "status": "dust_cleared",
+                "pair": pair,
+                "price": reference_price,
+                "amount": amount,
+                "min_idr": effective_min_idr,
+                "portfolio": _tracker.as_dict(reference_price),
+            }
+            self._persist_after_trade(pair)
+            return outcome
+
+        # ── IDR-level minimum check (exchange-reported) ──────────────────
+        # When the exchange has a per-pair IDR minimum and the sell value
+        # is below it, keep the position for monitoring rather than
+        # discarding it — the position may grow or be aggregated later.
+        if min_idr_per_pair > 0 and sell_idr_value < min_idr_per_pair:
             logger.warning(
                 "force_sell: sell amount %.8f %s (Rp %.0f) is below exchange minimum "
                 "(min_idr=%.0f) — skipping sell and keeping position to monitor",
                 amount,
                 pair.split("_")[0].upper(),
                 sell_idr_value,
-                effective_min_idr,
+                min_idr_per_pair,
             )
             return {
                 "status": "below_minimum",
                 "pair": pair,
                 "price": reference_price,
                 "amount": amount,
-                "min_idr": effective_min_idr,
+                "min_idr": min_idr_per_pair,
                 "portfolio": _tracker.as_dict(reference_price),
             }
 

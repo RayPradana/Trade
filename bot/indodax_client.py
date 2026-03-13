@@ -465,8 +465,9 @@ class IndodaxClient:
 
     # -------------------- helpers -------------------- #
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        if self._request_scheduler is not None:
-            return self._request_scheduler.submit(self._perform_get, path, params).result()
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None:
+            return scheduler.submit(self._perform_get, path, params).result()
         return self._perform_get(path, params)
 
     def _perform_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -493,8 +494,9 @@ class IndodaxClient:
         return self._handle_response(response)
 
     def _post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if self._request_scheduler is not None:
-            return self._request_scheduler.submit(self._perform_post_private, method, params).result()
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None:
+            return scheduler.submit(self._perform_post_private, method, params).result()
         return self._perform_post_private(method, params)
 
     def _perform_post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
