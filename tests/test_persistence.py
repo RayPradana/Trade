@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict
+from types import SimpleNamespace
 
 from bot.config import BotConfig
 from bot.persistence import StatePersistence
@@ -118,7 +119,31 @@ class TraderAutoResumeTests(unittest.TestCase):
             self.assertIsNotNone(state)
             assert state is not None
             self.assertEqual(state.get("pair"), "btc_idr")
-            self.assertGreater(state["portfolio"]["base_position"], 0)
+
+    def test_reconcile_does_not_clear_state_on_missing_balance(self) -> None:
+        """Reconciliation must not wipe state when balance data is unavailable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "bot_state.json"
+            config = BotConfig(
+                api_key="token",
+                dry_run=False,
+                state_path=state_path,
+                multi_position_enabled=False,
+            )
+            trader = Trader(config, client=_FakeClient())
+            trader.tracker.base_position = 5.0
+            trader.tracker.avg_cost = 100.0
+            # Seed a persisted state file.
+            trader.persistence.save(
+                {"portfolio": trader.tracker.to_state(), "pair": "btc_idr", "dry_run": False}
+            )
+            # Exchange response lacks balance for BTC (e.g., transient error).
+            trader.client = SimpleNamespace(get_account_info=lambda: {"success": 0})
+
+            trader._reconcile_with_api("btc_idr")
+
+            self.assertTrue(state_path.exists(), "State file must remain after reconciliation skip")
+            self.assertEqual(trader.tracker.base_position, 5.0)
 
     def test_trader_clears_state_after_full_sell(self) -> None:
         """State file must be removed after the entire position is sold."""

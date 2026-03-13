@@ -539,8 +539,14 @@ class Trader:
         try:
             info = self.client.get_account_info()
             # Indodax returns {"success": 1, "return": {"balance": {"btc": "0.001", ...}}}
+            if info.get("success") not in (None, 1):
+                logger.warning("Reconciliation skipped for %s: API success=%s", pair, info.get("success"))
+                return
             balance_dict = (info.get("return") or {}).get("balance") or {}
             base_coin = pair.split("_")[0].lower()
+            if base_coin not in balance_dict:
+                logger.warning("Reconciliation skipped for %s: balance key %s missing", pair, base_coin)
+                return
             real_balance = float(balance_dict.get(base_coin) or "0")
             saved_position = self.tracker.base_position
             tolerance = max(saved_position * 0.05, 1e-8)
