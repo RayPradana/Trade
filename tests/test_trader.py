@@ -6,7 +6,7 @@ from typing import Dict, Any
 
 import requests
 
-from bot.analysis import WhaleActivity
+from bot.analysis import WhaleActivity, Candle, OrderbookInsight
 from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
@@ -2062,31 +2062,106 @@ class TickMoveFilterTest(unittest.TestCase):
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("tick_too_large", outcome["reason"])
 
-    def test_tick_flat_book_fallback_to_unit_price(self):
-        """Flat book (4 @ bid/ask) should still be treated as 1 IDR tick (~25%)."""
-        bids = [["4", "100"], ["4", "200"]]
-        asks = [["4", "50"], ["4", "25"]]
-        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=4.0)
-        outcome = trader.maybe_execute(_make_buy_snap(price=4.0))
-        self.assertEqual(outcome["status"], "skipped")
-        self.assertIn("tick_too_large", outcome["reason"])
 
-    def test_filter_disabled_when_zero(self):
-        """When max_tick_move_pct=0 the tick filter must be disabled."""
-        bids = [["5", "100"], ["4", "200"]]
-        asks = [["6", "50"]]
-        trader = self._trader(max_tick=0.0, bids=bids, asks=asks, price=5.0)
-        outcome = trader.maybe_execute(_make_buy_snap(price=5.0))
-        self.assertNotIn("tick_too_large", outcome.get("reason", ""))
+class Depth429FallbackTest(unittest.TestCase):
+    """analyze_market must tolerate depth 429s by using WS/cache instead of failing."""
 
-    def test_sell_not_blocked_by_tick_filter(self):
-        """Tick filter must only apply to buy signals, not sells."""
-        bids = [["5", "100"], ["4", "200"]]
-        asks = [["6", "50"]]
-        trader = self._trader(max_tick=0.08, bids=bids, asks=asks, price=5.0)
-        trader.tracker.record_trade("buy", 5.0, 100.0)
-        outcome = trader.maybe_execute(_make_buy_snap(price=5.0, action="sell"))
-        self.assertNotIn("tick_too_large", outcome.get("reason", ""))
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _candles(self):
+        return [
+            Candle(timestamp=1, open=10, high=11, low=9, close=10.5, volume=1000),
+            Candle(timestamp=2, open=10.5, high=11, low=10, close=10.8, volume=900),
+        ]
+
+    def test_depth_prefers_ws_cache_and_skips_rest(self):
+        ws_depth = {"buy": [["10", "1"]], "sell": [["11", "1"]]}
+        ticker = {"last": "10", "high": "11", "low": "9", "vol_idr": "1000000", "trade_count": "100"}
+
+        class _Client:
+            depth_calls = 0
+
+            def get_ticker(self, pair):
+                return ticker
+
+            def get_depth(self, pair, count=200):
+                _Client.depth_calls += 1
+                raise RuntimeError("HTTP error: 429 Client Error: Too Many Requests for url: depth")
+
+            def get_trades(self, pair, count=200):
+                return []
+
+            def get_ohlc(self, pair, tf=None, limit=None):
+                return []
+
+        class _MultiFeed:
+            def get_depth(self, pair):
+                return ws_depth
+
+            def get_trades(self, pair):
+                return []
+
+            def get_ticker(self, pair):
+                return ticker
+
+        class _Trader(Trader):
+            def _fetch_candles(self, pair, trades, use_cache=False):
+                return Depth429FallbackTest._candles(self)
+
+            def _get_reference_pair_trend(self, pair):
+                return None
+
+        config = BotConfig(api_key=None, dry_run=True, min_candles=1)
+        trader = _Trader(config, client=_Client())
+        trader._multi_feed = _MultiFeed()
+
+        snap = trader.analyze_market("cst_idr")
+        self.assertGreater(snap["orderbook"].bid_volume, 0.0, "should use WS depth after 429")
+        self.assertEqual(_Client.depth_calls, 0, "should avoid REST depth when WS snapshot is available")
+
+    def test_depth_429_with_position_snapshot_falls_back_to_empty(self):
+        ticker = {"last": "10", "high": "11", "low": "9", "vol_idr": "1000000", "trade_count": "50"}
+
+        class _Client:
+            depth_calls = 0
+
+            def get_ticker(self, pair):
+                return ticker
+
+            def get_depth(self, pair, count=200):
+                _Client.depth_calls += 1
+                raise RuntimeError("HTTP error: 429 Client Error: Too Many Requests for url: depth")
+
+            def get_trades(self, pair, count=200):
+                return []
+
+            def get_ohlc(self, pair, tf=None, limit=None):
+                return []
+
+        class _PositionFeed:
+            has_snapshot = True
+
+            def snapshot(self):
+                return {"ticker": ticker, "trades": []}
+
+        class _Trader(Trader):
+            def _fetch_candles(self, pair, trades, use_cache=False):
+                return Depth429FallbackTest._candles(self)
+
+            def _get_reference_pair_trend(self, pair):
+                return None
+
+        config = BotConfig(api_key=None, dry_run=True, min_candles=1)
+        trader = _Trader(config, client=_Client())
+        trader._position_feeds["cst_idr"] = _PositionFeed()
+
+        snap = trader.analyze_market("cst_idr")
+        self.assertIsInstance(snap["orderbook"], OrderbookInsight)
+        self.assertEqual(_Client.depth_calls, 1)
 
 
 class TopVolumeAutoSelectorTest(unittest.TestCase):

@@ -1266,7 +1266,21 @@ class Trader:
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
                 depth = _ws_depth or _rt_snap.get("depth") or _empty_depth
             else:
-                depth = _rt_snap.get("depth") or self.client.get_depth(pair, count=200)
+                snap_depth = _rt_snap.get("depth")
+                _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
+                depth = snap_depth or _ws_depth
+                if not depth:
+                    try:
+                        depth = self.client.get_depth(pair, count=200)
+                    except RuntimeError as exc:
+                        if "429" in str(exc):
+                            logger.warning(
+                                "Depth request rate-limited for %s — using cached/empty depth",
+                                pair,
+                            )
+                            depth = snap_depth or _ws_depth or _empty_depth
+                        else:
+                            raise
             if skip_trades:
                 _ws_trades = self._multi_feed.get_trades(pair) if self._multi_feed else None
                 trades = _ws_trades or _rt_snap.get("trades") or []
@@ -1280,12 +1294,24 @@ class Trader:
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
                 depth = _ws_depth or _empty_depth
             else:
-                depth = self.client.get_depth(pair, count=200)
+                _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
+                try:
+                    depth = _ws_depth or self.client.get_depth(pair, count=200)
+                except RuntimeError as exc:
+                    if "429" in str(exc):
+                        logger.warning(
+                            "Depth request rate-limited for %s — using cached/empty depth",
+                            pair,
+                        )
+                        depth = _ws_depth or _empty_depth
+                    else:
+                        raise
             if skip_trades:
                 _ws_trades = self._multi_feed.get_trades(pair) if self._multi_feed else None
                 trades = _ws_trades or []
             else:
-                trades = self.client.get_trades(pair, count=self.config.trade_count)
+                _ws_trades = self._multi_feed.get_trades(pair) if self._multi_feed else None
+                trades = _ws_trades or self.client.get_trades(pair, count=self.config.trade_count)
 
         # ── Candle data ──────────────────────────────────────────────────────
         # Prefer the official OHLCV history endpoint which returns pre-formed
