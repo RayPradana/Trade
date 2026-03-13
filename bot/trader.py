@@ -2762,6 +2762,7 @@ class Trader:
                     retry_price = min(reference_price * (1 + retry_bump), allowed_max)
                     _fmt_price = getattr(self.client, "format_price", None)
                     if callable(_fmt_price):
+                        # format_price returns (price, precision) tuple
                         retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
                 if retry_price > reference_price:
                     logger.info(

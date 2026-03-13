@@ -4226,7 +4226,7 @@ class BuyPendingFillTests(unittest.TestCase):
             def invalidate_account_info_cache(self) -> None:
                 pass
 
-            def format_price(self, pair: str, price: float):
+            def format_price(self, pair: str, price: float) -> tuple[float, int]:
                 """Return (rounded_price, precision) tuple like IndodaxClient."""
                 return (round(price, 2), 2)
 
