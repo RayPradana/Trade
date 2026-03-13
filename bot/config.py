@@ -360,13 +360,12 @@ class BotConfig:
     fake_pump_reversal_pct: float = 0.0
     # ── Indodax minimum order value ───────────────────────────────────────────
     # Indodax rejects any order whose total IDR value (price × amount) is below
-    # 10,000 IDR.  The bot enforces this limit before submitting to the exchange
-    # so that the error is caught gracefully as a "skipped" outcome rather than
-    # raising a runtime exception.
+    # 10,000 IDR.  The bot enforces a higher safety floor before submitting to
+    # the exchange so the error is caught gracefully as a "skipped" outcome
+    # rather than raising a runtime exception.
     #
-    # Default is raised to 15,000 IDR above the exchange minimum to avoid
-    # wasting fees on tiny trades and to ensure trades "feel" meaningful.
-    # Must be > 0.
+    # Default is 30,000 IDR — a conservative buffer above the exchange minimum
+    # to avoid tiny trades and fee waste.  Must be > 0.
     min_order_idr: float = 30_000.0
     # Consecutive loss protection
     max_consecutive_losses: int = 0  # 0=disabled; stop trading after N losing sells in a row
