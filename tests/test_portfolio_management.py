@@ -36,7 +36,7 @@ from bot.portfolio_management import (
     recommend_hedges,
     # 11. Long/short portfolio balancing
     LongShortBalance,
-    analyse_long_short_balance,
+    analyze_long_short_balance,
 )
 
 
@@ -473,7 +473,7 @@ class TestCrossMarketHedging(unittest.TestCase):
 class TestLongShortBalance(unittest.TestCase):
     def test_long_only(self):
         positions = {"A": 5000, "B": 3000, "C": 2000}
-        r = analyse_long_short_balance(positions, portfolio_value=10000)
+        r = analyze_long_short_balance(positions, portfolio_value=10000)
         self.assertIsInstance(r, LongShortBalance)
         self.assertEqual(r.short_exposure, 0)
         self.assertEqual(len(r.short_assets), 0)
@@ -481,29 +481,29 @@ class TestLongShortBalance(unittest.TestCase):
 
     def test_balanced_portfolio(self):
         positions = {"L1": 5000, "S1": -5000}
-        r = analyse_long_short_balance(positions, portfolio_value=10000,
+        r = analyze_long_short_balance(positions, portfolio_value=10000,
                                         target_net_pct=0.0, tolerance_pct=5.0)
         self.assertTrue(r.is_balanced)
         self.assertAlmostEqual(r.net_pct, 0, places=1)
 
     def test_unbalanced_long_heavy(self):
         positions = {"L1": 8000, "S1": -1000}
-        r = analyse_long_short_balance(positions, portfolio_value=10000,
+        r = analyze_long_short_balance(positions, portfolio_value=10000,
                                         target_net_pct=0.0, tolerance_pct=10.0)
         self.assertFalse(r.is_balanced)
         self.assertEqual(r.recommendation, "increase_short_or_reduce_long")
 
     def test_gross_exposure(self):
         positions = {"L": 6000, "S": -4000}
-        r = analyse_long_short_balance(positions, portfolio_value=10000)
+        r = analyze_long_short_balance(positions, portfolio_value=10000)
         self.assertAlmostEqual(r.gross_exposure, 10000, places=1)
 
     def test_reason(self):
-        r = analyse_long_short_balance({"A": 1000}, portfolio_value=5000)
+        r = analyze_long_short_balance({"A": 1000}, portfolio_value=5000)
         self.assertIn("ls_balance", r.reason)
 
     def test_empty_positions(self):
-        r = analyse_long_short_balance({}, portfolio_value=10000)
+        r = analyze_long_short_balance({}, portfolio_value=10000)
         self.assertEqual(r.long_exposure, 0)
         self.assertEqual(r.short_exposure, 0)
 

@@ -456,7 +456,7 @@ def compute_correlation_matrix(
     returns_map: Dict[str, Sequence[float]],
     alert_threshold: float = 0.7,
 ) -> CorrelationMatrix:
-    """Build and analyse the pairwise correlation matrix.
+    """Build and analyze the pairwise correlation matrix.
 
     :param assets: Asset identifiers.
     :param returns_map: Historical returns per asset.
@@ -1042,7 +1042,7 @@ class LongShortBalance:
     reason: str
 
 
-def analyse_long_short_balance(
+def analyze_long_short_balance(
     positions: Dict[str, float],
     portfolio_value: float,
     target_net_pct: float = 0.0,
