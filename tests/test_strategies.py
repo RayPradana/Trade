@@ -3,7 +3,18 @@ import unittest
 from bot.config import BotConfig
 from bot.grid import build_grid_plan
 from bot.strategies import StrategyDecision, make_trade_decision, select_strategy, _position_size, confidence_position_pct
-from bot.analysis import OrderbookInsight, TrendResult, VolatilityStats, SupportResistance
+from bot.analysis import (
+    OrderbookInsight,
+    TrendResult,
+    VolatilityStats,
+    SupportResistance,
+    PumpSniperSignal,
+    PrePumpSignal,
+    WhalePressure,
+    EarlyBreakoutSignal,
+    FakeBreakoutRisk,
+    SmartEntryResult,
+)
 
 
 class StrategyTests(unittest.TestCase):
@@ -117,6 +128,49 @@ class SmartEntryStrategyTests(unittest.TestCase):
         levels = SupportResistance(support=90.0, resistance=115.0, lookback=10)
         config = BotConfig(api_key=None)
         return trend, orderbook, vol, levels, config
+
+    def test_pump_sniper_scales_position_size(self):
+        trend, orderbook, vol, levels, config = self._base_inputs()
+        price = 100.0
+        # Force deterministic sizing via confidence tiers
+        config.confidence_position_sizing_enabled = True
+        config.confidence_tier_skip = 0.0
+        config.confidence_tier_low = 0.0
+        config.confidence_tier_mid = 0.0
+        config.confidence_tier_high = 0.0
+        config.confidence_tier_max_pct = 0.2
+        config.pump_sniper_size_multiplier = 2.0
+        config.pump_sniper_size_min_score = 0.5
+
+        base_smart_entry = SmartEntryResult(
+            pre_pump=PrePumpSignal(detected=False, volume_surge_ratio=1.0, score=0.0),
+            pump_sniper=PumpSniperSignal(detected=False, price_ratio=1.0, volume_ratio=1.0, score=0.0),
+            whale_pressure=WhalePressure(detected=False, side=None, pressure=0.0),
+            early_breakout=EarlyBreakoutSignal(detected=False, proximity_pct=0.0, volume_ratio=1.0, score=0.0),
+            fake_breakout=FakeBreakoutRisk(breakout_present=False, detected=False, volume_ratio=1.0, score=0.0),
+        )
+        pump_smart_entry = SmartEntryResult(
+            pre_pump=PrePumpSignal(detected=False, volume_surge_ratio=1.0, score=0.0),
+            pump_sniper=PumpSniperSignal(detected=True, price_ratio=1.05, volume_ratio=3.0, score=1.0),
+            whale_pressure=WhalePressure(detected=False, side=None, pressure=0.0),
+            early_breakout=EarlyBreakoutSignal(detected=False, proximity_pct=0.0, volume_ratio=1.0, score=0.0),
+            fake_breakout=FakeBreakoutRisk(breakout_present=False, detected=False, volume_ratio=1.0, score=0.0),
+        )
+
+        base_decision = make_trade_decision(
+            trend, orderbook, vol, price, config, levels, smart_entry=base_smart_entry
+        )
+        pump_decision = make_trade_decision(
+            trend, orderbook, vol, price, config, levels, smart_entry=pump_smart_entry
+        )
+
+        self.assertEqual(base_decision.action, "buy")
+        self.assertEqual(pump_decision.action, "buy")
+        self.assertAlmostEqual(
+            pump_decision.amount,
+            base_decision.amount * config.pump_sniper_size_multiplier,
+            delta=1e-9,
+        )
 
     def _make_see(self, pre_pump=False, pp_score=0.0, pump_detected=False, pump_score=0.0,
                   wp_detected=False, wp_side=None, wp_pressure=0.0, fb_detected=False,

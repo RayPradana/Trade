@@ -696,7 +696,44 @@ def make_trade_decision(
 
     conf = round(max(0.0, min(1.0, conf)), 3)
 
-    _notes = " ".join(n for n in (sr_note, mtf_note, whale_note, spoof_note, see_note, sweep_note, trap_note, vacuum_note, smart_money_note, vaccel_note, micro_note, ai_note) if n)
+    # size based on risk per trade relative to stop distance
+    risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
+    amount = _position_size(
+        current_price, stop_loss, config, risk_per_unit, conf, vol,
+        effective_capital, ob_imbalance=orderbook.imbalance,
+    )
+
+    pump_size_note = ""
+    # Pump-sniper sizing boost: scale entry size when pump is confirmed
+    if (
+        action == "buy"
+        and smart_entry is not None
+        and getattr(smart_entry, "pump_sniper", None)
+        and smart_entry.pump_sniper.detected
+        and smart_entry.pump_sniper.score >= config.pump_sniper_size_min_score
+    ):
+        amount *= config.pump_sniper_size_multiplier
+        pump_size_note = f"pump_size_x{config.pump_sniper_size_multiplier:g}"
+
+    _notes = " ".join(
+        n
+        for n in (
+            sr_note,
+            mtf_note,
+            whale_note,
+            spoof_note,
+            see_note,
+            sweep_note,
+            trap_note,
+            vacuum_note,
+            smart_money_note,
+            vaccel_note,
+            micro_note,
+            ai_note,
+            pump_size_note,
+        )
+        if n
+    )
 
     # Adaptive sizing note: show effective risk when adaptive mode is on
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
@@ -711,13 +748,6 @@ def make_trade_decision(
         f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} "
         f"rsi={indicators.rsi if indicators else float('nan'):.2f}"
         + (f" {_all_notes}" if _all_notes else "")
-    )
-
-    # size based on risk per trade relative to stop distance
-    risk_per_unit = abs(current_price - stop_loss) if stop_loss else 0.0
-    amount = _position_size(
-        current_price, stop_loss, config, risk_per_unit, conf, vol,
-        effective_capital, ob_imbalance=orderbook.imbalance,
     )
 
     return StrategyDecision(

@@ -319,6 +319,9 @@ class BotConfig:
     see_pump_sniper_volume_ratio: float = 2.5
     see_pump_sniper_short: int = 3
     see_pump_sniper_long: int = 12
+    # Pump sizing boost: scale position size when pump-sniper confirms a pump
+    pump_sniper_size_multiplier: float = 1.5
+    pump_sniper_size_min_score: float = 0.7
     # Minimum net whale pressure ratio (bid_whale_ratio − ask_whale_ratio) to
     # classify as significant directional whale activity.
     see_whale_pressure_min: float = 2.0
@@ -711,6 +714,8 @@ class BotConfig:
             see_pump_sniper_volume_ratio=_env_float("SEE_PUMP_SNIPER_VOLUME_RATIO", "2.5"),
             see_pump_sniper_short=_env_int("SEE_PUMP_SNIPER_SHORT", "3"),
             see_pump_sniper_long=_env_int("SEE_PUMP_SNIPER_LONG", "12"),
+            pump_sniper_size_multiplier=_env_float("PUMP_SNIPER_SIZE_MULTIPLIER", "1.5"),
+            pump_sniper_size_min_score=_env_float("PUMP_SNIPER_SIZE_MIN_SCORE", "0.7"),
             see_whale_pressure_min=_env_float("SEE_WHALE_PRESSURE_MIN", "2.0"),
             see_breakout_volume_min=_env_float("SEE_BREAKOUT_VOLUME_MIN", "0.7"),
             early_breakout_proximity_pct=_env_float("EARLY_BREAKOUT_PROXIMITY_PCT", "0.005"),
@@ -924,6 +929,10 @@ class BotConfig:
             raise ValueError("Both SEE_PUMP_SNIPER_SHORT and SEE_PUMP_SNIPER_LONG must be positive")
         if self.see_pump_sniper_long <= self.see_pump_sniper_short:
             raise ValueError("SEE_PUMP_SNIPER_LONG must be greater than SEE_PUMP_SNIPER_SHORT")
+        if self.pump_sniper_size_multiplier < 1.0:
+            raise ValueError("PUMP_SNIPER_SIZE_MULTIPLIER must be at least 1.0")
+        if not (0.0 <= self.pump_sniper_size_min_score <= 1.0):
+            raise ValueError("PUMP_SNIPER_SIZE_MIN_SCORE must be between 0 and 1")
         if self.see_whale_pressure_min < 0:
             raise ValueError("SEE_WHALE_PRESSURE_MIN must be non-negative")
         if not (0.0 <= self.see_breakout_volume_min <= 1.0):
