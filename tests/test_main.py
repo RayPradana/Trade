@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 import unittest
@@ -400,6 +401,49 @@ class AccountInfoDisplayTests(unittest.TestCase):
     def test_log_account_info_dry_runs_without_error(self) -> None:
         """_log_account_info_dry should not raise."""
         main._log_account_info_dry()
+
+
+class TrailDisplayTests(unittest.TestCase):
+    """Ensure trailing fields explain when disabled to avoid confusion."""
+
+    def setUp(self) -> None:
+        self._prev_disable = logging.root.manager.disable
+        logging.disable(logging.NOTSET)
+
+    def tearDown(self) -> None:
+        logging.disable(self._prev_disable)
+
+    def test_trailing_disabled_hint_shown(self) -> None:
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+
+        portfolio = {
+            "base_position": 1.0,
+            "avg_cost": 100.0,
+            "equity": 200.0,
+            "cash": 100.0,
+            "target_equity": 0.0,
+            "trailing_stop": None,
+            "trailing_tp_stop": None,
+        }
+
+        try:
+            main._log_holding(
+                "btc_idr",
+                price=110.0,
+                portfolio=portfolio,
+                trailing_stop_enabled=False,
+                trailing_tp_enabled=False,
+            )
+        finally:
+            root.removeHandler(handler)
+
+        log_text = buf.getvalue()
+        self.assertIn("trail     : — (disabled)", log_text)
+        self.assertIn("trail-TP: — (disabled)", log_text)
 
 
 if __name__ == "__main__":

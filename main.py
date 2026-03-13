@@ -483,8 +483,23 @@ def _log_outcome(outcome: dict) -> None:
 
 # ── Portfolio display ────────────────────────────────────────────────────
 
-def _log_portfolio(portfolio: dict, initial_capital: float = 0.0) -> None:
-    """Log a multi-line tree-formatted portfolio summary."""
+def _log_portfolio(
+    portfolio: dict,
+    initial_capital: float = 0.0,
+    *,
+    trailing_stop_enabled: bool | None = None,
+    trailing_tp_enabled: bool | None = None,
+) -> None:
+    """Log a multi-line tree-formatted portfolio summary.
+
+    Uses the in-memory tracker snapshot (no REST calls), so it is safe to call
+    frequently without tripping exchange rate limits.
+
+    trailing_stop_enabled / trailing_tp_enabled are optional hints from config
+    so we can explain whether a missing trail value is due to the feature being
+    disabled (avoid confusion with "—" when users expect a trail).  None means
+    we do not know / will not annotate.
+    """
     equity   = portfolio["equity"]
     cash     = portfolio["cash"]
     pos      = portfolio["base_position"]
@@ -554,8 +569,20 @@ def _log_portfolio(portfolio: dict, initial_capital: float = 0.0) -> None:
         pb_str, pb_dd_str,
         f"{_BOLD}{_idr(eff_capital)}{_RESET}",
     )
-    trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"    if trail    else f"{_DIM}—{_RESET}"
-    ttp_str    = f"{_GREEN}{_idr(trailing_tp)}{_RESET}" if trailing_tp else f"{_DIM}—{_RESET}"
+    _trail_hint = ""
+    if trail is None and trailing_stop_enabled is not None:
+        _trail_hint = " (disabled)" if not trailing_stop_enabled else " (pending)"
+    trail_str  = (
+        f"{_YELLOW}{_idr(trail)}{_RESET}"
+        if trail is not None else f"{_DIM}—{_RESET}{_trail_hint}"
+    )
+    _ttp_hint = ""
+    if trailing_tp is None and trailing_tp_enabled is not None:
+        _ttp_hint = " (disabled)" if not trailing_tp_enabled else " (pending)"
+    ttp_str    = (
+        f"{_GREEN}{_idr(trailing_tp)}{_RESET}"
+        if trailing_tp is not None else f"{_DIM}—{_RESET}{_ttp_hint}"
+    )
     target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}"  if t_equity else f"{_DIM}—{_RESET}"
     floor_str  = f"{_RED}{_idr(m_equity)}{_RESET}"    if m_equity else f"{_DIM}—{_RESET}"
     logging.info(
@@ -566,8 +593,15 @@ def _log_portfolio(portfolio: dict, initial_capital: float = 0.0) -> None:
 
 # ── Holding-position status ───────────────────────────────────────────────
 
-def _log_holding(pair: str, price: float, portfolio: dict,
-                 initial_capital: float = 0.0) -> None:
+def _log_holding(
+    pair: str,
+    price: float,
+    portfolio: dict,
+    initial_capital: float = 0.0,
+    *,
+    trailing_stop_enabled: bool | None = None,
+    trailing_tp_enabled: bool | None = None,
+) -> None:
     """Log a compact holding-position summary with unrealized PnL."""
     pos      = portfolio["base_position"]
     avg_cost = portfolio.get("avg_cost", 0.0)
@@ -610,8 +644,20 @@ def _log_holding(pair: str, price: float, portfolio: dict,
         equity_pct_str,
         f"{_idr(cash)}",
     )
-    trail_str  = f"{_YELLOW}{_idr(trail)}{_RESET}"            if trail             else f"{_DIM}—{_RESET}"
-    ttp_str    = f"{_GREEN}{_idr(trailing_tp_floor)}{_RESET}"  if trailing_tp_floor else f"{_DIM}—{_RESET}"
+    _trail_hint = ""
+    if trail is None and trailing_stop_enabled is not None:
+        _trail_hint = " (disabled)" if not trailing_stop_enabled else " (pending)"
+    trail_str  = (
+        f"{_YELLOW}{_idr(trail)}{_RESET}"
+        if trail is not None else f"{_DIM}—{_RESET}{_trail_hint}"
+    )
+    _ttp_hint = ""
+    if trailing_tp_floor is None and trailing_tp_enabled is not None:
+        _ttp_hint = " (disabled)" if not trailing_tp_enabled else " (pending)"
+    ttp_str    = (
+        f"{_GREEN}{_idr(trailing_tp_floor)}{_RESET}"
+        if trailing_tp_floor is not None else f"{_DIM}—{_RESET}{_ttp_hint}"
+    )
     target_str = f"{_GREEN}{_idr(t_equity)}{_RESET}"          if t_equity          else f"{_DIM}—{_RESET}"
     logging.info(
         "   %s└─%s trail     : %s  trail-TP: %s    target : %s",
@@ -756,7 +802,12 @@ def main() -> None:
                             config.partial_tp_fraction * 100,
                             f"{held_price:15,.2f}",
                         )
-                        _log_portfolio(portfolio, config.initial_capital)
+                        _log_portfolio(
+                            portfolio,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
                         _notify(
                             config,
                             f"🎯 PARTIAL-TP {held_pair} @ Rp {held_price:,.0f}\n"
@@ -783,7 +834,12 @@ def main() -> None:
                         f"{held_price:15,.2f}",
                         config.partial_tp2_target_pct * 100,
                     )
-                    _log_portfolio(portfolio, config.initial_capital)
+                    _log_portfolio(
+                        portfolio,
+                        config.initial_capital,
+                        trailing_stop_enabled=config.trailing_stop_pct > 0,
+                        trailing_tp_enabled=config.trailing_tp_pct > 0,
+                    )
                     _notify(
                         config,
                         f"🎯 PARTIAL-TP2 {held_pair} @ Rp {held_price:,.0f}\n"
@@ -810,7 +866,12 @@ def main() -> None:
                         f"{held_price:15,.2f}",
                         config.partial_tp3_target_pct * 100,
                     )
-                    _log_portfolio(portfolio, config.initial_capital)
+                    _log_portfolio(
+                        portfolio,
+                        config.initial_capital,
+                        trailing_stop_enabled=config.trailing_stop_pct > 0,
+                        trailing_tp_enabled=config.trailing_tp_pct > 0,
+                    )
                     _notify(
                         config,
                         f"🎯 PARTIAL-TP3 {held_pair} @ Rp {held_price:,.0f}\n"
@@ -831,7 +892,12 @@ def main() -> None:
                             f"  trailing_floor=Rp {trailing_tp_floor:,.2f}" if trailing_tp_floor else "",
                         )
                         portfolio = held_tracker.as_dict(held_price)
-                        _log_portfolio(portfolio, config.initial_capital)
+                        _log_portfolio(
+                            portfolio,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
                         consecutive_errors = 0
                         _still_holding = True
                         continue  # next held pair
@@ -855,7 +921,12 @@ def main() -> None:
                         _BOLD, force_outcome.get("amount", 0), _RESET,
                         f"{held_price:15,.2f}",
                     )
-                    _log_portfolio(portfolio, config.initial_capital)
+                    _log_portfolio(
+                        portfolio,
+                        config.initial_capital,
+                        trailing_stop_enabled=config.trailing_stop_pct > 0,
+                        trailing_tp_enabled=config.trailing_tp_pct > 0,
+                    )
                     _notify(
                         config,
                         f"📤 EXIT {held_pair} @ Rp {held_price:,.0f}\n"
@@ -872,7 +943,14 @@ def main() -> None:
                 else:
                     _still_holding = True
                     portfolio = held_tracker.as_dict(held_price)
-                    _log_holding(held_pair, held_price, portfolio, config.initial_capital)
+                    _log_holding(
+                        held_pair,
+                        held_price,
+                        portfolio,
+                        config.initial_capital,
+                        trailing_stop_enabled=config.trailing_stop_pct > 0,
+                        trailing_tp_enabled=config.trailing_tp_pct > 0,
+                    )
                     consecutive_errors = 0
 
             # After monitoring all held positions:
@@ -912,7 +990,12 @@ def main() -> None:
                     if config.trailing_tp_pct > 0:
                         _bought_tracker.activate_trailing_tp(snapshot["price"], config.trailing_tp_pct)
             portfolio = trader.portfolio_snapshot(snapshot["pair"], snapshot["price"])
-            _log_portfolio(portfolio, config.initial_capital)
+            _log_portfolio(
+                portfolio,
+                config.initial_capital,
+                trailing_stop_enabled=config.trailing_stop_pct > 0,
+                trailing_tp_enabled=config.trailing_tp_pct > 0,
+            )
 
             # Telegram notification for actionable outcomes
             _out_action = outcome.get("action", "hold")
