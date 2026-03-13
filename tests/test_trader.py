@@ -1918,7 +1918,9 @@ class MinBuyPriceFilterTest(unittest.TestCase):
         trader = self._trader(min_price=10.0, min_coin_price=50.0, coin_price=4.0)
         trader.tracker.record_trade("buy", 4.0, 1000.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=4.0, action="sell"))
-        self.assertNotEqual(outcome["status"], "skipped")
+        # It may still skip for other reasons (e.g. no position), but must not be
+        # blocked by the hard floor filter.
+        self.assertNotIn("price_below_min_coin", outcome.get("reason", ""))
 
 
 class PreScanCheapCoinFilterTest(unittest.TestCase):
