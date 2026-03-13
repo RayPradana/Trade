@@ -412,16 +412,20 @@ class IndodaxClient:
             elif is_idr_pair:
                 idr_total = round(price * amount)
                 payload["idr"] = f"{idr_total:.0f}"
-                payload[base_coin] = f"{amount:.8f}"
-                payload["amount"] = f"{amount:.8f}"
+                coin_amt = amount
+                amount_str = f"{coin_amt:.8f}"
+                payload[base_coin] = amount_str
+                payload["amount"] = amount_str
             else:
                 coin_amt = btc if btc is not None else amount
-                payload[base_coin] = f"{coin_amt:.8f}"
-                payload["amount"] = f"{coin_amt:.8f}"
+                amount_str = f"{coin_amt:.8f}"
+                payload[base_coin] = amount_str
+                payload["amount"] = amount_str
         else:
             coin_amt = btc if btc is not None else amount
-            payload[base_coin] = f"{coin_amt:.8f}"
-            payload["amount"] = f"{coin_amt:.8f}"
+            amount_str = f"{coin_amt:.8f}"
+            payload[base_coin] = amount_str
+            payload["amount"] = amount_str
 
         if client_order_id:
             if len(client_order_id) > 36:
