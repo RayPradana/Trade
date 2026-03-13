@@ -16,20 +16,36 @@ from .analysis import (
     candles_from_ohlc,
     derive_indicators,
     detect_flash_dump,
+    detect_liquidity_sweep,
+    detect_liquidity_trap,
+    detect_liquidity_vacuum,
+    detect_micro_trend,
+    detect_orderbook_absorption,
     detect_rug_pull_risk,
+    detect_smart_money_footprint,
     detect_spread_anomaly,
+    detect_spread_expansion,
     detect_spoofing,
+    detect_volume_acceleration,
     detect_whale_activity,
     detect_market_regime,
     interval_to_ohlc_tf,
     multi_timeframe_confirm,
     smart_entry_filter,
+    LiquiditySweep,
+    LiquidityTrap,
+    LiquidityVacuum,
+    MicroTrend,
     MomentumIndicators,
     MultiTimeframeResult,
+    OrderbookAbsorption,
     RugPullRisk,
     SmartEntryResult,
+    SmartMoneyFootprint,
+    SpreadExpansion,
     SpoofingResult,
     TradeFlowResult,
+    VolumeAcceleration,
     WhaleActivity,
     support_resistance,
 )
@@ -42,6 +58,7 @@ from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, adaptive_max_positions, adaptive_risk_per_trade, make_trade_decision
 from .tracking import MultiPositionManager, PortfolioTracker
 from .journal import TradeJournal
+from .market_data import MarketDataFeed
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +156,8 @@ class Trader:
         self._volatility_cooldown_until: float = 0.0
         self.journal: Optional[TradeJournal] = None
         self._spread_history: Dict[str, List[float]] = {}
+        # Previous depth snapshot per pair for orderbook absorption detection
+        self._prev_depth: Dict[str, Dict[str, list]] = {}
         # Per-pair cooldown: maps pair → unix timestamp of last executed trade
         self._pair_last_trade: Dict[str, float] = {}
         # ── Per-pair minimum order cache ─────────────────────────────────────
@@ -151,6 +170,11 @@ class Trader:
         # saturate the REST rate limit.  Entries are reused until
         # config.scan_candle_cache_seconds have elapsed.
         self._candle_cache: Dict[str, Tuple[float, List[Any]]] = {}
+
+        # ── Market Data Feed ──────────────────────────────────────────────────
+        self.market_data_feed: Optional[MarketDataFeed] = None
+        if config.market_data_enabled:
+            self.market_data_feed = MarketDataFeed.from_config(config)
 
     def _min_confidence_threshold(self, snapshot: Dict[str, Any]) -> float:
         """Return the effective minimum confidence threshold for a snapshot.
@@ -1527,6 +1551,93 @@ class Trader:
                 pair, trade_flow.buy_ratio, trade_flow.sell_volume,
             )
 
+        # ── Liquidity sweep detection ─────────────────────────────────────────
+        liquidity_sweep: Optional[LiquiditySweep] = None
+        if self.config.liquidity_sweep_enabled and candles:
+            liquidity_sweep = detect_liquidity_sweep(
+                candles,
+                lookback=self.config.liquidity_sweep_lookback,
+                min_sweep_pct=self.config.liquidity_sweep_min_pct,
+                reversal_pct=self.config.liquidity_sweep_reversal_pct,
+            )
+            if liquidity_sweep.detected:
+                logger.debug(
+                    "Liquidity sweep on %s: dir=%s sweep=%.2f%% rev=%.2f%%",
+                    pair, liquidity_sweep.direction,
+                    liquidity_sweep.sweep_pct * 100, liquidity_sweep.reversal_pct * 100,
+                )
+
+        # ── Liquidity trap detection ──────────────────────────────────────────
+        liquidity_trap: Optional[LiquidityTrap] = None
+        if self.config.liquidity_trap_enabled and candles:
+            liquidity_trap = detect_liquidity_trap(
+                candles,
+                lookback=self.config.liquidity_sweep_lookback,
+                breakout_pct=self.config.liquidity_trap_breakout_pct,
+                reversal_pct=self.config.liquidity_trap_reversal_pct,
+            )
+            if liquidity_trap.detected:
+                logger.debug(
+                    "Liquidity trap on %s: dir=%s breakout=%.2f%% rev=%.2f%%",
+                    pair, liquidity_trap.direction,
+                    liquidity_trap.breakout_pct * 100, liquidity_trap.reversal_pct * 100,
+                )
+
+        # ── Liquidity vacuum detection ────────────────────────────────────────
+        liquidity_vacuum: Optional[LiquidityVacuum] = None
+        if self.config.liquidity_vacuum_min_gap_pct > 0 and depth:
+            liquidity_vacuum = detect_liquidity_vacuum(
+                depth,
+                min_gap_pct=self.config.liquidity_vacuum_min_gap_pct,
+                depth_levels=self.config.liquidity_vacuum_depth_levels,
+            )
+            if liquidity_vacuum.detected:
+                logger.debug(
+                    "Liquidity vacuum on %s: gap=%.2f%% at price=%.2f",
+                    pair, liquidity_vacuum.gap_pct * 100, liquidity_vacuum.gap_price,
+                )
+
+        # ── Smart money footprint detection ───────────────────────────────────
+        smart_money: Optional[SmartMoneyFootprint] = None
+        if self.config.smart_money_enabled and candles:
+            smart_money = detect_smart_money_footprint(
+                candles,
+                volume_factor=self.config.smart_money_volume_factor,
+                divergence_lookback=self.config.smart_money_divergence_lookback,
+            )
+            if smart_money.detected:
+                logger.debug(
+                    "Smart money on %s: bias=%s vol_ratio=%.2f",
+                    pair, smart_money.bias, smart_money.volume_ratio,
+                )
+
+        # ── Volume acceleration detection ─────────────────────────────────────
+        volume_accel: Optional[VolumeAcceleration] = None
+        if self.config.volume_accel_enabled and candles:
+            volume_accel = detect_volume_acceleration(
+                candles,
+                window=self.config.volume_accel_window,
+                min_ratio=self.config.volume_accel_min_ratio,
+            )
+            if volume_accel.detected:
+                logger.debug(
+                    "Volume acceleration on %s: ratio=%.2f",
+                    pair, volume_accel.acceleration_ratio,
+                )
+
+        # ── Micro trend detection ─────────────────────────────────────────────
+        micro_trend: Optional[MicroTrend] = None
+        if self.config.micro_trend_enabled and candles:
+            micro_trend = detect_micro_trend(
+                candles,
+                window=self.config.micro_trend_window,
+            )
+            if micro_trend.direction != "flat":
+                logger.debug(
+                    "Micro trend on %s: dir=%s strength=%.4f",
+                    pair, micro_trend.direction, micro_trend.strength,
+                )
+
         grid_plan: Optional[GridPlan] = None
         decision: StrategyDecision
         if self.config.grid_enabled:
@@ -1549,6 +1660,12 @@ class Trader:
                 effective_capital=self.tracker.effective_capital(),
                 smart_entry=smart_entry,
                 trade_flow=trade_flow,
+                liquidity_sweep=liquidity_sweep,
+                liquidity_trap=liquidity_trap,
+                liquidity_vacuum=liquidity_vacuum,
+                smart_money=smart_money,
+                volume_accel=volume_accel,
+                micro_trend=micro_trend,
                 regime=regime,
             )
             # Apply correlated-pair confidence boost when reference trend aligns
@@ -1577,6 +1694,12 @@ class Trader:
             "reference_trend": reference_trend,
             "smart_entry": smart_entry,
             "trade_flow": trade_flow,
+            "liquidity_sweep": liquidity_sweep,
+            "liquidity_trap": liquidity_trap,
+            "liquidity_vacuum": liquidity_vacuum,
+            "smart_money": smart_money,
+            "volume_accel": volume_accel,
+            "micro_trend": micro_trend,
             "volume_24h_idr": self._extract_volume_idr(ticker),
             "trades_24h": trades_24h,
         }
@@ -1714,6 +1837,58 @@ class Trader:
                     self.multi_manager.return_position_cash(pair)
         return cancelled
 
+    def _cancel_stale_orders(self, pair: str) -> int:
+        """Cancel open orders older than ``config.stale_order_seconds``.
+
+        Returns the number of cancelled orders.  Skipped when
+        ``stale_order_seconds`` is 0 (disabled), in dry-run mode, or when
+        API credentials are not configured.
+        """
+        if self.config.stale_order_seconds <= 0:
+            return 0
+        if self.config.dry_run or self.config.api_key is None:
+            return 0
+        try:
+            open_resp = self.client.open_orders(pair)
+            orders = (open_resp.get("return") or {}).get("orders") or []
+        except Exception as exc:
+            logger.warning("Unable to fetch open orders for stale check on %s: %s", pair, exc)
+            return 0
+
+        now = time.time()
+        cancelled = 0
+        for order in orders if isinstance(orders, list) else []:
+            submit_time = 0.0
+            for ts_key in ("submit_time", "order_time", "time"):
+                raw = order.get(ts_key)
+                if raw is not None:
+                    try:
+                        submit_time = float(raw)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            if submit_time <= 0:
+                continue
+            age = now - submit_time
+            if age >= self.config.stale_order_seconds:
+                order_id = str(order.get("order_id"))
+                order_type = str(order.get("type", "")).lower()
+                try:
+                    self.client.cancel_order(pair, order_id, order_type)
+                    cancelled += 1
+                    logger.info(
+                        "Cancelled stale %s order %s for %s (age=%.0fs ≥ %.0fs)",
+                        order_type, order_id, pair, age, self.config.stale_order_seconds,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to cancel stale %s order %s for %s: %s",
+                        order_type, order_id, pair, exc,
+                    )
+        if cancelled:
+            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
+        return cancelled
+
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         _pair = snapshot["pair"]
         decision: StrategyDecision = snapshot["decision"]
@@ -1721,6 +1896,10 @@ class Trader:
         # Route to the per-pair tracker in multi-position mode; otherwise use
         # self.tracker (classic single-position behaviour).
         _tracker = self._active_tracker(_pair)
+
+        # ── Stale order cancellation ─────────────────────────────────────────
+        # Cancel open orders that have been sitting unfilled for too long.
+        self._cancel_stale_orders(_pair)
 
         # Circuit breaker
         if self.config.circuit_breaker_max_errors > 0 and time.time() < self._circuit_breaker_until:
@@ -2131,6 +2310,93 @@ class Trader:
             anomaly = detect_spread_anomaly(live_spread_pct, recent_spreads, self.config.spread_anomaly_multiplier)
             if anomaly.detected:
                 return {"status": "skipped", "reason": f"spread_anomaly ratio={anomaly.ratio:.2f}x", "portfolio": _tracker.as_dict(price)}
+
+        # ── Spread expansion detection ───────────────────────────────────────
+        if self.config.spread_expansion_enabled and top_bid > 0 and top_ask > 0 and decision.action == "buy":
+            live_spread_pct = (top_ask - top_bid) / top_bid
+            pair_key = snapshot["pair"]
+            if pair_key not in self._spread_history:
+                self._spread_history[pair_key] = []
+            hist = self._spread_history[pair_key][-self.config.spread_expansion_window:]
+            expansion = detect_spread_expansion(
+                live_spread_pct, hist,
+                multiplier=self.config.spread_expansion_multiplier,
+            )
+            if expansion.detected:
+                logger.info(
+                    "Spread expansion on %s: ratio=%.2f× — skipping buy",
+                    pair_key, expansion.expansion_ratio,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"spread_expansion ratio={expansion.expansion_ratio:.2f}x",
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Orderbook absorption detection ───────────────────────────────────
+        if self.config.orderbook_absorption_threshold > 0 and decision.action == "buy":
+            pair_key = snapshot["pair"]
+            current_depth = {"buy": bids, "sell": asks}
+            prev_depth = self._prev_depth.get(pair_key)
+            if prev_depth is not None:
+                absorption = detect_orderbook_absorption(
+                    prev_depth, current_depth,
+                    threshold=self.config.orderbook_absorption_threshold,
+                )
+                if absorption.detected and absorption.side == "bid":
+                    logger.info(
+                        "Orderbook absorption on %s: side=%s ratio=%.2f — skipping buy (bid wall consumed)",
+                        pair_key, absorption.side, absorption.absorption_ratio,
+                    )
+                    self._prev_depth[pair_key] = current_depth
+                    return {
+                        "status": "skipped",
+                        "reason": f"ob_absorption side={absorption.side} ratio={absorption.absorption_ratio:.2f}",
+                        "portfolio": _tracker.as_dict(price),
+                    }
+            self._prev_depth[pair_key] = current_depth
+
+        # ── Liquidity vacuum guard ───────────────────────────────────────────
+        if self.config.liquidity_vacuum_min_gap_pct > 0 and decision.action == "buy":
+            vacuum = snapshot.get("liquidity_vacuum")
+            if vacuum is not None and vacuum.detected:
+                logger.info(
+                    "Liquidity vacuum on %s: gap=%.2f%% — skipping buy",
+                    snapshot["pair"], vacuum.gap_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"liquidity_vacuum gap={vacuum.gap_pct:.2%}",
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Liquidity sweep guard ─────────────────────────────────────────────
+        if self.config.liquidity_sweep_enabled and decision.action == "buy":
+            sweep = snapshot.get("liquidity_sweep")
+            if sweep is not None and sweep.detected and sweep.direction == "up":
+                logger.info(
+                    "Liquidity sweep (up) on %s: sweep=%.2f%% — skipping buy (stop-hunt risk)",
+                    snapshot["pair"], sweep.sweep_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"liquidity_sweep_up sweep={sweep.sweep_pct:.2%}",
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Liquidity trap guard ──────────────────────────────────────────────
+        if self.config.liquidity_trap_enabled and decision.action == "buy":
+            trap = snapshot.get("liquidity_trap")
+            if trap is not None and trap.detected and trap.direction == "up":
+                logger.info(
+                    "Liquidity trap (up) on %s: breakout=%.2f%% — skipping buy (false breakout)",
+                    snapshot["pair"], trap.breakout_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"liquidity_trap_up breakout={trap.breakout_pct:.2%}",
+                    "portfolio": _tracker.as_dict(price),
+                }
 
         # ── Sell-wall / orderbook wall guard ─────────────────────────────────
         # Skip buy when aggregate ask-side volume dominates bid-side volume by

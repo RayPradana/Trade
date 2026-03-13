@@ -630,6 +630,20 @@ class BotConfig:
     spread_expansion_multiplier: float = 2.0  # current > this * recent_avg = expanding
     spread_expansion_window: int = 10  # recent candle count to build spread baseline
 
+    # ── Market Data Infrastructure ────────────────────────────────────────────
+    # Settings for the market data feed (historical storage, tick processing,
+    # anomaly detection, cross-exchange comparison, latency monitoring, etc.).
+    market_data_enabled: bool = False
+    market_data_dir: str = "market_data"
+    market_data_max_ticks: int = 100_000
+    market_data_tick_window: float = 60.0
+    market_data_large_trade_idr: float = 10_000_000.0
+    market_data_stale_seconds: float = 120.0
+    market_data_anomaly_price_pct: float = 0.05
+    market_data_anomaly_volume_mult: float = 5.0
+    market_data_anomaly_spread_mult: float = 3.0
+    market_data_anomaly_crash_pct: float = 0.10
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         existing_keys = set(os.environ.keys())
@@ -824,6 +838,17 @@ class BotConfig:
             spread_expansion_enabled=os.getenv("SPREAD_EXPANSION_ENABLED", "false").lower() in {"1", "true", "yes"},
             spread_expansion_multiplier=_env_float("SPREAD_EXPANSION_MULTIPLIER", "2.0"),
             spread_expansion_window=_env_int("SPREAD_EXPANSION_WINDOW", "10"),
+            # Market Data Infrastructure
+            market_data_enabled=os.getenv("MARKET_DATA_ENABLED", "false").lower() in {"1", "true", "yes"},
+            market_data_dir=os.getenv("MARKET_DATA_DIR", "market_data"),
+            market_data_max_ticks=_env_int("MARKET_DATA_MAX_TICKS", "100000"),
+            market_data_tick_window=_env_float("MARKET_DATA_TICK_WINDOW", "60"),
+            market_data_large_trade_idr=_env_float("MARKET_DATA_LARGE_TRADE_IDR", "10000000"),
+            market_data_stale_seconds=_env_float("MARKET_DATA_STALE_SECONDS", "120"),
+            market_data_anomaly_price_pct=_env_float("MARKET_DATA_ANOMALY_PRICE_PCT", "0.05"),
+            market_data_anomaly_volume_mult=_env_float("MARKET_DATA_ANOMALY_VOLUME_MULT", "5"),
+            market_data_anomaly_spread_mult=_env_float("MARKET_DATA_ANOMALY_SPREAD_MULT", "3"),
+            market_data_anomaly_crash_pct=_env_float("MARKET_DATA_ANOMALY_CRASH_PCT", "0.10"),
         )
         cfg._validate()
         return cfg
