@@ -2975,26 +2975,25 @@ class Trader:
         is_below_idr_min = effective_min_idr > 0 and sell_idr_value < effective_min_idr
 
         if is_below_idr_min:
+            # Instead of discarding the position as "dust", keep it for monitoring
+            # so the bot can aggregate or retry later once the position is large
+            # enough. Surface the condition to the caller and leave state intact.
             logger.warning(
                 "force_sell: sell amount %.8f %s (Rp %.0f) is below exchange minimum "
-                "(min_idr=%.0f) — clearing dust position without order",
+                "(min_idr=%.0f) — skipping sell and keeping position to monitor",
                 amount,
                 pair.split("_")[0].upper(),
                 sell_idr_value,
                 effective_min_idr,
             )
-            _tracker.cancel_pending_buy()
-            if self.multi_manager is not None:
-                self.multi_manager.return_position_cash(pair)
-            outcome: Dict[str, Any] = {
-                "status": "dust_cleared",
+            return {
+                "status": "below_minimum",
                 "pair": pair,
                 "price": reference_price,
                 "amount": amount,
+                "min_idr": effective_min_idr,
                 "portfolio": _tracker.as_dict(reference_price),
             }
-            self._persist_after_trade(pair)
-            return outcome
 
         # ── Place the sell order ─────────────────────────────────────────────
         try:

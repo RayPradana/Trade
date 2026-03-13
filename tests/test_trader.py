@@ -619,6 +619,57 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(outcome["amount"], 5000.0, places=2)
         self.assertEqual(placed_sell_amount, [5000.0])
 
+    def test_force_sell_below_minimum_keeps_position(self) -> None:
+        """When sell value is below min IDR, force_sell must keep the position instead of clearing dust."""
+
+        class _LiveClient(GuardedTrader._Client):
+            cancel_called = False
+            order_called = False
+
+            def get_depth(self, *a, **kw):
+                return {"buy": [["1689", "1000"]], "sell": [["1690", "1000"]]}
+
+            def get_account_info(self):
+                # Exchange balance matches tracked amount
+                return {"return": {"balance": {"doge": "2.27518843", "idr": "500000"}}}
+
+            def get_pair_min_order(self, pair: str):
+                return {"min_idr": 30_000.0}
+
+            def cancel_order(self, *a, **kw):
+                _LiveClient.cancel_called = True
+                return {"success": 1}
+
+            def create_order(self, *a, **kw):
+                _LiveClient.order_called = True
+                return {"success": 1}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            min_order_idr=30_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        # Position worth ~3.8K IDR (< 30K minimum)
+        trader.tracker.record_trade("buy", 1689.0, 2.27518843)
+
+        snapshot = {"pair": "doge_idr", "price": 1689.0, "decision": StrategyDecision(
+            mode="scalping", action="sell", confidence=0.9, reason="exit",
+            target_price=1689.0, amount=trader.tracker.base_position,
+            stop_loss=None, take_profit=None,
+        )}
+
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "below_minimum")
+        # Position must be preserved for monitoring
+        self.assertAlmostEqual(trader.tracker.base_position, 2.27518843, places=8)
+        self.assertFalse(_LiveClient.cancel_called)
+        self.assertFalse(_LiveClient.order_called)
+
     def test_analyze_with_retry_succeeds_after_429(self) -> None:
         """_analyze_with_retry must back off and succeed when the first call gets a 429."""
         config = BotConfig(api_key=None, scan_request_delay=0.0)
