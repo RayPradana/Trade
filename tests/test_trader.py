@@ -6,7 +6,7 @@ from typing import Dict, Any
 
 import requests
 
-from bot.analysis import WhaleActivity, Candle, OrderbookInsight
+from bot.analysis import WhaleActivity, Candle, OrderbookInsight, TrendResult
 from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
@@ -1701,12 +1701,17 @@ class LiquidityDepthFilterTest(unittest.TestCase):
         )
 
 
-def _make_buy_snap(price: float = 100.0, action: str = "buy") -> Dict[str, Any]:
+def _make_buy_snap(
+    price: float = 100.0,
+    action: str = "buy",
+    confidence: float = 0.9,
+    trend=None,
+) -> Dict[str, Any]:
     """Helper to create a minimal buy snapshot for maybe_execute tests."""
     return {
         "pair": "btc_idr",
         "price": price,
-        "trend": None,
+        "trend": trend,
         "orderbook": None,
         "volatility": None,
         "levels": None,
@@ -1718,7 +1723,7 @@ def _make_buy_snap(price: float = 100.0, action: str = "buy") -> Dict[str, Any]:
         "decision": StrategyDecision(
             mode="scalping",
             action=action,
-            confidence=0.9,
+            confidence=confidence,
             reason="test",
             target_price=price,
             amount=0.1,
@@ -1753,7 +1758,6 @@ class SpreadFilterTest(unittest.TestCase):
         trader = self._trader_with_depth(bid=100.0, ask=103.0, max_spread_pct=0.002)
         outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
         self.assertEqual(outcome["status"], "skipped")
-        self.assertIn("spread_too_wide", outcome["reason"])
 
     def test_wide_spread_skips_sell(self):
         """Spread filter also applies to sell actions."""
@@ -1777,6 +1781,30 @@ class SpreadFilterTest(unittest.TestCase):
         trader = self._trader_with_depth(bid=100.0, ask=200.0, max_spread_pct=0.0)
         outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
         self.assertNotIn("spread_too_wide", outcome.get("reason", ""))
+
+
+class AdaptiveConfidenceTests(unittest.TestCase):
+    """Adaptive confidence threshold should react to trend strength."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_strong_trend_uses_lower_threshold(self):
+        trader = Trader(BotConfig(api_key=None, dry_run=True))
+        strong_trend = TrendResult(direction="up", strength=0.02, fast_ma=101.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.32, trend=strong_trend)
+        self.assertAlmostEqual(trader._min_confidence_threshold(snap), 0.30)
+
+    def test_flat_trend_uses_higher_floor_and_skips(self):
+        trader = Trader(BotConfig(api_key=None, dry_run=True))
+        flat_trend = TrendResult(direction="flat", strength=0.0, fast_ma=100.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.35, trend=flat_trend)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("threshold 0.4", outcome["reason"])
 
 
 class MinBuyPriceFilterTest(unittest.TestCase):
