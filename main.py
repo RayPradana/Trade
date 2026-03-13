@@ -1333,11 +1333,9 @@ def main() -> None:
             recent_errors=consecutive_errors,
             has_open_orders=_has_open,
         )
-        _sleep_secs = max(
-            trader._effective_interval(snapshot),
-            _polling_config.current_interval_ms // 1000,
-        )
-        # Use the shorter of the two adaptive systems
+        # Use the shorter of the two adaptive systems (trader's built-in
+        # adaptive interval vs autonomous dynamic polling) so the bot reacts
+        # to the most responsive signal.
         _sleep_secs = min(
             trader._effective_interval(snapshot),
             max(1, _polling_config.current_interval_ms // 1000),
