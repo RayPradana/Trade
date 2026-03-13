@@ -1758,6 +1758,7 @@ class SpreadFilterTest(unittest.TestCase):
         trader = self._trader_with_depth(bid=100.0, ask=103.0, max_spread_pct=0.002)
         outcome = trader.maybe_execute(_make_buy_snap(price=100.0))
         self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("spread_too_wide", outcome["reason"])
 
     def test_wide_spread_skips_sell(self):
         """Spread filter also applies to sell actions."""
@@ -1792,11 +1793,31 @@ class AdaptiveConfidenceTests(unittest.TestCase):
     def tearDown(self):
         logging.disable(logging.NOTSET)
 
-    def test_strong_trend_uses_lower_threshold(self):
-        trader = Trader(BotConfig(api_key=None, dry_run=True))
+    def test_strong_trend_enforces_adaptive_floor(self):
+        class _DepthStubClient:
+            def get_depth(self, *a, **kw):
+                return {"buy": [["100", "10"]], "sell": [["100.05", "10"]]}
+
+        trader = Trader(BotConfig(api_key=None, dry_run=True, min_order_idr=0, pair_min_order_cache_enabled=False))
+        trader.client = _DepthStubClient()
+        strong_trend = TrendResult(direction="up", strength=0.02, fast_ma=101.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.28, trend=strong_trend)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("confidence", outcome["reason"])
+
+    def test_strong_trend_allows_confidence_that_would_otherwise_skip(self):
+        class _DepthStubClient:
+            def get_depth(self, *a, **kw):
+                return {"buy": [["100", "10"]], "sell": [["100.05", "10"]]}
+
+        trader = Trader(BotConfig(api_key=None, dry_run=True, min_order_idr=0, pair_min_order_cache_enabled=False))
+        trader.client = _DepthStubClient()
         strong_trend = TrendResult(direction="up", strength=0.02, fast_ma=101.0, slow_ma=100.0)
         snap = _make_buy_snap(price=100.0, confidence=0.32, trend=strong_trend)
-        self.assertAlmostEqual(trader._min_confidence_threshold(snap), 0.30)
+        outcome = trader.maybe_execute(snap)
+        # May still skip for other reasons, but should not be blocked by confidence threshold
+        self.assertNotIn("confidence", outcome.get("reason", ""))
 
     def test_flat_trend_uses_higher_floor_and_skips(self):
         trader = Trader(BotConfig(api_key=None, dry_run=True))

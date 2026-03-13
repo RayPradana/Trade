@@ -46,6 +46,9 @@ from .journal import TradeJournal
 logger = logging.getLogger(__name__)
 
 _WHALE_EVENT_MAX = 100
+_ADAPTIVE_CONF_STRENGTH_THRESHOLD = 0.01
+_ADAPTIVE_CONF_STRONG = 0.30
+_ADAPTIVE_CONF_WEAK = 0.40
 
 # Extra candles requested beyond slow_window when fetching OHLC history so
 # that EMA-based indicators (MACD, Bollinger) have enough warm-up data.
@@ -159,7 +162,11 @@ class Trader:
         trend = snapshot.get("trend")
         strength = getattr(trend, "strength", None)
         if strength is not None:
-            adaptive_min = 0.30 if strength > 0.01 else 0.40
+            adaptive_min = (
+                _ADAPTIVE_CONF_STRONG
+                if strength > _ADAPTIVE_CONF_STRENGTH_THRESHOLD
+                else _ADAPTIVE_CONF_WEAK
+            )
             base_min = min(base_min, adaptive_min)
         return base_min
 
