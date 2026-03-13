@@ -364,8 +364,8 @@ class BotConfig:
     # the exchange so the error is caught gracefully as a "skipped" outcome
     # rather than raising a runtime exception.
     #
-    # Default is 30,000 IDR — a conservative buffer above the exchange minimum
-    # to avoid tiny trades and fee waste.  Must be > 0.
+    # Default is 30,000 IDR — a conservative buffer above the 10,000 IDR
+    # exchange minimum to avoid tiny trades and fee waste.  Must be > 0.
     min_order_idr: float = 30_000.0
     # Consecutive loss protection
     max_consecutive_losses: int = 0  # 0=disabled; stop trading after N losing sells in a row

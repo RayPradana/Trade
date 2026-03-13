@@ -2677,7 +2677,7 @@ class MinOrderIdrTest(unittest.TestCase):
         self.assertNotEqual(outcome["status"], "skipped")
 
     def test_config_min_order_idr_default(self):
-        """BotConfig default min_order_idr must be 30,000 (bot-enforced safety floor above exchange minimum)."""
+        """BotConfig default min_order_idr must be 30,000 (bot safety floor above the 10,000 IDR exchange minimum)."""
         config = BotConfig(api_key=None)
         self.assertEqual(config.min_order_idr, 30_000.0)
 
