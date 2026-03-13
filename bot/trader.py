@@ -2761,8 +2761,9 @@ class Trader:
                     open_resp = self.client.open_orders(pair)
                     orders = (open_resp.get("return") or {}).get("orders") or []
                     for order in (orders if isinstance(orders, list) else []):
-                        if str(order.get("type", "")).lower() == "buy":
-                            self.client.cancel_order(pair, str(order["order_id"]))
+                        order_type = str(order.get("type", "")).lower()
+                        if order_type == "buy":
+                            self.client.cancel_order(pair, str(order["order_id"]), order_type)
                             logger.info(
                                 "Cancelled pending buy order %s for %s",
                                 order["order_id"],

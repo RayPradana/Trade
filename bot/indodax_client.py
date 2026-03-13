@@ -314,8 +314,11 @@ class IndodaxClient:
             payload["amount"] = f"{amount:.8f}"
         return self._enqueue_private("trade", payload)
 
-    def cancel_order(self, pair: str, order_id: str) -> Dict[str, Any]:
-        return self._enqueue_private("cancelOrder", {"pair": pair, "order_id": order_id})
+    def cancel_order(self, pair: str, order_id: str, order_type: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"pair": pair, "order_id": order_id}
+        if order_type:
+            payload["type"] = order_type
+        return self._enqueue_private("cancelOrder", payload)
 
     @staticmethod
     def parse_minimum_order_error(error_message: str) -> Optional[float]:

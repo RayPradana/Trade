@@ -525,7 +525,7 @@ class TraderSelectionTests(unittest.TestCase):
                     }
                 }
 
-            def cancel_order(self, pair: str, order_id: str):
+            def cancel_order(self, pair: str, order_id: str, order_type: str | None = None):
                 cancelled_orders.append(order_id)
                 return {"success": 1}
 
@@ -581,7 +581,7 @@ class TraderSelectionTests(unittest.TestCase):
             def open_orders(self, pair: str):
                 return {"return": {"orders": [{"order_id": "9999", "type": "buy"}]}}
 
-            def cancel_order(self, pair: str, order_id: str):
+            def cancel_order(self, pair: str, order_id: str, order_type: str | None = None):
                 return {"success": 1}
 
             def create_order(self, pair: str, order_type: str, price: float, amount: float):
