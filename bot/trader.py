@@ -2762,7 +2762,7 @@ class Trader:
                     retry_price = min(reference_price * (1 + retry_bump), allowed_max)
                     _fmt_price = getattr(self.client, "format_price", None)
                     if callable(_fmt_price):
-                        retry_price = _fmt_price(snapshot["pair"], retry_price)
+                        retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
                 if retry_price > reference_price:
                     logger.info(
                         "Retrying buy at more aggressive price: %.10f → %.10f (pair=%s)",
