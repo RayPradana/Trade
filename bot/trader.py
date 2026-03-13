@@ -90,6 +90,7 @@ class Trader:
             initial_capital=config.initial_capital,
             target_profit_pct=config.target_profit_pct,
             max_loss_pct=config.max_loss_pct,
+            continue_after_target=config.continue_after_target,
         )
         # ── Multi-position manager ────────────────────────────────────────────
         self.multi_manager: Optional[MultiPositionManager] = None
@@ -99,6 +100,7 @@ class Trader:
                 max_positions=config.multi_position_max,
                 target_profit_pct=config.target_profit_pct,
                 max_loss_pct=config.max_loss_pct,
+                continue_after_target=config.continue_after_target,
             )
         # Whale wallet tracking (recent events, limited to prevent unbounded growth)
         self._whale_events: Deque[Dict[str, object]] = deque(maxlen=_WHALE_EVENT_MAX)

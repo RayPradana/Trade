@@ -41,7 +41,13 @@ class PortfolioTracker:
     peak.  This protects realised profits from being eroded by a losing streak.
     """
 
-    def __init__(self, initial_capital: float, target_profit_pct: float, max_loss_pct: float) -> None:
+    def __init__(
+        self,
+        initial_capital: float,
+        target_profit_pct: float,
+        max_loss_pct: float,
+        continue_after_target: bool = True,
+    ) -> None:
         self.initial_capital = initial_capital
         # Principal: the immutable starting capital used as an anchor.
         # Exposed as a named attribute for clarity; always equals initial_capital.
@@ -87,6 +93,7 @@ class PortfolioTracker:
         self._all_sell_pnls: List[float] = []
         self._strategy_stats: Dict[str, Dict] = {}
         self._disabled_strategies: Set[str] = set()
+        self.continue_after_target = continue_after_target
 
     @property
     def profit_buffer(self) -> float:
@@ -335,7 +342,7 @@ class PortfolioTracker:
         # Trailing TP: if floor is active and price fell below it, take profit
         if self._trailing_tp_stop is not None and mark_price <= self._trailing_tp_stop:
             return "trailing_tp_triggered"
-        if snap.equity >= self.target_equity:
+        if not self.continue_after_target and snap.equity >= self.target_equity:
             # When the trailing TP is already active, hold — the trailing
             # floor protects profits while letting the position run.
             if self._trailing_tp_stop is not None:
@@ -565,6 +572,7 @@ class MultiPositionManager:
         max_positions: int,
         target_profit_pct: float,
         max_loss_pct: float,
+        continue_after_target: bool = True,
     ) -> None:
         self.initial_capital = initial_capital
         self.max_positions = max(1, max_positions)
@@ -572,6 +580,7 @@ class MultiPositionManager:
         self.cash: float = initial_capital
         self._target_profit_pct = target_profit_pct
         self._max_loss_pct = max_loss_pct
+        self._continue_after_target = continue_after_target
         # per-pair sub-trackers; key = lowercase pair string
         self._trackers: Dict[str, PortfolioTracker] = {}
         # Cumulative realised PnL from *fully closed* positions (returned to pool).
@@ -634,6 +643,7 @@ class MultiPositionManager:
             initial_capital=capital,
             target_profit_pct=self._target_profit_pct,
             max_loss_pct=self._max_loss_pct,
+            continue_after_target=self._continue_after_target,
         )
         self._trackers[pair] = tracker
         return tracker
@@ -731,6 +741,7 @@ class MultiPositionManager:
                 initial_capital=float(state.get("cash", 0)),  # type: ignore[arg-type]
                 target_profit_pct=self._target_profit_pct,
                 max_loss_pct=self._max_loss_pct,
+                continue_after_target=self._continue_after_target,
             )
             tracker.load_state(state)  # type: ignore[arg-type]
             self._trackers[pair] = tracker

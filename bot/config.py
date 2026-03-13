@@ -119,6 +119,7 @@ class BotConfig:
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
+    continue_after_target: bool = True
     trailing_stop_pct: float = 0.03  # 3% trailing stop (rises with price, never falls)
     staged_entry_steps: int = 3
     # Minimum portfolio cash (IDR) required to use multi-step staged entry.
@@ -659,6 +660,7 @@ class BotConfig:
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
             target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
             max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),
+            continue_after_target=os.getenv("CONTINUE_AFTER_TARGET", "true").lower() in {"1", "true", "yes"},
             trailing_stop_pct=_env_float("TRAILING_STOP_PCT", "0.03"),
             staged_entry_steps=_env_int("STAGED_ENTRY_STEPS", "3"),
             staged_entry_min_equity=_env_float("STAGED_ENTRY_MIN_EQUITY", "1000000"),
