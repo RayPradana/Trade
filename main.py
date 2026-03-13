@@ -15,6 +15,30 @@ import requests
 from bot.config import BotConfig
 from bot.trader import Trader
 from bot.journal import TradeJournal
+from bot.risk_management import (
+    check_circuit_breaker as rm_check_circuit_breaker,
+    check_max_drawdown,
+    adjust_risk_dynamically,
+    check_anomaly_shutdown,
+)
+from bot.portfolio_management import (
+    evaluate_multi_asset_portfolio,
+    plan_rebalance,
+    assess_diversification,
+    compute_correlation_matrix,
+)
+from bot.ml_models import (
+    detect_regime,
+    optimize_strategy,
+    detect_anomalies as ml_detect_anomalies,
+)
+from bot.scanning import (
+    scan_momentum,
+    scan_trends,
+)
+from bot.execution import (
+    monitor_execution_quality,
+)
 from bot.autonomous import (
     AutonomousTradingState,
     run_autonomous_cycle,
@@ -748,6 +772,9 @@ def main() -> None:
         ScheduledTask(name="health_check", interval_seconds=120.0, priority=1, enabled=True),
         ScheduledTask(name="pair_rotation", interval_seconds=300.0, priority=2, enabled=True),
         ScheduledTask(name="strategy_review", interval_seconds=600.0, priority=3, enabled=True),
+        ScheduledTask(name="risk_monitoring", interval_seconds=180.0, priority=2, enabled=True),
+        ScheduledTask(name="portfolio_analysis", interval_seconds=600.0, priority=3, enabled=True),
+        ScheduledTask(name="ml_regime_check", interval_seconds=300.0, priority=3, enabled=True),
         ScheduledTask(name="cleanup", interval_seconds=900.0, priority=5, enabled=True),
     ]
 
@@ -765,6 +792,9 @@ def main() -> None:
         ComponentHealth(name="exchange_api", is_healthy=True, last_heartbeat=_now_ms(), priority=0),
         ComponentHealth(name="market_data", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
         ComponentHealth(name="order_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+        ComponentHealth(name="risk_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+        ComponentHealth(name="ml_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=2),
+        ComponentHealth(name="portfolio_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=2),
     ]
 
     # ── Auto-resume: use the pair from saved state if we're resuming ────────
@@ -835,6 +865,67 @@ def main() -> None:
                                 "🔄 Health check: needs restart (errors=%d)",
                                 _health["error_count"],
                             )
+                    elif _task_name == "risk_monitoring":
+                        # ── Risk management monitoring via risk_management module ──
+                        try:
+                            _rm_cb = rm_check_circuit_breaker(
+                                consecutive_losses=_autonomous_state.failed_cycles,
+                                api_errors=consecutive_errors,
+                            )
+                            if _rm_cb.is_tripped:
+                                logging.warning(
+                                    "🛑 Risk monitoring: circuit breaker tripped (%s, severity=%s)",
+                                    _rm_cb.triggers, _rm_cb.severity,
+                                )
+                                for _comp in _components:
+                                    if _comp.name == "risk_engine":
+                                        _comp.is_healthy = False
+                            else:
+                                for _comp in _components:
+                                    if _comp.name == "risk_engine":
+                                        _comp.is_healthy = True
+                                        _comp.consecutive_failures = 0
+                        except Exception as _rm_exc:
+                            logging.debug("Risk monitoring check failed: %s", _rm_exc)
+                    elif _task_name == "portfolio_analysis":
+                        # ── Portfolio management analysis ─────────────────────────
+                        try:
+                            _pa = trader._get_portfolio_analysis()
+                            if _pa.get("portfolio_eval"):
+                                _pe = _pa["portfolio_eval"]
+                                logging.info(
+                                    "📊 Portfolio: %d assets, concentration=%.2f, value=%.2f",
+                                    _pe.num_assets, _pe.concentration_score, _pe.total_value,
+                                )
+                            if _pa.get("diversification"):
+                                _div = _pa["diversification"]
+                                logging.info(
+                                    "📊 Diversification: score=%.2f, effective_assets=%.1f",
+                                    _div.score, _div.effective_assets,
+                                )
+                                for _comp in _components:
+                                    if _comp.name == "portfolio_engine":
+                                        _comp.is_healthy = True
+                                        _comp.consecutive_failures = 0
+                        except Exception as _pa_exc:
+                            logging.debug("Portfolio analysis failed: %s", _pa_exc)
+                    elif _task_name == "ml_regime_check":
+                        # ── ML regime detection for strategy optimization ────────
+                        try:
+                            if snapshot and snapshot.get("candles"):
+                                _candles = snapshot["candles"]
+                                if len(_candles) >= 10:
+                                    _regime = detect_regime(_candles, lookback=min(30, len(_candles)))
+                                    logging.info(
+                                        "🤖 ML regime: %s (confidence=%.2f)",
+                                        _regime.regime, _regime.confidence,
+                                    )
+                                    for _comp in _components:
+                                        if _comp.name == "ml_engine":
+                                            _comp.is_healthy = True
+                                            _comp.consecutive_failures = 0
+                        except Exception as _ml_exc:
+                            logging.debug("ML regime check failed: %s", _ml_exc)
                     elif _task_name == "cleanup":
                         trader.cleanup_stale_data()
                 except Exception:
@@ -1096,6 +1187,31 @@ def main() -> None:
                 continue
             pair, snapshot = trader.scan_and_choose()
             _log_signal(snapshot)
+            # ── Log ML & strategy signals if available ────────────────────────
+            if snapshot.get("ml_regime"):
+                logging.debug(
+                    "🤖 ML regime: %s (conf=%.2f)",
+                    snapshot["ml_regime"].regime,
+                    snapshot["ml_regime"].confidence,
+                )
+            if snapshot.get("ml_prediction"):
+                logging.debug(
+                    "🤖 ML prediction: %s (agreement=%.2f)",
+                    snapshot["ml_prediction"].predicted_direction,
+                    snapshot["ml_prediction"].model_agreement,
+                )
+            if snapshot.get("adv_trend"):
+                logging.debug(
+                    "📈 Adv trend: %s (strength=%.2f)",
+                    snapshot["adv_trend"].action,
+                    snapshot["adv_trend"].strength,
+                )
+            if snapshot.get("ob_pressure"):
+                logging.debug(
+                    "📊 OB pressure: %s (pressure=%.2f)",
+                    snapshot["ob_pressure"].signal,
+                    snapshot["ob_pressure"].pressure,
+                )
             outcome = trader.maybe_execute(snapshot)
             _log_outcome(outcome)
             # Immediately compute trailing stops after a buy so the portfolio
@@ -1119,6 +1235,23 @@ def main() -> None:
             _out_action = outcome.get("action", "hold")
             _out_status = outcome.get("status", "")
             if _out_action in ("buy", "sell") and _out_status in ("simulated", "placed"):
+                # ── Execution quality monitoring ────────────────────────────
+                try:
+                    _eq = monitor_execution_quality(
+                        order_price=snapshot["price"],
+                        fill_price=outcome.get("price", snapshot["price"]),
+                        quantity=outcome.get("amount", 0),
+                        side=_out_action,
+                        latency_ms=outcome.get("latency_ms", 0),
+                    )
+                    logging.debug(
+                        "📊 Execution quality: slippage=%.4f%%, score=%.2f",
+                        _eq.slippage_pct * 100,
+                        _eq.quality_score,
+                    )
+                except Exception as _eq_exc:
+                    logging.debug("Execution quality monitoring failed: %s", _eq_exc)
+
                 _notify(
                     config,
                     f"{'📈 BUY' if _out_action == 'buy' else '📉 SELL'} "
