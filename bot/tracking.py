@@ -373,16 +373,16 @@ class PortfolioTracker:
         # Trailing TP: if floor is active and price fell below it, take profit
         if self._trailing_tp_stop is not None and mark_price <= self._trailing_tp_stop:
             return "trailing_tp_triggered"
+        if self._trailing_stop is not None and mark_price <= self._trailing_stop:
+            return "trailing_stop_triggered"
+        if snap.equity <= snap.min_equity:
+            return "max_loss_reached"
         if not self.continue_after_target and snap.equity >= self.target_equity:
             # When the trailing TP is already active, hold — the trailing
             # floor protects profits while letting the position run.
             if self._trailing_tp_stop is not None:
                 return None
             return "target_profit_reached"
-        if snap.equity <= snap.min_equity:
-            return "max_loss_reached"
-        if self._trailing_stop is not None and mark_price <= self._trailing_stop:
-            return "trailing_stop_triggered"
         return None
 
     @property
@@ -422,6 +422,8 @@ class PortfolioTracker:
             # Trailing TP
             "tp_activated": self._tp_activated,
             "trailing_tp_stop": self._trailing_tp_stop,
+            # Pending orders (e.g., buy placed but not yet filled)
+            "pending_orders": list(self.pending_orders),
         }
 
     def to_state(self) -> Dict[str, object]:

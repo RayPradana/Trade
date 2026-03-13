@@ -39,6 +39,13 @@ class TrackingTests(unittest.TestCase):
         # Price falls below trailing stop
         self.assertEqual(tracker.stop_reason(105), "trailing_stop_triggered")
 
+    def test_trailing_stop_checked_before_target_and_loss(self) -> None:
+        tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.01, max_loss_pct=0.5)
+        tracker.record_trade("buy", 100, 1)
+        tracker.update_trailing_stop(120, 0.05)  # stop at 114
+        # Even though equity is above target, trailing stop breach should fire first.
+        self.assertEqual(tracker.stop_reason(110), "trailing_stop_triggered")
+
     def test_trailing_stop_rises_with_price(self) -> None:
         tracker = PortfolioTracker(initial_capital=1000, target_profit_pct=0.5, max_loss_pct=0.5)
         tracker.record_trade("buy", 100, 1)
