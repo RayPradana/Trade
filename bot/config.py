@@ -367,7 +367,7 @@ class BotConfig:
     # Default is raised to 15,000 IDR above the exchange minimum to avoid
     # wasting fees on tiny trades and to ensure trades "feel" meaningful.
     # Must be > 0.
-    min_order_idr: float = 15_000.0
+    min_order_idr: float = 30_000.0
     # Consecutive loss protection
     max_consecutive_losses: int = 0  # 0=disabled; stop trading after N losing sells in a row
     # Volatility cooldown
@@ -733,7 +733,7 @@ class BotConfig:
             ai_scoring_enabled=os.getenv("AI_SCORING_ENABLED", "false").lower() in {"1", "true", "yes"},
             ai_scoring_weight=_env_float("AI_SCORING_WEIGHT", "0.25"),
             fake_pump_reversal_pct=_env_float("FAKE_PUMP_REVERSAL_PCT", "0"),
-            min_order_idr=_env_float("MIN_ORDER_IDR", "15000"),
+            min_order_idr=_env_float("MIN_ORDER_IDR", "30000"),
             max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", "0"),
             volatility_cooldown_pct=_env_float("VOLATILITY_COOLDOWN_PCT", "0"),
             volatility_cooldown_seconds=_env_float("VOLATILITY_COOLDOWN_SECONDS", "0"),

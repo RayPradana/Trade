@@ -2199,9 +2199,9 @@ class Trader:
 
         # ── Indodax minimum order value guard ─────────────────────────────────
         # Indodax rejects orders whose total IDR value (price × amount) is below
-        # 10,000 IDR (configurable via MIN_ORDER_IDR).  Check upfront so the
-        # error is surfaced as a clean "skipped" outcome rather than a
-        # RuntimeError from the exchange.
+        # the exchange minimum (default 30,000 IDR, configurable via MIN_ORDER_IDR).
+        # Check upfront so the error is surfaced as a clean "skipped" outcome
+        # rather than a RuntimeError from the exchange.
         total_order_value_idr = effective_amount * reference_price
         if total_order_value_idr < self.config.min_order_idr:
             logger.info(

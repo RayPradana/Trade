@@ -2677,9 +2677,9 @@ class MinOrderIdrTest(unittest.TestCase):
         self.assertNotEqual(outcome["status"], "skipped")
 
     def test_config_min_order_idr_default(self):
-        """BotConfig default min_order_idr must be 15,000 (raised from 10k to avoid tiny fees)."""
+        """BotConfig default min_order_idr must be 30,000 (raised to match Indodax minimum)."""
         config = BotConfig(api_key=None)
-        self.assertEqual(config.min_order_idr, 15_000.0)
+        self.assertEqual(config.min_order_idr, 30_000.0)
 
     def test_config_min_order_idr_validation(self):
         """min_order_idr must be positive; zero or negative must raise ValueError."""
