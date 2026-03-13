@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple, Iterable
 
 import requests
 
@@ -1647,6 +1647,52 @@ class Trader:
             return f"small_coin_low_trades {trades_24h} < {min_trades}"
         return None
 
+    def _cancel_open_orders(
+        self,
+        pair: str,
+        order_types: Iterable[str],
+        reason: Optional[str] = None,
+    ) -> int:
+        """Cancel open orders for *pair* whose type is included in ``order_types``."""
+        if self.config.dry_run or self.config.api_key is None:
+            return 0
+        try:
+            open_resp = self.client.open_orders(pair)
+            orders = (open_resp.get("return") or {}).get("orders") or []
+        except Exception as exc:
+            logger.warning("Unable to fetch open orders for %s: %s", pair, exc)
+            return 0
+
+        order_types = {t.lower() for t in order_types}
+        cancelled = 0
+        for order in orders if isinstance(orders, list) else []:
+            order_type = str(order.get("type", "")).lower()
+            if order_type not in order_types:
+                continue
+            order_id = str(order.get("order_id"))
+            try:
+                self.client.cancel_order(pair, order_id, order_type)
+                cancelled += 1
+                logger.info(
+                    "Cancelled open %s order %s for %s%s",
+                    order_type,
+                    order_id,
+                    pair,
+                    f" ({reason})" if reason else "",
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Failed to cancel %s order %s for %s: %s",
+                    order_type,
+                    order_id,
+                    pair,
+                    exc,
+                )
+
+        if cancelled:
+            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
+        return cancelled
+
     def _cancel_open_buy_orders(
         self,
         pair: str,
@@ -1659,34 +1705,9 @@ class Trader:
         per-pair tracker is rolled back and its capital slice (if any) is
         returned to the multi-position pool so the bot can seek another pair.
         """
-        if self.config.dry_run or self.config.api_key is None:
-            return 0
-        try:
-            open_resp = self.client.open_orders(pair)
-            orders = (open_resp.get("return") or {}).get("orders") or []
-        except Exception as exc:
-            logger.warning("Unable to fetch open orders for %s: %s", pair, exc)
-            return 0
-
-        cancelled = 0
-        for order in orders if isinstance(orders, list) else []:
-            if str(order.get("type", "")).lower() != "buy":
-                continue
-            order_id = str(order.get("order_id"))
-            try:
-                self.client.cancel_order(pair, order_id, "buy")
-                cancelled += 1
-                logger.info(
-                    "Cancelled open buy order %s for %s%s",
-                    order_id,
-                    pair,
-                    f" ({reason})" if reason else "",
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Failed to cancel order %s for %s: %s", order_id, pair, exc)
+        cancelled = self._cancel_open_orders(pair, ("buy",), reason=reason)
 
         if cancelled:
-            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
             if tracker.base_position <= 0:
                 tracker.cancel_pending_buy()
                 if self.multi_manager is not None:
@@ -2863,31 +2884,7 @@ class Trader:
 
         # Cancel any open orders (buy or sell) for this pair to avoid conflicts
         # that would make the exit loop retry without actually liquidating.
-        try:
-            open_resp = self.client.open_orders(pair)
-            orders = (open_resp.get("return") or {}).get("orders") or []
-            for order in (orders if isinstance(orders, list) else []):
-                order_id = str(order.get("order_id") or "")
-                order_type = str(order.get("type", "")).lower()
-                if order_id and order_type in ("buy", "sell"):
-                    try:
-                        self.client.cancel_order(pair, order_id, order_type)
-                        logger.info(
-                            "force_sell: cancelled pending %s order %s for %s",
-                            order_type,
-                            order_id,
-                            pair,
-                        )
-                    except Exception as exc:  # pragma: no cover - log & continue
-                        logger.warning(
-                            "force_sell: failed to cancel %s order %s for %s: %s",
-                            order_type,
-                            order_id,
-                            pair,
-                            exc,
-                        )
-        except Exception as exc:  # pragma: no cover - best effort
-            logger.debug("force_sell: could not fetch open orders for %s: %s", pair, exc)
+        self._cancel_open_orders(pair, ("buy", "sell"))
 
         # Use top-of-book bid as reference price for the sell; fall back to
         # the snapshot price if the order-book fetch fails.
