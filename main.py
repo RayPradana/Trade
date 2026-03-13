@@ -15,6 +15,23 @@ import requests
 from bot.config import BotConfig
 from bot.trader import Trader
 from bot.journal import TradeJournal
+from bot.autonomous import (
+    AutonomousTradingState,
+    run_autonomous_cycle,
+    check_autonomous_health,
+    rotate_pairs,
+    auto_switch_strategy,
+    CrashEvent,
+    decide_restart,
+    ComponentHealth,
+    evaluate_failover,
+    ScheduledTask,
+    schedule_tasks,
+    update_task_after_run,
+    PollingConfig,
+    adjust_polling_interval,
+    diagnose_and_recover,
+)
 
 # ── ANSI codes — disabled when stdout is not a terminal ─────────────────
 _USE_COLOR = sys.stdout.isatty()
@@ -714,6 +731,42 @@ def main() -> None:
         else trader.tracker.base_position > 0
     )
 
+    # ── Autonomous trading state ─────────────────────────────────────────────
+    _autonomous_state = AutonomousTradingState(
+        is_running=True,
+        health_status="running",
+        max_errors_before_pause=10,
+        pause_duration_seconds=60.0,
+    )
+    _start_time = time.time()
+    _crash_history: list = []
+    _error_log: list = []
+
+    # ── Task scheduling ──────────────────────────────────────────────────────
+    _now_ms = lambda: int(time.time() * 1000)
+    _tasks = [
+        ScheduledTask(name="health_check", interval_seconds=120.0, priority=1, enabled=True),
+        ScheduledTask(name="pair_rotation", interval_seconds=300.0, priority=2, enabled=True),
+        ScheduledTask(name="strategy_review", interval_seconds=600.0, priority=3, enabled=True),
+        ScheduledTask(name="cleanup", interval_seconds=900.0, priority=5, enabled=True),
+    ]
+
+    # ── Dynamic polling ──────────────────────────────────────────────────────
+    _polling_config = PollingConfig(
+        base_interval_ms=config.interval_seconds * 1000,
+        min_interval_ms=max(1000, getattr(config, "adaptive_interval_min_seconds", 3) * 1000),
+        max_interval_ms=60000,
+        current_interval_ms=config.interval_seconds * 1000,
+        mode="adaptive" if config.adaptive_interval_enabled else "fixed",
+    )
+
+    # ── Component health tracking ────────────────────────────────────────────
+    _components = [
+        ComponentHealth(name="exchange_api", is_healthy=True, last_heartbeat=_now_ms(), priority=0),
+        ComponentHealth(name="market_data", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+        ComponentHealth(name="order_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+    ]
+
     # ── Auto-resume: use the pair from saved state if we're resuming ────────
     if trader.restored_pair:
         pair = trader.restored_pair
@@ -729,6 +782,67 @@ def main() -> None:
         logging.info(_separator(f"Cycle #{cycle}"))
 
         try:
+            # ── Autonomous state tracking ────────────────────────────────────
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles,
+                successful_cycles=_autonomous_state.successful_cycles,
+                failed_cycles=_autonomous_state.failed_cycles,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status=_autonomous_state.health_status,
+                error_count=consecutive_errors,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+
+            # ── Failover check ───────────────────────────────────────────────
+            for _comp in _components:
+                _comp.last_heartbeat = _now_ms()
+            _failover = evaluate_failover(_components)
+            if _failover.failover_triggered:
+                logging.warning(
+                    "⚠️  Failover triggered: %s (status=%s)",
+                    _failover.failed_components,
+                    _failover.system_status,
+                )
+                _recovery = diagnose_and_recover(
+                    _error_log,
+                    component_health=_components,
+                )
+                if _recovery.needs_recovery and not _recovery.can_auto_recover:
+                    logging.error(
+                        "🛑 Manual intervention needed: %s", _recovery.diagnosis,
+                    )
+
+            # ── Task scheduling ──────────────────────────────────────────────
+            _schedule_result = schedule_tasks(_tasks, current_time=_now_ms())
+            for _task_name in _schedule_result.tasks_due:
+                _task_idx = next(
+                    (i for i, t in enumerate(_tasks) if t.name == _task_name), None,
+                )
+                if _task_idx is None:
+                    continue
+                _task = _tasks[_task_idx]
+                _task_success = True
+                try:
+                    if _task_name == "health_check":
+                        _health = check_autonomous_health(_autonomous_state)
+                        if _health.get("needs_restart"):
+                            logging.warning(
+                                "🔄 Health check: needs restart (errors=%d)",
+                                _health["error_count"],
+                            )
+                    elif _task_name == "cleanup":
+                        trader.cleanup_stale_data()
+                except Exception:
+                    _task_success = False
+                _tasks[_task_idx] = update_task_after_run(
+                    _task, success=_task_success, current_time=_now_ms(),
+                )
+
             # ── Position monitoring ──────────────────────────────────────────
             # When the bot is holding one or more positions (from this run or
             # restored via auto-resume) analyse each held pair first.
@@ -1017,6 +1131,24 @@ def main() -> None:
             consecutive_errors = 0
             scan_cycles += 1
 
+            # ── Update autonomous state on successful cycle ──────────────────
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles + 1,
+                successful_cycles=_autonomous_state.successful_cycles + 1,
+                failed_cycles=_autonomous_state.failed_cycles,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status="running",
+                error_count=0,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+            # Reset error log on successful cycle
+            _error_log.clear()
+
             # Mark that we've entered a position (for single-trade mode)
             if outcome.get("action") == "buy" and trader._active_tracker(snapshot["pair"]).base_position > 0:
                 _entered_position = True
@@ -1055,14 +1187,50 @@ def main() -> None:
                 time.sleep(config.interval_seconds)
                 continue  # find next opportunity instead of halting
 
-        except (requests.RequestException, RuntimeError, ValueError):
+        except (requests.RequestException, RuntimeError, ValueError) as _err:
             consecutive_errors += 1
-            # Cap the exponent so the computed delay doesn't grow beyond _max_backoff.
-            # Without this cap the multiplication could produce a very large intermediate
-            # value even though min() would ultimately clamp it.
-            # 2^_MAX_BACKOFF_EXPONENT = 1024 s, which is well above the _max_backoff ceiling of 300 s.
-            exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
-            backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
+            # ── Classify error for autonomous recovery ───────────────────────
+            _etype = "connection" if isinstance(_err, requests.RequestException) else "runtime"
+            _error_log.append({"type": _etype, "message": str(_err), "timestamp": _now_ms()})
+            _crash_history.append(CrashEvent(
+                timestamp=_now_ms(),
+                error_type=_etype,
+                error_message=str(_err)[:200],
+                component="trading_loop",
+                recoverable=True,
+            ))
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles + 1,
+                successful_cycles=_autonomous_state.successful_cycles,
+                failed_cycles=_autonomous_state.failed_cycles + 1,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status="degraded",
+                error_count=consecutive_errors,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+            # Mark exchange_api as unhealthy on connection errors
+            if isinstance(_err, requests.RequestException):
+                for _comp in _components:
+                    if _comp.name == "exchange_api":
+                        _comp.consecutive_failures += 1
+                        if _comp.consecutive_failures >= _comp.max_failures:
+                            _comp.is_healthy = False
+            # ── Dynamic backoff via autonomous restart logic ──────────────────
+            _restart_decision = decide_restart(
+                _crash_history,
+                max_restarts=_autonomous_state.max_errors_before_pause,
+                base_delay=float(config.interval_seconds),
+            )
+            if _restart_decision.should_restart:
+                backoff = min(_restart_decision.delay_seconds, _max_backoff)
+            else:
+                exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
+                backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
                 "⚠️  %sError #%d%s  pair=%s  backing off %.0fs …",
                 _BOLD, consecutive_errors, _RESET, pair, backoff,
@@ -1072,14 +1240,44 @@ def main() -> None:
                 break
             time.sleep(backoff)
             continue
-        except Exception:  # noqa: BLE001 — broad catch prevents unexpected crash
+        except Exception as _err:  # noqa: BLE001 — broad catch prevents unexpected crash
             # Catch any unexpected exception type (KeyError, AttributeError, TypeError,
             # IndexError, etc.) that is not explicitly in the tuple above.  Without this
             # handler such errors would propagate all the way out of main() and crash the
             # bot process entirely instead of retrying with back-off.
             consecutive_errors += 1
-            exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
-            backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
+            _error_log.append({"type": "unexpected", "message": str(_err), "timestamp": _now_ms()})
+            _crash_history.append(CrashEvent(
+                timestamp=_now_ms(),
+                error_type=type(_err).__name__,
+                error_message=str(_err)[:200],
+                component="trading_loop",
+                recoverable=True,
+            ))
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles + 1,
+                successful_cycles=_autonomous_state.successful_cycles,
+                failed_cycles=_autonomous_state.failed_cycles + 1,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status="degraded",
+                error_count=consecutive_errors,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+            _restart_decision = decide_restart(
+                _crash_history,
+                max_restarts=_autonomous_state.max_errors_before_pause,
+                base_delay=float(config.interval_seconds),
+            )
+            if _restart_decision.should_restart:
+                backoff = min(_restart_decision.delay_seconds, _max_backoff)
+            else:
+                exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
+                backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
                 "⚠️  Unexpected error #%d  pair=%s  backing off %.0fs …",
                 consecutive_errors, pair, backoff,
@@ -1122,15 +1320,39 @@ def main() -> None:
             trader.persistence.backup(_backup_path)
 
         logging.info(_separator())
-        _sleep_secs = trader._effective_interval(snapshot)
+        # ── Dynamic polling interval ─────────────────────────────────────────
+        _vol_snapshot = 0.0
+        if snapshot:
+            _vol_obj = snapshot.get("volatility")
+            if _vol_obj:
+                _vol_snapshot = getattr(_vol_obj, "volatility", 0.0)
+        _has_open = len(trader.active_positions) > 0
+        _polling_config, _polling_adj = adjust_polling_interval(
+            _polling_config,
+            recent_volatility=_vol_snapshot,
+            recent_errors=consecutive_errors,
+            has_open_orders=_has_open,
+        )
+        _sleep_secs = max(
+            trader._effective_interval(snapshot),
+            _polling_config.current_interval_ms // 1000,
+        )
+        # Use the shorter of the two adaptive systems
+        _sleep_secs = min(
+            trader._effective_interval(snapshot),
+            max(1, _polling_config.current_interval_ms // 1000),
+        )
         if _sleep_secs != config.interval_seconds:
-            logging.debug("⚡ Adaptive interval: sleeping %ds (normal=%ds)", _sleep_secs, config.interval_seconds)
+            logging.debug(
+                "⚡ Adaptive interval: sleeping %ds (normal=%ds, reason=%s)",
+                _sleep_secs, config.interval_seconds, _polling_adj.adjustment_reason,
+            )
         time.sleep(_sleep_secs)
 
 
 if __name__ == "__main__":
     _MAX_RESTARTS = 10
-    _RESTART_BACKOFF = [5, 10, 30, 60, 120]
+    _process_crash_history: list = []
     _restart_count = 0
     while _restart_count <= _MAX_RESTARTS:
         try:
@@ -1140,9 +1362,28 @@ if __name__ == "__main__":
             break
         except Exception as _exc:
             _restart_count += 1
-            _wait = _RESTART_BACKOFF[min(_restart_count - 1, len(_RESTART_BACKOFF) - 1)]
+            _process_crash_history.append(CrashEvent(
+                timestamp=int(time.time() * 1000),
+                error_type=type(_exc).__name__,
+                error_message=str(_exc)[:200],
+                component="main_process",
+                recoverable=True,
+            ))
+            _restart_decision = decide_restart(
+                _process_crash_history,
+                max_restarts=_MAX_RESTARTS,
+                base_delay=5.0,
+                backoff_factor=2.0,
+            )
+            if _restart_decision.should_restart:
+                _wait = _restart_decision.delay_seconds
+            else:
+                logging.getLogger(__name__).error(
+                    "Bot crashed — max restarts reached, stopping.",
+                )
+                break
             logging.getLogger(__name__).error(
-                "Bot crashed (attempt %d): %s — restarting in %ds",
-                _restart_count, _exc, _wait,
+                "Bot crashed (attempt %d): %s — restarting in %.0fs (%s)",
+                _restart_count, _exc, _wait, _restart_decision.reason,
             )
             time.sleep(_wait)

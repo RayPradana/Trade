@@ -661,6 +661,53 @@ class Trader:
             else:
                 self._save_state(pair)
 
+    def cleanup_stale_data(self) -> None:
+        """Remove stale entries from per-pair caches to prevent memory leaks.
+
+        Called periodically by the autonomous task scheduler to prune:
+        - Price history entries for pairs no longer in the watchlist
+        - Spread history entries for inactive pairs
+        - Previous depth snapshots for inactive pairs
+        - Expired candle cache entries
+        """
+        active_pairs = set()
+        if self._all_pairs:
+            active_pairs.update(self._all_pairs)
+        # Always keep pairs with open positions
+        active_pairs.update(self.active_positions.keys())
+        active_pairs.add(self.config.pair)
+
+        # Prune price history for pairs no longer in watchlist
+        stale_price = [p for p in self._price_history if p not in active_pairs]
+        for p in stale_price:
+            del self._price_history[p]
+
+        # Prune spread history for inactive pairs
+        stale_spread = [p for p in self._spread_history if p not in active_pairs]
+        for p in stale_spread:
+            del self._spread_history[p]
+
+        # Prune previous depth snapshots
+        stale_depth = [p for p in self._prev_depth if p not in active_pairs]
+        for p in stale_depth:
+            del self._prev_depth[p]
+
+        # Prune expired candle cache entries (older than 2× the configured TTL)
+        now = time.time()
+        cache_ttl = getattr(self.config, "scan_candle_cache_seconds", 120)
+        stale_candles = [
+            p for p, (ts, _) in self._candle_cache.items()
+            if now - ts > cache_ttl * 2
+        ]
+        for p in stale_candles:
+            del self._candle_cache[p]
+
+        if stale_price or stale_spread or stale_depth or stale_candles:
+            logger.debug(
+                "Cleanup: removed price=%d spread=%d depth=%d candle=%d stale entries",
+                len(stale_price), len(stale_spread), len(stale_depth), len(stale_candles),
+            )
+
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
             last = ticker["ticker"].get("last")
