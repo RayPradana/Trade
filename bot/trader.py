@@ -3283,4 +3283,8 @@ class Trader:
                 len(insufficient_data_pairs),
                 self.config.trade_count,
             )
-        return best_pair, self.analyze_market(best_pair)
+        # Use the retry wrapper here as well so 429s during the fallback
+        # analysis are handled consistently with the main scan loop.  If the
+        # final retries still fail, the exception is propagated so the caller
+        # can back off rather than silently using stale data.
+        return best_pair, self._analyze_with_retry(best_pair)

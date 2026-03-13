@@ -1195,8 +1195,8 @@ class InsufficientDataTests(unittest.TestCase):
         feed = MultiPairFeed(
             list(snapshots), mock.MagicMock(), websocket_enabled=False, summaries_interval=9999
         )
-        feed._apply_ws_message_for_pair("a_idr", {"last": "100", "vol_idr": "100"})
-        feed._apply_ws_message_for_pair("b_idr", {"last": "100", "vol_idr": "50"})
+        feed._apply_ws_message_for_pair("a_idr", {"last": "100", "vol_idr": "100", "trade_count": 10})
+        feed._apply_ws_message_for_pair("b_idr", {"last": "100", "vol_idr": "50", "trade_count": 5})
         trader._multi_feed = feed
 
         with mock.patch("bot.trader.time.sleep"):
@@ -1244,6 +1244,43 @@ class InsufficientDataTests(unittest.TestCase):
         self.assertEqual(len(analyze_calls), 2, f"Expected 2 analyze calls, got {analyze_calls}")
         # Returned pair is the one with highest _score (b_idr has confidence=0.6 > 0.4)
         self.assertEqual(returned_pair, "b_idr")
+
+    def test_scan_fallback_uses_retry_wrapper(self) -> None:
+        """Fallback analysis must go through _analyze_with_retry (handles 429s)."""
+        import unittest.mock as mock
+        from bot.realtime import MultiPairFeed
+
+        config = BotConfig(api_key=None, scan_request_delay=0.0, pairs_per_cycle=0)
+
+        class RecordingTrader(AutoPairsTrader):
+            def __init__(self, cfg, snaps):
+                super().__init__(cfg, snaps)
+                self.calls: list[str] = []
+
+            def _analyze_with_retry(self, pair, prefetched_ticker=None, skip_depth=False, skip_trades=False):
+                self.calls.append(pair)
+                return self._snapshots[pair]
+
+        # All pairs flagged insufficient → fallback path triggers extra retry call
+        snapshots = {
+            "a_idr": self._make_snapshot("a_idr", insufficient=True),
+            "b_idr": self._make_snapshot("b_idr", insufficient=True),
+        }
+        trader = RecordingTrader(config, snapshots)
+        feed = MultiPairFeed(
+            list(snapshots), mock.MagicMock(), websocket_enabled=False, summaries_interval=9999
+        )
+        feed._apply_ws_message_for_pair("a_idr", {"last": "100", "vol_idr": "100"})
+        feed._apply_ws_message_for_pair("b_idr", {"last": "100", "vol_idr": "50"})
+        trader._multi_feed = feed
+
+        with mock.patch("bot.trader.time.sleep"):
+            returned_pair, snapshot = trader.scan_and_choose()
+
+        # _analyze_with_retry is called once per pair during scan + once for fallback
+        self.assertEqual(trader.calls, ["a_idr", "b_idr", "a_idr"])
+        self.assertEqual(returned_pair, "a_idr")
+        self.assertTrue(snapshot.get("insufficient_data"))
 
     def test_get_ohlc_in_client(self) -> None:
         """IndodaxClient.get_ohlc builds URL params correctly."""
