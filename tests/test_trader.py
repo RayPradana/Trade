@@ -2754,19 +2754,36 @@ class MinOrderIdrTest(unittest.TestCase):
         }
 
     def test_buy_below_minimum_skipped(self):
-        """An order whose total IDR value is below min_order_idr must be skipped."""
+        """An order whose total IDR value is below min_order_idr and cannot be
+        bumped up (insufficient available cash) must be skipped."""
         config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
-                           initial_capital=100_000)
+                           initial_capital=5_000)  # capital < min_order_idr → cannot bump up
         trader = Trader(config)
         trader.client = type("_C", (), {
             # bid=ask=253 so slippage guard passes
             "get_depth": lambda self, *a, **kw: {"buy": [["253", "100"]], "sell": [["253", "100"]]},
         })()
         # price=253, amount=1 → total=253 IDR < 10,000 IDR
+        # capital=5000 → max affordable=5000/253≈19.7 coins → value≈5000 < 10,000
         snap = self._snap(price=253.0)
         outcome = trader.maybe_execute(snap)
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("order_below_minimum", outcome["reason"])
+
+    def test_buy_below_minimum_bumped_up(self):
+        """When the order value is below min_order_idr but capital can cover
+        the minimum, the order amount should be bumped up instead of skipped."""
+        config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
+                           initial_capital=100_000)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["253", "1000"]], "sell": [["253", "1000"]]},
+        })()
+        # price=253, amount=1 → 253 IDR < 10,000, but capital can cover min
+        snap = self._snap(price=253.0)
+        outcome = trader.maybe_execute(snap)
+        # Should proceed (bumped up to minimum) instead of being skipped
+        self.assertNotEqual(outcome["status"], "skipped")
 
     def test_buy_above_minimum_proceeds(self):
         """An order whose total IDR value meets or exceeds min_order_idr must proceed."""
@@ -3141,7 +3158,8 @@ class EvaluateDynamicTpTest(unittest.TestCase):
         """After a profitable trade, effective_capital > initial_capital → larger position."""
         from bot.strategies import make_trade_decision
         from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats, MomentumIndicators
-        config = BotConfig(api_key=None, risk_per_trade=0.01, initial_capital=100_000.0)
+        config = BotConfig(api_key=None, risk_per_trade=0.01, initial_capital=100_000.0,
+                           min_order_idr=0)  # disable min-order floor for this sizing test
         tracker_base = PortfolioTracker(100_000.0, 0.2, 0.1)
         tracker_rich = PortfolioTracker(100_000.0, 0.2, 0.1)
         # Simulate rich tracker having 50k profit buffer

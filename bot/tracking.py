@@ -720,13 +720,22 @@ class MultiPositionManager:
             total += tracker.cash + tracker.base_position * mark
         return total
 
-    def capital_per_new_position(self) -> float:
+    def capital_per_new_position(self, min_order_idr: float = 0.0) -> float:
         """Suggested IDR allocation for the *next* new position.
 
         Divides the remaining unallocated cash evenly among all still-available
         slots so that each subsequent position gets a proportional share.
+
+        When *min_order_idr* is positive the method automatically reduces the
+        effective slot count so that every slot receives at least that amount.
+        This prevents position capital from dropping below the exchange minimum
+        order value which would cause every trade to be skipped.
         """
         remaining_slots = max(1, self.max_positions - self.position_count())
+        # Reduce slots if the per-slot allocation would fall below the minimum
+        if min_order_idr > 0 and self.cash > 0:
+            max_slots = max(1, int(self.cash / min_order_idr))
+            remaining_slots = min(remaining_slots, max_slots)
         return self.cash / remaining_slots
 
     def as_dict(self, prices: Dict[str, float]) -> Dict[str, object]:

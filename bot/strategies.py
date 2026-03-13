@@ -368,6 +368,21 @@ def _position_size(
     ):
         size *= config.ob_imbalance_size_multiplier
 
+    # ── Enforce minimum order value ──────────────────────────────────────────
+    # Ensure the computed size meets the exchange minimum order value so that
+    # orders are not skipped downstream.  When the available capital can cover
+    # the minimum, bump size up; otherwise leave it as-is (the downstream
+    # guard will skip gracefully).
+    min_order_idr = getattr(config, "min_order_idr", 0.0)
+    if min_order_idr > 0 and current_price > 0:
+        order_value = size * current_price
+        if 0 < order_value < min_order_idr:
+            min_size = min_order_idr / current_price
+            # Only bump up if the capital can afford it
+            max_size_from_capital = capital / current_price
+            if min_size <= max_size_from_capital:
+                size = min_size
+
     return size
 
 

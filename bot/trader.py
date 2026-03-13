@@ -2969,11 +2969,24 @@ class Trader:
             # In multi-position mode the tracker for a new pair is a zero-cash
             # placeholder; use the multi_manager's prospective allocation instead.
             if self.multi_manager is not None and not self.multi_manager.has_position(_pair):
-                available_cash = self.multi_manager.capital_per_new_position()
+                available_cash = self.multi_manager.capital_per_new_position(
+                    min_order_idr=self.config.min_order_idr,
+                )
             else:
                 available_cash = _tracker.cash
             max_affordable = max(0.0, available_cash / reference_price)
             effective_amount = min(decision.amount, max_affordable)
+
+            # ── Bump up to minimum order value when possible ─────────────────
+            # When the computed amount falls below the exchange minimum but the
+            # available cash can cover it, raise the amount to the minimum so
+            # the trade is not unnecessarily skipped.
+            if reference_price > 0 and self.config.min_order_idr > 0:
+                order_value = effective_amount * reference_price
+                if 0 < order_value < self.config.min_order_idr:
+                    min_amount = self.config.min_order_idr / reference_price
+                    if min_amount <= max_affordable:
+                        effective_amount = min_amount
             # Log adaptive sizing tier when it's active
             if self.config.adaptive_sizing_enabled:
                 equity = _tracker.effective_capital() or available_cash
@@ -2986,6 +2999,15 @@ class Trader:
         elif decision.action == "sell":
             max_sellable = max(0.0, _tracker.base_position)
             effective_amount = min(decision.amount, max_sellable)
+            # When selling, if the amount is below the exchange minimum but we
+            # hold the full position, sell everything rather than being stuck
+            # with an unsellable remainder.
+            if reference_price > 0 and self.config.min_order_idr > 0:
+                order_value = effective_amount * reference_price
+                if 0 < order_value < self.config.min_order_idr and max_sellable > 0:
+                    full_value = max_sellable * reference_price
+                    if full_value >= self.config.min_order_idr:
+                        effective_amount = max_sellable
 
         if effective_amount <= 0:
             logger.info("Skip due to insufficient balance/position | action=%s", decision.action)
