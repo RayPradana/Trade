@@ -249,6 +249,80 @@ class Trader:
             base_min = min(base_min, adaptive_min)
         return base_min
 
+    def _entry_quality_score(self, snapshot: Dict[str, Any]) -> float:
+        """Compute a 0–1 entry quality score from available market signals.
+
+        Aggregates regime, trend, orderbook pressure, volume acceleration, and
+        micro-trend signals into a single score.  Higher values indicate a more
+        favourable entry environment.  Called by :meth:`maybe_execute` to skip
+        buys when conditions are marginal.
+        """
+        score = 0.0
+        weights = 0.0
+
+        # 1. Market regime (weight 0.30)
+        regime = snapshot.get("regime")
+        if regime is not None:
+            weights += 0.30
+            if regime.regime == "trending_up":
+                score += 0.30 * min(1.0, 0.5 + regime.strength)
+            elif regime.regime == "ranging":
+                score += 0.30 * 0.4
+            elif regime.regime == "volatile":
+                score += 0.30 * max(0.0, 0.3 - regime.strength * 0.3)
+            # trending_down → 0
+
+        # 2. Trend direction + strength (weight 0.25)
+        trend = snapshot.get("trend")
+        if trend is not None:
+            weights += 0.25
+            direction = getattr(trend, "direction", "flat")
+            strength = getattr(trend, "strength", 0.0)
+            if direction == "up":
+                score += 0.25 * min(1.0, 0.5 + strength)
+            elif direction == "flat":
+                score += 0.25 * 0.3
+            # down → 0
+
+        # 3. Orderbook pressure (weight 0.20)
+        ob_pressure = snapshot.get("ob_pressure")
+        if ob_pressure is not None:
+            weights += 0.20
+            signal = getattr(ob_pressure, "signal", "neutral")
+            pressure = getattr(ob_pressure, "pressure", 0.0)
+            if signal == "buy":
+                score += 0.20 * min(1.0, 0.5 + pressure)
+            elif signal == "neutral":
+                score += 0.20 * 0.3
+            # sell → 0
+
+        # 4. Volume acceleration (weight 0.15)
+        vol_accel = snapshot.get("volume_accel")
+        if vol_accel is not None:
+            weights += 0.15
+            if getattr(vol_accel, "detected", False):
+                ratio = getattr(vol_accel, "acceleration_ratio", 1.0)
+                score += 0.15 * min(1.0, ratio / 3.0)
+            else:
+                score += 0.15 * 0.2  # baseline for no acceleration
+
+        # 5. Micro trend (weight 0.10)
+        micro = snapshot.get("micro_trend")
+        if micro is not None:
+            weights += 0.10
+            m_dir = getattr(micro, "direction", "flat")
+            m_str = getattr(micro, "strength", 0.0)
+            if m_dir == "up":
+                score += 0.10 * min(1.0, 0.5 + m_str * 10)
+            elif m_dir == "flat":
+                score += 0.10 * 0.2
+            # down → 0
+
+        # Normalise when only a subset of signals are available
+        if weights > 0:
+            return score / weights
+        return 0.5  # no data → neutral
+
     # ── Multi-position helpers ─────────────────────────────────────────────
 
     def _active_tracker(self, pair: str) -> PortfolioTracker:
@@ -2620,6 +2694,29 @@ class Trader:
             }
             return outcome
 
+        # ── Entry quality scoring ─────────────────────────────────────────────
+        # Multi-signal quality check that aggregates regime, trend, orderbook
+        # pressure, volume acceleration, and micro-trend into a single 0–1
+        # score.  Buys are skipped when the score is below the configured
+        # threshold, preventing entries in marginal conditions.
+        if self.config.entry_quality_min_score > 0 and decision.action == "buy":
+            eq_score = self._entry_quality_score(snapshot)
+            if eq_score < self.config.entry_quality_min_score:
+                logger.info(
+                    "Entry quality too low on %s: %.3f < %.3f — skipping buy",
+                    snapshot["pair"],
+                    eq_score,
+                    self.config.entry_quality_min_score,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"entry_quality_low score={eq_score:.3f}"
+                        f" < min={self.config.entry_quality_min_score:.3f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
+
         # simple slippage guard using top of book
         depth = self.client.get_depth(snapshot["pair"], count=_EXECUTION_DEPTH_LEVELS)
         bids = depth.get("buy") or []
@@ -4489,10 +4586,27 @@ class Trader:
 
         if received > 0:
             _tracker.record_trade("buy", retry_price, received)
-            logger.info(
-                "✅ Pending buy filled: %.8f %s @ Rp%.2f (pair=%s)",
-                received, base_coin.upper(), retry_price, pair,
-            )
+            remaining_buy = amount - received
+            # Partial fill: record filled portion and re-mark the remaining
+            # amount as pending_buy so it is retried on the next cycle.
+            if remaining_buy > 0:
+                _eff_min_re = max(self.config.min_order_idr, _min_info.get("min_idr", 0.0))
+                if _eff_min_re > 0 and remaining_buy * retry_price < _eff_min_re:
+                    logger.info(
+                        "⚠️ Pending buy partial fill: %.8f filled, remainder %.8f below min — accepting partial (pair=%s)",
+                        received, remaining_buy, pair,
+                    )
+                else:
+                    logger.info(
+                        "⚠️ Pending buy partial fill: %.8f filled, %.8f remaining — will retry remainder (pair=%s)",
+                        received, remaining_buy, pair,
+                    )
+                    _tracker.mark_pending_buy(remaining_buy, retry_price)
+            else:
+                logger.info(
+                    "✅ Pending buy filled: %.8f %s @ Rp%.2f (pair=%s)",
+                    received, base_coin.upper(), retry_price, pair,
+                )
             self._ensure_position_feed(pair)
             self._persist_after_trade(pair)
             return {
@@ -4684,6 +4798,25 @@ class Trader:
 
         if spent > 0:
             _tracker.record_trade("sell", retry_price, spent)
+            remaining_sell = amount - spent
+            # Partial fill: record sold portion and re-mark the unsold
+            # remainder as pending_sell so it is retried on the next cycle.
+            if remaining_sell > 0 and _tracker.base_position > 0:
+                logger.info(
+                    "⚠️ Pending sell partial fill: %.8f sold, %.8f remaining — will retry remainder (pair=%s)",
+                    spent, remaining_sell, pair,
+                )
+                _tracker.mark_pending_sell(remaining_sell, retry_price)
+                self._persist_after_trade(pair)
+                return {
+                    "status": "partial",
+                    "action": "sell",
+                    "pair": pair,
+                    "price": retry_price,
+                    "amount": spent,
+                    "remaining": remaining_sell,
+                    "portfolio": _tracker.as_dict(retry_price),
+                }
             logger.info(
                 "✅ Pending sell filled: %.8f %s @ Rp%.2f (pair=%s)",
                 spent, base_coin.upper(), retry_price, pair,
@@ -5140,6 +5273,26 @@ class Trader:
         # ── Record result ────────────────────────────────────────────────────
         if sold_amount > 0:
             _tracker.record_trade("sell", reference_price, sold_amount)
+            # If only partially sold, mark the remaining unsold amount as
+            # pending_sell so the monitoring loop retries the remainder on the
+            # next cycle instead of silently losing it.
+            if _chase_amount > 0 and _tracker.base_position > 0:
+                logger.info(
+                    "force_sell: partial fill %.8f sold, %.8f remaining — marking remainder pending (pair=%s)",
+                    sold_amount, _chase_amount, pair,
+                )
+                _tracker.mark_pending_sell(_chase_amount, reference_price)
+                self._persist_after_trade(pair)
+                return {
+                    "status": "pending_sell",
+                    "action": "sell",
+                    "pair": pair,
+                    "price": reference_price,
+                    "amount": sold_amount,
+                    "remaining": _chase_amount,
+                    "order": order_resp,
+                    "portfolio": _tracker.as_dict(reference_price),
+                }
             if self.multi_manager is not None and _tracker.base_position <= 0:
                 self.multi_manager.return_position_cash(pair)
             if _tracker.base_position <= 0:

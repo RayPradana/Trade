@@ -967,7 +967,9 @@ def main() -> None:
                 # ── Resume pending (unfilled) buy orders ──────────────────
                 # When a buy was placed but never filled, keep adjusting the
                 # price until it IS filled so no order is left hanging.
-                if held_tracker.has_pending_buy and held_tracker.base_position <= 0:
+                # NOTE: We also resume when base_position > 0 — this handles
+                # multi-stage buys where stage 1 filled but stage 2 did not.
+                if held_tracker.has_pending_buy:
                     logging.info(
                         "🔄 %sRESUME%s  %s%s%s  ·  re-attempting pending buy @ Rp %s",
                         _BOLD, _RESET,
@@ -1010,13 +1012,15 @@ def main() -> None:
                         f"{held_price:15,.2f}",
                     )
                     resume_sell_out = trader.resume_pending_sell(held_snapshot)
-                    if resume_sell_out.get("status") == "resumed":
+                    if resume_sell_out.get("status") in ("resumed", "partial"):
                         portfolio = held_tracker.as_dict(held_price)
+                        _is_partial = resume_sell_out.get("status") == "partial"
                         logging.info(
-                            "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s",
+                            "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s%s",
                             _DIM, _RESET,
                             _BOLD, resume_sell_out.get("amount", 0), _RESET,
                             f"{held_price:15,.2f}",
+                            f"  (partial, {resume_sell_out.get('remaining', 0):.8f} remaining)" if _is_partial else "",
                         )
                         _log_portfolio(
                             portfolio,
@@ -1024,12 +1028,15 @@ def main() -> None:
                             trailing_stop_enabled=config.trailing_stop_pct > 0,
                             trailing_tp_enabled=config.trailing_tp_pct > 0,
                         )
+                        _status_label = "PARTIAL SELL" if _is_partial else "PENDING SELL FILLED"
                         _notify(
                             config,
-                            f"🔄 PENDING SELL FILLED {held_pair} @ Rp {held_price:,.0f}\n"
+                            f"🔄 {_status_label} {held_pair} @ Rp {held_price:,.0f}\n"
                             f"Amount: {resume_sell_out.get('amount', 0):.8f}\n"
                             f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                         )
+                        if _is_partial:
+                            _still_holding = True
                     elif resume_sell_out.get("status") in ("cancelled_below_min", "cancelled_zero", "no_position"):
                         logging.info(
                             "❌ Pending sell cancelled for %s: %s",

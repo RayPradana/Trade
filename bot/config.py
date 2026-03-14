@@ -133,6 +133,13 @@ class BotConfig:
     # confirmation read of the orderbook (spread + direction check) before
     # committing the very first buy order.  Helps avoid false breakouts.
     smart_entry_buffer_enabled: bool = True
+    # ── Entry quality scoring ─────────────────────────────────────────────────
+    # Multi-signal quality check before buying.  The bot aggregates signals
+    # (regime, trend, orderbook, volume acceleration, micro-trend) into a
+    # 0→1 score and skips buys when the score is below this threshold.
+    # Higher values → pickier entry, lower values → more aggressive.
+    # 0 disables the check entirely.
+    entry_quality_min_score: float = 0.35
     # Adaptive limit order: when enabled, the first buy order is placed
     # slightly above best_bid (passive) rather than at best_ask (aggressive).
     # This gives a better fill price when the market isn't trending hard.
@@ -714,6 +721,7 @@ class BotConfig:
             chase_max_retries=_env_int("CHASE_MAX_RETRIES", "3"),
             order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
             smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "true").lower() in {"1", "true", "yes"},
+            entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.35"),
             adaptive_order_enabled=os.getenv("ADAPTIVE_ORDER_ENABLED", "true").lower() in {"1", "true", "yes"},
             min_orderbook_volume_idr=_env_float("MIN_ORDERBOOK_VOLUME_IDR", "0"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
