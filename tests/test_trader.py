@@ -7,7 +7,7 @@ from typing import Dict, Any
 
 import requests
 
-from bot.analysis import WhaleActivity, Candle, OrderbookInsight, TrendResult
+from bot.analysis import WhaleActivity, Candle, OrderbookInsight, TrendResult, MarketRegime
 from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
@@ -5516,7 +5516,8 @@ class ChaseAlgorithmTests(unittest.TestCase):
         trader = Trader(config)
         trader.client = _Client()
 
-        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.5, description="test"))
         outcome = trader.maybe_execute(snap)
 
         # 1 initial + 3 chase + 1 market = 5 orders
@@ -5609,7 +5610,8 @@ class ChaseAlgorithmTests(unittest.TestCase):
         trader.client = _Client()
         trader.tracker.record_trade("buy", 100.0, 500.0)
 
-        snap = self._make_snap("ponke_idr", "sell", 100.0, 500.0)
+        snap = self._make_snap("ponke_idr", "sell", 100.0, 500.0,
+                               regime=MarketRegime(regime="trending_down", strength=0.5, description="test"))
         outcome = trader.maybe_execute(snap)
 
         # 1 initial + 3 chase + 1 market = 5 orders

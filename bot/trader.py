@@ -29,6 +29,7 @@ from .analysis import (
     detect_volume_acceleration,
     detect_whale_activity,
     detect_market_regime,
+    MarketRegime,
     interval_to_ohlc_tf,
     multi_timeframe_confirm,
     smart_entry_filter,
@@ -3083,6 +3084,17 @@ class Trader:
                     if full_value >= self.config.min_order_idr:
                         effective_amount = max_sellable
 
+        # ── Dynamic position sizing (regime + liquidity) ─────────────────────
+        # Adjust the computed amount based on market regime (larger in trending
+        # up, smaller in volatile/down) and cap it against visible orderbook
+        # depth to avoid excessive slippage.
+        if decision.action == "buy" and effective_amount > 0:
+            effective_amount = self._regime_adjusted_position_size(
+                effective_amount, snapshot,
+            )
+            # Re-enforce the max_affordable ceiling after the adjustment
+            effective_amount = min(effective_amount, max_affordable)
+
         if effective_amount <= 0:
             logger.info("Skip due to insufficient balance/position | action=%s", decision.action)
             outcome = {
@@ -3485,7 +3497,11 @@ class Trader:
                         break  # Filled — exit chase loop
 
                 # ── Timeout → market order (buy) ──────────────────────────────
-                if received_amount <= 0 and self.config.order_timeout_to_market:
+                # Only use market fallback when the regime indicates the coin
+                # is trending up or has strong upward momentum; otherwise keep
+                # the order as a pending limit to avoid overpaying in a flat or
+                # falling market.
+                if received_amount <= 0 and self.config.order_timeout_to_market and self._should_use_market_fallback(snapshot, "buy"):
                     _prev_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
                     if _prev_oid:
                         try:
@@ -3656,7 +3672,10 @@ class Trader:
                             break  # Filled
 
                     # ── Timeout → market order (sell) ─────────────────────────
-                    if _sell_spent <= 0 and self.config.order_timeout_to_market:
+                    # Only use market fallback when the regime indicates the coin
+                    # is trending down or volatile (dump risk); otherwise keep
+                    # the order as a pending sell to avoid selling at rock bottom.
+                    if _sell_spent <= 0 and self.config.order_timeout_to_market and self._should_use_market_fallback(snapshot, "sell"):
                         _prev_sell_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
                         if _prev_sell_oid:
                             try:
@@ -3999,6 +4018,207 @@ class Trader:
             window,
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Market Regime helpers for execution
+    # ------------------------------------------------------------------
+
+    def _should_use_market_fallback(
+        self,
+        snapshot: Dict[str, Any],
+        side: str,
+    ) -> bool:
+        """Decide whether a market-crossing order is appropriate after chase
+        exhaustion based on the current market regime.
+
+        For **buy**: market order only when the coin is trending up or the
+        snapshot signals rapid upward movement (avoid overpaying in a flat or
+        falling market).
+
+        For **sell**: market order only when the coin is trending down or
+        volatile (urgency to exit before further dump).
+
+        When the conditions are not met the caller should fall back to a pending
+        limit order that will be retried on the next monitoring cycle.
+        """
+        regime: Optional[MarketRegime] = snapshot.get("regime")
+        if regime is None:
+            # No regime data — conservative: stick with limit
+            return False
+
+        if side == "buy":
+            # Market buy justified when trending up with decent strength
+            if regime.regime == "trending_up" and regime.strength >= 0.3:
+                return True
+            # Also allow if volume acceleration or strong micro trend detected
+            vol_accel = snapshot.get("volume_accel")
+            if vol_accel and getattr(vol_accel, "detected", False):
+                return True
+            micro = snapshot.get("micro_trend")
+            if micro and getattr(micro, "detected", False) and getattr(micro, "direction", "") == "up":
+                return True
+            return False
+
+        if side == "sell":
+            # Market sell justified when trending down or volatile (dump risk)
+            if regime.regime in ("trending_down", "volatile"):
+                return True
+            # Also allow if the trend direction is down regardless of regime label
+            trend = snapshot.get("trend")
+            if trend and getattr(trend, "direction", "") == "down" and getattr(trend, "strength", 0) > 0.01:
+                return True
+            return False
+
+        return False
+
+    def _regime_adjusted_position_size(
+        self,
+        base_amount: float,
+        snapshot: Dict[str, Any],
+    ) -> float:
+        """Adjust position size based on market regime and liquidity.
+
+        * **trending_up** with strong signal → up to +20 % size boost
+        * **volatile / trending_down** → reduce size by up to 30 %
+        * **ranging** → no adjustment
+
+        Separately, if the orderbook lacks depth the amount is capped so that
+        the order does not exceed visible liquidity.
+        """
+        if base_amount <= 0:
+            return base_amount
+
+        regime: Optional[MarketRegime] = snapshot.get("regime")
+        multiplier = 1.0
+        if regime is not None:
+            if regime.regime == "trending_up":
+                # Stronger trend → bigger boost (max +20 %)
+                multiplier = 1.0 + min(0.20, regime.strength * 0.20)
+            elif regime.regime == "volatile":
+                # Higher volatility → bigger cut (max −30 %)
+                multiplier = max(0.70, 1.0 - regime.strength * 0.30)
+            elif regime.regime == "trending_down":
+                multiplier = max(0.70, 1.0 - regime.strength * 0.30)
+            # ranging → 1.0
+
+        adjusted = base_amount * multiplier
+
+        # ── Liquidity cap ────────────────────────────────────────────────────
+        adjusted = self._liquidity_adjusted_amount(adjusted, snapshot)
+
+        return adjusted
+
+    def _liquidity_adjusted_amount(
+        self,
+        amount: float,
+        snapshot: Dict[str, Any],
+    ) -> float:
+        """Cap *amount* so that the order does not exceed a fraction of the
+        visible orderbook depth on the relevant side.
+
+        For a buy we look at ask-side depth; for a sell we look at bid-side
+        depth.  The cap is 40 % of the total visible depth in the top 5 levels
+        so that a single order does not eat through the entire book and suffer
+        large slippage.
+        """
+        if amount <= 0:
+            return amount
+
+        depth = snapshot.get("raw_depth")
+        if not depth:
+            return amount
+
+        price = snapshot.get("price", 0)
+        if price <= 0:
+            return amount
+
+        decision = snapshot.get("decision")
+        side = getattr(decision, "action", "buy") if decision else "buy"
+
+        levels = depth.get("sell") if side == "buy" else depth.get("buy")
+        if not levels:
+            return amount
+
+        # Sum coin-equivalent volume in top 5 levels
+        total_coin = 0.0
+        for lvl in levels[:5]:
+            try:
+                total_coin += float(lvl[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+
+        if total_coin <= 0:
+            return amount
+
+        # Cap at 40 % of visible depth
+        max_amount = total_coin * 0.40
+        if amount > max_amount > 0:
+            logger.info(
+                "Liquidity cap: %.8f → %.8f (40%% of %.8f visible depth on %s)",
+                amount, max_amount, total_coin, snapshot.get("pair", "?"),
+            )
+            return max_amount
+
+        return amount
+
+    def analyze_reentry_opportunity(
+        self,
+        snapshot: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Analyse whether a re-entry at a lower price is justified after
+        a trailing-stop or stop-loss sell.
+
+        Returns a dict with ``reentry=True`` and a suggested ``target_price``
+        when conditions are favourable, or ``None`` when the bot should stay
+        flat.
+
+        Conditions checked:
+        * Market regime is *not* ``trending_down`` (would just keep falling).
+        * Support level is nearby below the current price.
+        * Trend is at least neutral or turning up.
+        * Orderbook shows bid-side strength (imbalance > 0).
+        """
+        regime: Optional[MarketRegime] = snapshot.get("regime")
+        trend = snapshot.get("trend")
+        orderbook = snapshot.get("orderbook")
+        levels = snapshot.get("levels")
+        price = snapshot.get("price", 0)
+
+        if price <= 0:
+            return None
+
+        # Do not re-enter if the market is clearly heading down
+        if regime and regime.regime == "trending_down" and regime.strength >= 0.4:
+            return None
+
+        # Need at least a non-bearish trend
+        if trend and getattr(trend, "direction", "") == "down" and getattr(trend, "strength", 0) > 0.02:
+            return None
+
+        # Look for a nearby support level below the current price
+        supports = getattr(levels, "support", []) if levels else []
+        target_price = None
+        for s in sorted(supports, reverse=True):
+            if s < price * 0.995:  # at least 0.5 % below current
+                target_price = s
+                break
+
+        if target_price is None:
+            # No identified support — use a 1 % dip from current as target
+            target_price = price * 0.99
+
+        # Orderbook should show some bid strength
+        imbalance = getattr(orderbook, "imbalance", 0.0) if orderbook else 0.0
+        if imbalance < -0.3:
+            # Heavy sell-side pressure — skip re-entry
+            return None
+
+        return {
+            "reentry": True,
+            "target_price": target_price,
+            "regime": regime.regime if regime else "unknown",
+            "imbalance": imbalance,
+        }
 
     def _conditions_allow_holding(self, snapshot: Dict[str, Any]) -> bool:
         """Return ``True`` when market indicators suggest holding past the TP target.

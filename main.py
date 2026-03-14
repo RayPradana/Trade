@@ -1232,6 +1232,42 @@ def main() -> None:
                         f"Amount: {force_outcome.get('amount', 0):.8f}\n"
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
+
+                    # ── Re-entry analysis after trail/stop sell ──────────────
+                    # When the exit was triggered by a trailing stop or stop
+                    # loss, analyse whether the coin still has upside potential.
+                    # If so, mark a pending buy at a lower target price so the
+                    # bot can re-enter instead of staying flat.
+                    if stop_reason in (
+                        "trailing_stop", "stop_loss", "trailing_tp_triggered",
+                        "momentum_exit", "post_entry_dump",
+                    ):
+                        try:
+                            _reentry = trader.analyze_reentry_opportunity(held_snapshot)
+                            if _reentry and _reentry.get("reentry"):
+                                _tgt = _reentry["target_price"]
+                                logging.info(
+                                    "🔄 %sRE-ENTRY OPPORTUNITY%s  %s%s%s  ·  target Rp %s  regime=%s  imbalance=%.2f",
+                                    _BOLD, _RESET,
+                                    _BOLD, held_pair, _RESET,
+                                    f"{_tgt:,.2f}",
+                                    _reentry.get("regime", "?"),
+                                    _reentry.get("imbalance", 0),
+                                )
+                                _notify(
+                                    config,
+                                    f"🔄 RE-ENTRY OPPORTUNITY {held_pair}\n"
+                                    f"Target: Rp {_tgt:,.2f}\n"
+                                    f"Regime: {_reentry.get('regime', '?')}",
+                                )
+                            else:
+                                logging.info(
+                                    "📊 No re-entry opportunity for %s — staying flat",
+                                    held_pair,
+                                )
+                        except Exception as _re_exc:
+                            logging.debug("Re-entry analysis failed for %s: %s", held_pair, _re_exc)
+
                     consecutive_errors = 0
                     if config.trade_mode == "single" and _entered_position:
                         logging.info("✅ %sSingle-trade cycle complete — stopping.%s", _BOLD, _RESET)
