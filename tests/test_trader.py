@@ -5787,6 +5787,132 @@ class ChaseAlgorithmTests(unittest.TestCase):
         partial_steps = [s for s in outcome["executed_steps"] if s.get("partial")]
         self.assertGreaterEqual(len(partial_steps), 1, "Should record partial fill step")
 
+    def test_buy_chase_skips_below_min_order_after_partial_fill(self):
+        """Chase retry should not place an order when remaining amount is below min_order_idr."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                # First call: simulate partial fill via balance bump
+                if len(created) == 1:
+                    _balance[0] = 100.0  # partial fill of 100 out of ~111
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                # Should NOT reach here — chase should skip below-min remaining
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # min_order_idr=30000, price=270 → min amount ≈ 111.11
+        # After partial fill of 100, remaining ≈ 11.11 → 11.11 * 270 = 3000 < 30000
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=30_000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        outcome = trader.maybe_execute(snap)
+
+        # Only the initial order should be placed; chase retries should be skipped
+        self.assertEqual(len(created), 1, f"Expected 1 order (chase skipped due to min), got {len(created)}")
+
+    def test_sell_chase_skips_below_min_order_after_partial_fill(self):
+        """Sell chase retry should skip when remaining amount is below min_order_idr."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # Partial fill: sell 140 out of 150, leaving remainder of 10
+                    return {"success": 1, "return": {"order_id": "1", "spend_cjl": 140.0, "receive_idr": 37800}}
+                return {"success": 1, "return": {"order_id": str(len(created)), "spend_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "10", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # price=270, amount=150 → order_value=40500 > 30000 (passes initial check)
+        # After partial fill of 140, remainder=10 → 10*270=2700 < 30000 (below min)
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=30_000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 270.0, 150.0)
+
+        snap = self._make_snap("cjl_idr", "sell", 270.0, 150.0)
+        outcome = trader.maybe_execute(snap)
+
+        # Only initial order; chase should skip due to remaining below min
+        self.assertEqual(len(created), 1, f"Expected 1 order (sell chase skipped due to min), got {len(created)}")
+
+    def test_buy_chase_market_fallback_skips_below_min(self):
+        """Market order fallback after chase exhaustion should skip when below min_order_idr."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    _balance[0] = 100.0
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=True, min_order_idr=30_000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        outcome = trader.maybe_execute(snap)
+
+        # Only initial order should be placed; chase + market fallback should skip
+        self.assertEqual(len(created), 1, f"Expected 1 order (market fallback skipped due to min), got {len(created)}")
+
 
 class AdaptiveLimitOrderTests(unittest.TestCase):
     """Tests for the adaptive limit order feature."""

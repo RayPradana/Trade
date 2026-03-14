@@ -3390,6 +3390,15 @@ class Trader:
                         if callable(_fmt_price):
                             retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
 
+                    # Check remaining chase amount still meets minimum order
+                    if self.config.min_order_idr > 0 and _chase_amount * retry_price < self.config.min_order_idr:
+                        logger.info(
+                            "Chase[%d] remaining amount %.8f × Rp%.2f = Rp%.0f below min Rp%.0f — accepting partial fill (pair=%s)",
+                            _chase_i + 1, _chase_amount, retry_price, _chase_amount * retry_price,
+                            self.config.min_order_idr, snapshot["pair"],
+                        )
+                        break
+
                     logger.info(
                         "Chase[%d/%d] buy at %.10f → %.10f (pair=%s)",
                         _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
@@ -3425,14 +3434,20 @@ class Trader:
                     _fmt_price = getattr(self.client, "format_price", None)
                     if callable(_fmt_price):
                         market_price, _ = _fmt_price(snapshot["pair"], market_price)
-                    logger.info(
-                        "Chase exhausted — converting buy to market-price order at %.10f (pair=%s)",
-                        market_price, snapshot["pair"],
-                    )
-                    order_resp = self.client.create_order(snapshot["pair"], decision.action, market_price, _chase_amount)
-                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
-                    reference_price = market_price
-                    received_amount = _calc_received_amount(order_resp, pre_step_position)
+                    if self.config.min_order_idr > 0 and _chase_amount * market_price < self.config.min_order_idr:
+                        logger.info(
+                            "Chase exhausted — remaining buy Rp%.0f below min Rp%.0f, accepting partial fill (pair=%s)",
+                            _chase_amount * market_price, self.config.min_order_idr, snapshot["pair"],
+                        )
+                    else:
+                        logger.info(
+                            "Chase exhausted — converting buy to market-price order at %.10f (pair=%s)",
+                            market_price, snapshot["pair"],
+                        )
+                        order_resp = self.client.create_order(snapshot["pair"], decision.action, market_price, _chase_amount)
+                        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                        reference_price = market_price
+                        received_amount = _calc_received_amount(order_resp, pre_step_position)
 
                 if received_amount <= 0:
                     logger.info(
@@ -3503,6 +3518,15 @@ class Trader:
                             if callable(_fmt_price):
                                 retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
 
+                        # Check remaining chase amount still meets minimum order
+                        if self.config.min_order_idr > 0 and _chase_amount * retry_price < self.config.min_order_idr:
+                            logger.info(
+                                "Chase[%d] remaining sell %.8f × Rp%.2f = Rp%.0f below min Rp%.0f — accepting partial fill (pair=%s)",
+                                _chase_i + 1, _chase_amount, retry_price, _chase_amount * retry_price,
+                                self.config.min_order_idr, snapshot["pair"],
+                            )
+                            break
+
                         logger.info(
                             "Chase[%d/%d] sell at %.10f → %.10f (pair=%s)",
                             _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
@@ -3541,18 +3565,24 @@ class Trader:
                         _fmt_price = getattr(self.client, "format_price", None)
                         if callable(_fmt_price):
                             market_price, _ = _fmt_price(snapshot["pair"], market_price)
-                        logger.info(
-                            "Chase exhausted — converting sell to market-price order at %.10f (pair=%s)",
-                            market_price, snapshot["pair"],
-                        )
-                        order_resp = self.client.create_order(
-                            snapshot["pair"], decision.action, market_price, _chase_amount,
-                        )
-                        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
-                        reference_price = market_price
-                        _sell_spent = float(
-                            (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
-                        )
+                        if self.config.min_order_idr > 0 and _chase_amount * market_price < self.config.min_order_idr:
+                            logger.info(
+                                "Chase exhausted — remaining sell Rp%.0f below min Rp%.0f, accepting partial fill (pair=%s)",
+                                _chase_amount * market_price, self.config.min_order_idr, snapshot["pair"],
+                            )
+                        else:
+                            logger.info(
+                                "Chase exhausted — converting sell to market-price order at %.10f (pair=%s)",
+                                market_price, snapshot["pair"],
+                            )
+                            order_resp = self.client.create_order(
+                                snapshot["pair"], decision.action, market_price, _chase_amount,
+                            )
+                            getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                            reference_price = market_price
+                            _sell_spent = float(
+                                (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                            )
 
                     # Update received for the record_trade below
                     if _sell_spent > 0:
