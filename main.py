@@ -5,10 +5,11 @@ import datetime
 import logging
 import os
 import signal
+import statistics as _statistics
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -865,6 +866,146 @@ def main() -> None:
                                 "🔄 Health check: needs restart (errors=%d)",
                                 _health["error_count"],
                             )
+                    elif _task_name == "pair_rotation":
+                        # ── Pair rotation using scanning + autonomous modules ───
+                        try:
+                            # Score all tracked pairs with multi-market scanning
+                            _scan_scores = trader.get_pair_scan_scores()
+
+                            # Build price lists for direct scan calls
+                            _ph: Dict[str, List[float]] = {
+                                _p: [_px for _, _px in _buf]
+                                for _p, _buf in trader._price_history.items()
+                                if len(_buf) >= 20
+                            }
+
+                            # Momentum scan — identify pairs with strong ROC
+                            _mom = scan_momentum(_ph)
+                            _bull = [r.market for r in _mom if r.signal == "bullish"]
+
+                            # Trend scan — identify pairs in confirmed uptrend
+                            _trnd = scan_trends(_ph)
+                            _up = [r.market for r in _trnd if r.trend == "uptrend"]
+
+                            if _bull or _up:
+                                logging.info(
+                                    "📊 Pair scan — bullish momentum: %s | uptrend: %s",
+                                    _bull[:3], _up[:3],
+                                )
+
+                            # Build pair_data for rotate_pairs
+                            _pair_data: Dict[str, Dict] = {}
+                            for _p, _score in _scan_scores.items():
+                                _pbuf = trader._price_history.get(_p, [])
+                                _pprices = [_px for _, _px in _pbuf]
+                                _pvol = trader._pair_volume(_p)
+                                _pvolatility = 0.0
+                                if len(_pprices) >= 5:
+                                    _prets = [
+                                        (_pprices[i] - _pprices[i - 1]) / _pprices[i - 1]
+                                        for i in range(1, len(_pprices))
+                                        if _pprices[i - 1] > 0
+                                    ]
+                                    if len(_prets) >= 2:
+                                        _pvolatility = _statistics.pstdev(_prets)
+                                _pair_data[_p] = {
+                                    "volume": _pvol,
+                                    "volatility": _pvolatility,
+                                    "spread": 0.0,
+                                    "momentum": _score,
+                                }
+                            if _pair_data:
+                                _rotation = rotate_pairs(
+                                    pair_data=_pair_data,
+                                    current_pair=config.pair,
+                                    max_pairs=getattr(config, "multi_position_max", 3),
+                                    min_volume=getattr(config, "min_volume_idr", 0.0),
+                                )
+                                if _rotation.rotated:
+                                    logging.info(
+                                        "🔄 Pair rotation: %s → %s (%s)",
+                                        _rotation.previous_pair,
+                                        _rotation.new_pair,
+                                        _rotation.reason,
+                                    )
+                                elif _rotation.selected_pairs:
+                                    logging.debug(
+                                        "📊 Top pairs: %s (current=%s is optimal)",
+                                        _rotation.selected_pairs[:3],
+                                        _rotation.previous_pair,
+                                    )
+                            for _comp in _components:
+                                if _comp.name == "scanner":
+                                    _comp.is_healthy = True
+                                    _comp.consecutive_failures = 0
+                        except Exception as _pr_exc:
+                            logging.debug("Pair rotation failed: %s", _pr_exc)
+                    elif _task_name == "strategy_review":
+                        # ── Strategy optimization + auto-switch ──────────────────
+                        try:
+                            if snapshot and snapshot.get("candles"):
+                                _sr_candles = snapshot["candles"]
+                                if len(_sr_candles) >= 20:
+                                    _opt = optimize_strategy(_sr_candles)
+                                    if _opt.fitness_score > 0.1:
+                                        logging.info(
+                                            "🤖 Strategy optimization: best=%s"
+                                            " (fitness=%.4f, params=%s)",
+                                            _opt.recommended_strategy,
+                                            _opt.fitness_score,
+                                            _opt.recommended_params,
+                                        )
+
+                            # Gather per-strategy stats from all active trackers
+                            _strategy_stats: Dict[str, Dict] = {}
+                            for _t in trader.active_positions.values():
+                                for _sn, _ss in getattr(_t, "_strategy_stats", {}).items():
+                                    if _sn not in _strategy_stats:
+                                        _strategy_stats[_sn] = dict(_ss)
+                                    else:
+                                        for _k, _v in _ss.items():
+                                            try:
+                                                _strategy_stats[_sn][_k] = (
+                                                    (_strategy_stats[_sn].get(_k, 0) + float(_v)) / 2
+                                                )
+                                            except (TypeError, ValueError):
+                                                pass
+                            # Fall back to the primary tracker
+                            if not _strategy_stats and hasattr(trader, "tracker"):
+                                _strategy_stats = dict(trader.tracker._strategy_stats)
+
+                            if _strategy_stats:
+                                _ph_prices = [
+                                    _px for _, _px in
+                                    trader._price_history.get(config.pair, [])[-20:]
+                                ]
+                                _switch = auto_switch_strategy(
+                                    strategy_stats=_strategy_stats,
+                                    current_strategy=getattr(config, "strategy", ""),
+                                    prices=_ph_prices,
+                                )
+                                if _switch.switched:
+                                    logging.info(
+                                        "🔄 Strategy switch recommended: %s → %s"
+                                        " (%s) | regime=%s",
+                                        _switch.previous_strategy,
+                                        _switch.new_strategy,
+                                        _switch.reason,
+                                        _switch.regime,
+                                    )
+                                elif _switch.regime not in ("unknown", ""):
+                                    logging.debug(
+                                        "📊 Strategy review: regime=%s,"
+                                        " current=%s still optimal",
+                                        _switch.regime,
+                                        _switch.previous_strategy,
+                                    )
+                            for _comp in _components:
+                                if _comp.name == "strategy_engine":
+                                    _comp.is_healthy = True
+                                    _comp.consecutive_failures = 0
+                        except Exception as _sr_exc:
+                            logging.debug("Strategy review failed: %s", _sr_exc)
                     elif _task_name == "risk_monitoring":
                         # ── Risk management monitoring via risk_management module ──
                         try:
@@ -887,6 +1028,88 @@ def main() -> None:
                                         _comp.consecutive_failures = 0
                         except Exception as _rm_exc:
                             logging.debug("Risk monitoring check failed: %s", _rm_exc)
+                        # ── Max drawdown check (portfolio-wide) ──────────────────
+                        try:
+                            _main_tracker = getattr(trader, "tracker", None)
+                            if _main_tracker is not None:
+                                _eq_hist = getattr(_main_tracker, "equity_history", [])
+                                if _eq_hist and len(_eq_hist) >= 2:
+                                    _dd = check_max_drawdown(
+                                        equity_history=_eq_hist,
+                                        max_drawdown_pct=config.max_loss_pct * 100,
+                                        warning_pct=config.max_loss_pct * 100 * 0.75,
+                                    )
+                                    if _dd.should_stop:
+                                        logging.warning(
+                                            "🛑 Portfolio max drawdown reached:"
+                                            " %.2f%% ≥ %.2f%%",
+                                            _dd.current_drawdown_pct,
+                                            _dd.max_drawdown_pct,
+                                        )
+                                    elif _dd.should_reduce:
+                                        logging.warning(
+                                            "⚠️ Drawdown warning: %.2f%%"
+                                            " — consider reducing exposure",
+                                            _dd.current_drawdown_pct,
+                                        )
+                        except Exception as _dd_exc:
+                            logging.debug("Max drawdown monitoring failed: %s", _dd_exc)
+                        # ── Dynamic risk adjustment advisory ─────────────────────
+                        try:
+                            _main_tracker = getattr(trader, "tracker", None)
+                            if _main_tracker is not None:
+                                _rpnl = list(
+                                    _main_tracker._all_sell_pnls[-10:]
+                                ) if _main_tracker._all_sell_pnls else []
+                                if _rpnl:
+                                    _eq_hist = getattr(_main_tracker, "equity_history", [])
+                                    _cur_dd = 0.0
+                                    if _eq_hist and len(_eq_hist) >= 2:
+                                        _pk = max(_eq_hist)
+                                        _cur = _eq_hist[-1]
+                                        _cur_dd = ((_pk - _cur) / _pk * 100) if _pk > 0 else 0.0
+                                    _dyn = adjust_risk_dynamically(
+                                        base_risk_pct=config.risk_per_trade * 100,
+                                        recent_pnl=_rpnl,
+                                        current_drawdown_pct=_cur_dd,
+                                        volatility=0.0,
+                                        win_rate=_main_tracker.win_rate,
+                                    )
+                                    if _dyn.scale_factor < 0.8:
+                                        logging.warning(
+                                            "📉 Risk monitoring: risk scaled down"
+                                            " to %.2f%% (factor=%.2f×, %s)",
+                                            _dyn.adjusted_risk_pct,
+                                            _dyn.scale_factor,
+                                            _dyn.reason,
+                                        )
+                                    elif _dyn.scale_factor > 1.1:
+                                        logging.info(
+                                            "📈 Risk monitoring: risk scaled up"
+                                            " to %.2f%% (factor=%.2f×, %s)",
+                                            _dyn.adjusted_risk_pct,
+                                            _dyn.scale_factor,
+                                            _dyn.reason,
+                                        )
+                        except Exception as _dr_exc:
+                            logging.debug(
+                                "Dynamic risk adjustment monitoring failed: %s", _dr_exc,
+                            )
+                        # ── Anomaly detection (ML-based) ─────────────────────────
+                        try:
+                            if snapshot and snapshot.get("candles"):
+                                _anom_candles = snapshot["candles"]
+                                if len(_anom_candles) >= 10:
+                                    _anom = ml_detect_anomalies(_anom_candles)
+                                    if _anom.is_anomaly:
+                                        logging.warning(
+                                            "🚨 ML anomaly detected (score=%.2f,"
+                                            " type=%s) — monitor closely",
+                                            _anom.anomaly_score,
+                                            _anom.anomaly_type,
+                                        )
+                        except Exception as _anom_exc:
+                            logging.debug("ML anomaly detection failed: %s", _anom_exc)
                     elif _task_name == "portfolio_analysis":
                         # ── Portfolio management analysis ─────────────────────────
                         try:
@@ -903,10 +1126,40 @@ def main() -> None:
                                     "📊 Diversification: score=%.2f, effective_assets=%.1f",
                                     _div.score, _div.effective_assets,
                                 )
-                                for _comp in _components:
-                                    if _comp.name == "portfolio_engine":
-                                        _comp.is_healthy = True
-                                        _comp.consecutive_failures = 0
+                            if _pa.get("rebalance"):
+                                _rb = _pa["rebalance"]
+                                if _rb.needs_rebalance:
+                                    logging.info(
+                                        "⚖️ Rebalance needed: %d trades,"
+                                        " turnover=%.0f, max_drift=%.2f%% (%s)",
+                                        len(_rb.actions),
+                                        _rb.total_turnover,
+                                        _rb.max_drift,
+                                        _rb.reason,
+                                    )
+                            if _pa.get("correlation"):
+                                _corr = _pa["correlation"]
+                                if _corr.risk_level in ("high", "critical"):
+                                    logging.warning(
+                                        "⚠️ High correlation risk: %s"
+                                        " (avg=%.2f, max=%.2f, pairs=%s)",
+                                        _corr.risk_level,
+                                        _corr.avg_correlation,
+                                        _corr.max_correlation,
+                                        _corr.high_pairs[:3],
+                                    )
+                                elif _corr.high_pairs:
+                                    logging.info(
+                                        "📊 Correlation: risk=%s, avg=%.2f,"
+                                        " high_pairs=%d",
+                                        _corr.risk_level,
+                                        _corr.avg_correlation,
+                                        len(_corr.high_pairs),
+                                    )
+                            for _comp in _components:
+                                if _comp.name == "portfolio_engine":
+                                    _comp.is_healthy = True
+                                    _comp.consecutive_failures = 0
                         except Exception as _pa_exc:
                             logging.debug("Portfolio analysis failed: %s", _pa_exc)
                     elif _task_name == "ml_regime_check":

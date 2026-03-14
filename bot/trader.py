@@ -86,6 +86,7 @@ from .portfolio_management import (
     evaluate_multi_asset_portfolio,
     plan_rebalance,
     assess_diversification,
+    compute_correlation_matrix,
 )
 from .ml_models import (
     detect_regime,
@@ -1086,16 +1087,38 @@ class Trader:
         if decision.action != "buy":
             return None
 
+        # ── Maximum drawdown protection ───────────────────────────────────────
+        equity_history = tracker.equity_history if hasattr(tracker, "equity_history") else []
+        drawdown_pct = 0.0
+        if equity_history and len(equity_history) >= 2:
+            try:
+                _dd = check_max_drawdown(
+                    equity_history=equity_history,
+                    max_drawdown_pct=self.config.max_loss_pct * 100,
+                    warning_pct=self.config.max_loss_pct * 100 * 0.75,
+                )
+                drawdown_pct = _dd.current_drawdown_pct
+                if _dd.should_stop:
+                    logger.warning(
+                        "🛑 Max drawdown reached: %.2f%% ≥ %.2f%% — blocking buy",
+                        _dd.current_drawdown_pct, _dd.max_drawdown_pct,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": f"max_drawdown {_dd.current_drawdown_pct:.2f}%",
+                        "portfolio": tracker.as_dict(price),
+                    }
+                if _dd.should_reduce:
+                    logger.warning(
+                        "⚠️ Drawdown warning: %.2f%% approaching hard limit of %.2f%%",
+                        _dd.current_drawdown_pct, _dd.max_drawdown_pct,
+                    )
+            except Exception as exc:
+                logger.debug("Max drawdown check failed: %s", exc)
+
         # ── Circuit breaker (risk_management module) ─────────────────────────
         try:
             daily_loss = tracker.daily_loss_pct(price) * 100
-            equity_history = tracker.equity_history if hasattr(tracker, "equity_history") else []
-            drawdown_pct = 0.0
-            if equity_history and len(equity_history) >= 2:
-                peak = max(equity_history)
-                current = equity_history[-1]
-                drawdown_pct = ((peak - current) / peak * 100) if peak > 0 else 0.0
-
             cb = rm_check_circuit_breaker(
                 daily_loss_pct=daily_loss,
                 drawdown_pct=drawdown_pct,
@@ -1114,6 +1137,59 @@ class Trader:
                 }
         except Exception as exc:
             logger.debug("Risk management circuit breaker check failed: %s", exc)
+
+        # ── Daily loss limit (risk_management module) ─────────────────────────
+        if self.config.max_daily_loss_pct > 0:
+            try:
+                _daily_loss_frac = tracker.daily_loss_pct(price)
+                _day_equity_open = tracker._day_open_equity
+                # daily_pnl is negative when we have a loss
+                _daily_pnl_idr = -_daily_loss_frac * _day_equity_open
+                _dl_limit = self.config.max_daily_loss_pct * _day_equity_open
+                _dl = check_daily_loss_limit(
+                    daily_pnl=_daily_pnl_idr,
+                    daily_loss_limit=_dl_limit,
+                )
+                if not _dl.can_trade:
+                    logger.warning(
+                        "🛑 Daily loss limit reached: pnl=Rp%.0f, limit=Rp%.0f (utilization=%.1f%%)",
+                        _dl.daily_pnl, _dl.daily_loss_limit, _dl.utilization_pct,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            f"daily_loss_limit pnl={_dl.daily_pnl:.0f}"
+                            f" limit={_dl.daily_loss_limit:.0f}"
+                        ),
+                        "portfolio": tracker.as_dict(price),
+                    }
+                if _dl.utilization_pct > 75:
+                    logger.info(
+                        "⚠️ Daily loss at %.1f%% of limit — remaining budget: Rp%.0f",
+                        _dl.utilization_pct, _dl.remaining_budget,
+                    )
+            except Exception as exc:
+                logger.debug("Daily loss limit check failed: %s", exc)
+
+        # ── Dynamic risk adjustment (advisory) ────────────────────────────────
+        try:
+            _recent_pnl = list(tracker._all_sell_pnls[-10:]) if tracker._all_sell_pnls else []
+            _vol_obj = snapshot.get("volatility")
+            _vol_val = getattr(_vol_obj, "volatility", 0.0) if _vol_obj else 0.0
+            _dyn_risk = adjust_risk_dynamically(
+                base_risk_pct=self.config.risk_per_trade * 100,
+                recent_pnl=_recent_pnl,
+                current_drawdown_pct=drawdown_pct,
+                volatility=_vol_val,
+                win_rate=tracker.win_rate,
+            )
+            if _dyn_risk.scale_factor < 0.8 or _dyn_risk.scale_factor > 1.1:
+                logger.info(
+                    "📉 Dynamic risk adjustment: scale=%.2f× adjusted=%.2f%% (%s)",
+                    _dyn_risk.scale_factor, _dyn_risk.adjusted_risk_pct, _dyn_risk.reason,
+                )
+        except Exception as exc:
+            logger.debug("Dynamic risk adjustment advisory failed: %s", exc)
 
         # ── Anomaly detection ────────────────────────────────────────────────
         candles = snapshot.get("candles", [])
@@ -1332,6 +1408,66 @@ class Trader:
         except Exception:
             pass
 
+        # ── Portfolio rebalancing plan (advisory) ─────────────────────────────
+        # Computes the drift between current and equal-weight target allocations.
+        # The plan is surfaced in main.py's portfolio_analysis log and is NOT
+        # automatically executed — it informs manual or future automated actions.
+        try:
+            if len(positions) >= 2:
+                # Compute IDR value per pair using latest buffered price
+                prices_map: Dict[str, float] = {}
+                for pair in positions:
+                    buf = self._price_history.get(pair, [])
+                    if buf:
+                        prices_map[pair] = buf[-1][1]
+                    else:
+                        prices_map[pair] = positions[pair].avg_cost or 1.0
+                total_value = sum(
+                    positions[p].base_position * prices_map.get(p, 1.0)
+                    for p in positions
+                )
+                if total_value > 0:
+                    current_weights = {
+                        p: (positions[p].base_position * prices_map.get(p, 1.0)) / total_value
+                        for p in positions
+                    }
+                    n = len(positions)
+                    target_weights = {p: 1.0 / n for p in positions}
+                    rebalance = plan_rebalance(
+                        current_weights=current_weights,
+                        target_weights=target_weights,
+                        portfolio_value=total_value,
+                    )
+                    result["rebalance"] = rebalance
+        except Exception:
+            pass
+
+        # ── Correlation matrix ─────────────────────────────────────────────────
+        try:
+            if len(positions) >= 2:
+                assets = list(positions.keys())
+                returns_map: Dict[str, List[float]] = {}
+                for pair in assets:
+                    buf = self._price_history.get(pair, [])
+                    prices = [p for _, p in buf[-30:]]
+                    if len(prices) >= 3:
+                        rets = [
+                            (prices[i] - prices[i - 1]) / prices[i - 1]
+                            for i in range(1, len(prices))
+                            if prices[i - 1] > 0
+                        ]
+                        if rets:
+                            returns_map[pair] = rets
+                usable = [a for a in assets if a in returns_map]
+                if len(usable) >= 2:
+                    corr = compute_correlation_matrix(
+                        assets=usable,
+                        returns_map=returns_map,
+                    )
+                    result["correlation"] = corr
+        except Exception:
+            pass
+
         return result
 
     def _pair_volume(self, pair: str) -> float:
@@ -1358,6 +1494,87 @@ class Trader:
                 except (ValueError, TypeError):
                     pass
         return 0.0
+
+    def get_pair_scan_scores(self) -> Dict[str, float]:
+        """Score all tracked pairs using multi-market scanning functions.
+
+        Builds price-history and volume data from the internal buffer, then
+        applies :func:`~bot.scanning.scan_multiple_markets`,
+        :func:`~bot.scanning.scan_momentum`,
+        :func:`~bot.scanning.scan_trends`,
+        :func:`~bot.scanning.filter_by_volume`, and
+        :func:`~bot.scanning.filter_by_volatility` to produce a composite
+        score per pair.  Higher scores indicate stronger buy opportunities;
+        negative scores indicate weak or bearish conditions.
+
+        Returns an empty dict when no price history is available.
+        """
+        if not self._price_history:
+            return {}
+
+        # Extract price lists from the internal buffer
+        price_hist: Dict[str, List[float]] = {}
+        vol_hist: Dict[str, List[float]] = {}
+        for pair, buf in self._price_history.items():
+            if len(buf) >= 2:
+                price_hist[pair] = [p for _, p in buf]
+                vol_hist[pair] = [self._pair_volume(pair)]
+
+        if not price_hist:
+            return {}
+
+        scores: Dict[str, float] = {}
+
+        # Multi-market composite signal (trend + momentum − volatility)
+        try:
+            for r in scan_multiple_markets(price_hist, min_score=0.0):
+                scores[r.market] = scores.get(r.market, 0.0) + r.score * 0.40
+        except Exception:
+            pass
+
+        # Momentum signal — rate-of-change over recent candles
+        try:
+            for r in scan_momentum(price_hist):
+                if r.signal == "bullish":
+                    scores[r.market] = scores.get(r.market, 0.0) + r.strength * 0.30
+                elif r.signal == "bearish":
+                    scores[r.market] = scores.get(r.market, 0.0) - r.strength * 0.30
+        except Exception:
+            pass
+
+        # Trend signal — fast/slow MA crossover
+        try:
+            for r in scan_trends(price_hist):
+                if r.trend == "uptrend":
+                    scores[r.market] = scores.get(r.market, 0.0) + r.strength * 0.30
+                elif r.trend == "downtrend":
+                    scores[r.market] = scores.get(r.market, 0.0) - r.strength * 0.30
+        except Exception:
+            pass
+
+        # Volume filter — penalise pairs below the configured minimum trading volume.
+        # We have a single-point volume snapshot per pair, so we use the
+        # min_avg_volume threshold rather than a ratio check (ratio with a
+        # single point is always 1.0, making > 1.5 comparisons meaningless).
+        try:
+            for r in filter_by_volume(
+                vol_hist,
+                min_avg_volume=getattr(self.config, "min_volume_idr", 0.0),
+            ):
+                if not r.passed:
+                    scores[r.market] = scores.get(r.market, 0.0) - 0.20
+        except Exception:
+            pass
+
+        # Volatility filter — penalise pairs outside the tradeable range
+        try:
+            for r in filter_by_volatility(price_hist, min_vol=0.0001, max_vol=0.05):
+                if not r.passed:
+                    scores[r.market] = scores.get(r.market, 0.0) - 0.20
+        except Exception:
+            pass
+
+        return scores
 
     def _record_price(self, pair: str, price: float) -> None:
         """Append *(now, price)* to the per-pair pump-detection history buffer.
@@ -2528,21 +2745,6 @@ class Trader:
                     )
                     return result
 
-        # ── Daily loss cap ────────────────────────────────────────────────────
-        if self.config.max_daily_loss_pct > 0 and decision.action == "buy":
-            daily_loss_pct = _tracker.daily_loss_pct(price)
-            if daily_loss_pct >= self.config.max_daily_loss_pct:
-                logger.warning(
-                    "Daily loss cap reached: %.2f%% ≥ %.2f%% — skipping buy",
-                    daily_loss_pct * 100,
-                    self.config.max_daily_loss_pct * 100,
-                )
-                return {
-                    "status": "skipped",
-                    "reason": f"daily_loss_cap {daily_loss_pct:.2%} ≥ {self.config.max_daily_loss_pct:.2%}",
-                    "portfolio": _tracker.as_dict(price),
-                }
-
         # ── Per-coin exposure cap ─────────────────────────────────────────────
         if self.config.max_exposure_per_coin_pct > 0 and decision.action == "buy":
             current_equity = _tracker.snapshot(price).equity
@@ -3287,6 +3489,49 @@ class Trader:
             )
             # Re-enforce the max_affordable ceiling after the adjustment
             effective_amount = min(effective_amount, max_affordable)
+
+        # ── Risk-management position-sizing advisory ──────────────────────────
+        # Cross-check using calculate_position_size (fixed-pct method) and
+        # size_by_volatility (ATR-based).  These are informational only — they
+        # do not override the computed size, but log a debug note when the
+        # risk-module recommendation differs substantially.
+        if decision.action == "buy" and effective_amount > 0:
+            try:
+                _equity_cap = _tracker.effective_capital()
+                _vol_obj = snapshot.get("volatility")
+                _vol_val = getattr(_vol_obj, "volatility", 0.0) if _vol_obj else 0.0
+                _sl_price = (
+                    reference_price * (1.0 - self.config.stop_loss_pct)
+                    if getattr(self.config, "stop_loss_pct", 0.0) > 0
+                    else 0.0
+                )
+                _ps = calculate_position_size(
+                    account_balance=_equity_cap,
+                    risk_per_trade_pct=self.config.risk_per_trade * 100,
+                    entry_price=reference_price,
+                    stop_loss_price=_sl_price,
+                    method="fixed_pct",
+                    volatility=_vol_val,
+                )
+                if _ps.quantity > 0:
+                    logger.debug(
+                        "Position size advisory (fixed-pct): %.8f — %s",
+                        _ps.quantity, _ps.reason,
+                    )
+                candles_snap = snapshot.get("candles", [])
+                if candles_snap and len(candles_snap) >= 2:
+                    _svol = size_by_volatility(
+                        account_balance=_equity_cap,
+                        candles=candles_snap,
+                        risk_pct=self.config.risk_per_trade * 100,
+                    )
+                    if _svol.quantity > 0:
+                        logger.debug(
+                            "Position size advisory (ATR-vol): %.8f (atr=%.8f) — %s",
+                            _svol.quantity, _svol.atr_value, _svol.reason,
+                        )
+            except Exception:
+                pass
 
         if effective_amount <= 0:
             _diag_cash = available_cash if decision.action == "buy" else _tracker.base_position

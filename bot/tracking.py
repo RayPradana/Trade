@@ -98,6 +98,10 @@ class PortfolioTracker:
         self._strategy_stats: Dict[str, Dict] = {}
         self._disabled_strategies: Set[str] = set()
         self.continue_after_target = continue_after_target
+        # Equity history for drawdown monitoring — records realized equity
+        # (principal + realized_pnl) after each completed sell.  Seeded with
+        # the initial capital so check_max_drawdown always has a reference.
+        self._equity_history: List[float] = [initial_capital]
         # Track live pending buy orders (placed but not yet filled) so they can
         # be monitored and persisted.
         self.pending_orders: List[Dict[str, float]] = []
@@ -141,6 +145,16 @@ class PortfolioTracker:
         current_pb = self.profit_buffer
         return max(0.0, (self._peak_profit_buffer - current_pb) / self._peak_profit_buffer)
 
+    @property
+    def equity_history(self) -> List[float]:
+        """Historical realized-equity snapshots after each sell (max 200 entries).
+
+        Each value is ``principal + realized_pnl`` at the moment of a completed
+        sell.  Used by :func:`~bot.risk_management.check_max_drawdown` to
+        compute portfolio drawdown over time.
+        """
+        return list(self._equity_history)
+
     def record_trade(self, action: str, price: float, amount: float) -> None:
         notional = price * amount
         if action == "buy":
@@ -182,6 +196,12 @@ class PortfolioTracker:
             pb = self.profit_buffer
             if pb > self._peak_profit_buffer:
                 self._peak_profit_buffer = pb
+            # Snapshot realized equity for max-drawdown tracking.
+            # Keep at most 200 data points to bound memory usage.
+            _realized_eq = self.principal + self.realized_pnl
+            self._equity_history.append(_realized_eq)
+            if len(self._equity_history) > 200:
+                self._equity_history = self._equity_history[-200:]
             if self.base_position <= 0:
                 self.avg_cost = 0.0
                 self.partial_tp_taken = False
@@ -420,6 +440,10 @@ class PortfolioTracker:
             self.pending_sell_orders = normalised_sell
         else:
             self.pending_sell_orders = []
+        # Restore equity history for drawdown tracking
+        hist = state.get("equity_history")
+        if hist:
+            self._equity_history = [float(v) for v in hist]
         # target/min equity recomputed from initial_capital to keep guard consistent
 
     def stop_reason(self, mark_price: float) -> Optional[str]:
@@ -515,6 +539,7 @@ class PortfolioTracker:
             "disabled_strategies": list(self._disabled_strategies),
             "pending_orders": self.pending_orders,
             "pending_sell_orders": self.pending_sell_orders,
+            "equity_history": list(self._equity_history[-50:]),
         }
 
     # ── Daily loss cap helpers ────────────────────────────────────────────
