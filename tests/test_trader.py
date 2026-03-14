@@ -5114,3 +5114,153 @@ class MultiPositionTraderTest(unittest.TestCase):
         # Default max_loss_pct=10% → floor = 2_700_000
         self.assertLess(snap["min_equity"], initial)
         self.assertGreater(snap["min_equity"], 0.0)
+
+
+class AllocateCapitalMinOrderTests(unittest.TestCase):
+    """Tests that allocate_capital respects min_order_idr to prevent
+    per-position capital from falling below the exchange minimum."""
+
+    def _make_manager(self, capital: float, max_pos: int):
+        from bot.tracking import MultiPositionManager
+        return MultiPositionManager(
+            initial_capital=capital,
+            max_positions=max_pos,
+            target_profit_pct=0.2,
+            max_loss_pct=0.1,
+        )
+
+    def test_allocate_reduces_slots_when_capital_too_thin(self):
+        """With 1M IDR and 55 positions, per-slot = ~18K < 30K.
+        min_order_idr=30K should reduce effective slots to 33 so each gets ~30K."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        t1 = mgr.allocate_capital("ponke_idr", min_order_idr=30_000.0)
+        # max_slots = int(1_000_000 / 30_000) = 33
+        # capital = 1_000_000 / 33 ≈ 30303
+        self.assertGreaterEqual(t1.cash, 30_000.0,
+                                "Per-position capital must be >= min_order_idr")
+
+    def test_allocate_without_min_order_can_be_below_minimum(self):
+        """Without min_order_idr guard, 1M / 55 ≈ 18K which is below 30K."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        t1 = mgr.allocate_capital("ponke_idr")  # no min_order_idr
+        self.assertLess(t1.cash, 30_000.0,
+                        "Without guard, per-position capital may be below 30K")
+
+    def test_allocate_with_min_order_successive_slots(self):
+        """Successive allocations all respect the minimum when using the guard."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        for i in range(5):
+            t = mgr.allocate_capital(f"pair{i}_idr", min_order_idr=30_000.0)
+            self.assertGreaterEqual(t.cash, 30_000.0,
+                                    f"Position {i} capital must be >= 30K")
+
+    def test_allocate_small_capital_single_slot(self):
+        """When capital is only 50K and min is 30K, only 1 slot should be used."""
+        mgr = self._make_manager(50_000.0, 10)
+        t1 = mgr.allocate_capital("btc_idr", min_order_idr=30_000.0)
+        # max_slots = int(50_000/30_000) = 1 → capital = 50_000
+        self.assertAlmostEqual(t1.cash, 50_000.0)
+
+    def test_capital_per_new_position_consistent_with_allocate(self):
+        """capital_per_new_position and allocate_capital should give similar amounts
+        when both use the same min_order_idr."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        suggested = mgr.capital_per_new_position(min_order_idr=30_000.0)
+        t1 = mgr.allocate_capital("btc_idr", min_order_idr=30_000.0)
+        self.assertAlmostEqual(suggested, t1.cash, delta=1.0)
+
+
+class SellRetryExitProtectionTests(unittest.TestCase):
+    """Tests for sell-side retry logic (exit protection)."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_sell_retry_at_lower_price_on_unfilled(self):
+        """When a sell order is placed but not filled, the bot should cancel
+        and retry at a lower (more aggressive) price."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                call_count = len(created)
+                if call_count == 1:
+                    # First sell order: not filled (returns order_id but spend_ponke=0)
+                    return {"success": 1, "return": {"order_id": "99", "spend_ponke": 0}}
+                else:
+                    # Second sell order: filled (returns spend_ponke > 0)
+                    return {"success": 1, "return": {"order_id": "100", "spend_ponke": amount, "receive_idr": price * amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = BotConfig(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+        )
+        trader = Trader(config)
+        trader.client = _Client()
+        # Set up a position so sell is valid
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+
+        snap = {
+            "pair": "ponke_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="sell",
+                confidence=0.9,
+                reason="exit",
+                target_price=100.0,
+                amount=500.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        # The sell should have been retried
+        self.assertGreaterEqual(len(created), 2,
+                                "Sell order should have been retried at aggressive price")
+        # The first order should have been cancelled
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(cancelled[0], "99")
+        # The retry price should be LOWER than original (more aggressive for sell)
+        self.assertLess(created[1]["price"], created[0]["price"])

@@ -648,13 +648,18 @@ class MultiPositionManager:
             if t.base_position > 0 or t.has_pending_buy
         }
 
-    def allocate_capital(self, pair: str) -> PortfolioTracker:
+    def allocate_capital(self, pair: str, min_order_idr: float = 0.0) -> PortfolioTracker:
         """Allocate a capital slice from the cash pool and create a tracker for *pair*.
 
         The slice is computed as ``cash / remaining_open_slots`` so that all
         *max_positions* slots would be filled evenly if taken in sequence.
         If a tracker already exists for *pair* it is returned unchanged (DCA /
         add-to-position path).
+
+        When *min_order_idr* is positive the effective slot count is reduced so
+        that every slot receives at least that amount.  This is consistent with
+        :meth:`capital_per_new_position` and prevents per-position capital from
+        falling below the exchange minimum order value.
 
         :raises ValueError: When *max_positions* is already reached and *pair*
             has no existing tracker.
@@ -673,6 +678,11 @@ class MultiPositionManager:
         # compute remaining slots fairly — prevents over-allocating capital when
         # allocate_capital() is called before base_position > 0.
         remaining_slots = max(1, self.max_positions - len(self._trackers))
+        # Reduce slots if the per-slot allocation would fall below the minimum
+        # order value — mirrors the logic in capital_per_new_position().
+        if min_order_idr > 0 and self.cash > 0:
+            max_slots = max(1, int(self.cash / min_order_idr))
+            remaining_slots = min(remaining_slots, max_slots)
         capital = min(self.cash, self.cash / remaining_slots)
         capital = max(0.0, capital)
         self.cash -= capital

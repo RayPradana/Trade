@@ -3074,7 +3074,7 @@ class Trader:
         # per-pair tracker now so record_trade() has a properly funded account.
         if decision.action == "buy" and self.multi_manager is not None:
             if not self.multi_manager.has_position(_pair):
-                _tracker = self.multi_manager.allocate_capital(_pair)
+                _tracker = self.multi_manager.allocate_capital(_pair, min_order_idr=self.config.min_order_idr)
                 # Tighten effective_amount against the newly allocated cash
                 max_affordable = max(0.0, _tracker.cash / reference_price)
                 effective_amount = min(effective_amount, max_affordable)
@@ -3208,15 +3208,15 @@ class Trader:
             return received
 
         # ── Pre-trade execution quality analysis ─────────────────────────────
-        if decision.action == "buy":
-            _exec_quality = self._check_execution_quality(
-                snapshot, side=decision.action, quantity=effective_amount,
+        _exec_quality = self._check_execution_quality(
+            snapshot, side=decision.action, quantity=effective_amount,
+        )
+        if _exec_quality.get("slippage_warning"):
+            logger.info(
+                "Execution quality warning for %s %s — proceeding with caution",
+                decision.action,
+                snapshot["pair"],
             )
-            if _exec_quality.get("slippage_warning"):
-                logger.info(
-                    "Execution quality warning for %s — proceeding with caution",
-                    snapshot["pair"],
-                )
 
         for amt in staged:
             step_amount = min(amt, remaining_amount)
@@ -3289,6 +3289,51 @@ class Trader:
                         {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
                     )
                     continue
+
+            # ── Exit protection: retry unfilled sell at more aggressive price ──
+            if decision.action == "sell":
+                _sell_order_id = str(
+                    (order_resp.get("return") or {}).get("order_id")
+                    or order_resp.get("order_id")
+                    or ""
+                )
+                _sell_spent = float(
+                    (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                )
+                if _sell_order_id and _sell_spent <= 0:
+                    # Sell order was placed but not filled — cancel and retry
+                    # at a lower (more aggressive) price.
+                    try:
+                        self.client.cancel_order(snapshot["pair"], _sell_order_id, decision.action)
+                        logger.info(
+                            "Cancelled unfilled sell order %s on %s before retrying",
+                            _sell_order_id, snapshot["pair"],
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning(
+                            "Failed to cancel unfilled sell order %s on %s: %s",
+                            _sell_order_id, snapshot["pair"], exc,
+                        )
+
+                    retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct)
+                    retry_price = reference_price
+                    if retry_bump > 0:
+                        retry_price = max(reference_price * (1 - retry_bump), allowed_min)
+                        _fmt_price = getattr(self.client, "format_price", None)
+                        if callable(_fmt_price):
+                            retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+                    if retry_price < reference_price:
+                        logger.info(
+                            "Retrying sell at more aggressive price: %.10f → %.10f (pair=%s)",
+                            reference_price,
+                            retry_price,
+                            snapshot["pair"],
+                        )
+                        order_resp = self.client.create_order(
+                            snapshot["pair"], decision.action, retry_price, step_amount,
+                        )
+                        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                        reference_price = retry_price
 
             step_amount = min(step_amount, received_amount)
             _tracker.record_trade(decision.action, reference_price, step_amount)
