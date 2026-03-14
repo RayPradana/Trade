@@ -964,6 +964,41 @@ def main() -> None:
                 held_snapshot = _held_snapshots.get(held_pair) or trader.analyze_market(held_pair)
                 held_price = held_snapshot["price"]
 
+                # ── Resume pending (unfilled) buy orders ──────────────────
+                # When a buy was placed but never filled, keep adjusting the
+                # price until it IS filled so no order is left hanging.
+                if held_tracker.has_pending_buy and held_tracker.base_position <= 0:
+                    logging.info(
+                        "🔄 %sRESUME%s  %s%s%s  ·  re-attempting pending buy @ Rp %s",
+                        _BOLD, _RESET,
+                        _BOLD, held_pair, _RESET,
+                        f"{held_price:15,.2f}",
+                    )
+                    resume_out = trader.resume_pending_buy(held_snapshot)
+                    if resume_out.get("status") == "resumed":
+                        _entered_position = True
+                        portfolio = trader.portfolio_snapshot(held_pair, held_price)
+                        _log_portfolio(
+                            portfolio,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                        _notify(
+                            config,
+                            f"🔄 PENDING BUY FILLED {held_pair} @ Rp {held_price:,.0f}\n"
+                            f"Amount: {resume_out.get('amount', 0):.8f}",
+                        )
+                    elif resume_out.get("status") in ("cancelled_below_min", "cancelled_zero"):
+                        logging.info(
+                            "❌ Pending buy cancelled for %s: %s",
+                            held_pair, resume_out.get("status"),
+                        )
+                    else:
+                        _still_holding = True
+                    consecutive_errors = 0
+                    continue  # next held pair
+
                 if config.trailing_stop_pct > 0:
                     held_tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
 

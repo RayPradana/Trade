@@ -3479,9 +3479,10 @@ class Trader:
 
                 if received_amount <= 0:
                     logger.info(
-                        "Buy order not filled after %d chase retries (pair=%s) — will re-evaluate",
+                        "Buy order not filled after %d chase retries (pair=%s) — marking pending for resume",
                         _max_chase, snapshot["pair"],
                     )
+                    _tracker.mark_pending_buy(_chase_amount, reference_price)
                     remaining_amount -= _chase_amount
                     executed_steps.append(
                         {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
@@ -4018,6 +4019,169 @@ class Trader:
 
         # Hold the position — let profits run
         return None
+
+    # ------------------------------------------------------------------
+    # Resume pending buy
+    # ------------------------------------------------------------------
+    def resume_pending_buy(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-attempt a pending buy order using fresh orderbook data.
+
+        Called from the monitoring loop when a position has
+        ``has_pending_buy == True`` and ``base_position <= 0`` — i.e. a
+        previous buy was placed but never filled.  The method cancels any
+        stale open orders, reads the current orderbook, and places a new
+        aggressive limit order (at best_ask + bump) using the same chase
+        algorithm.  If the order fills, the pending flag is automatically
+        cleared by :meth:`PortfolioTracker.record_trade`.
+
+        Returns an outcome dict compatible with the main-loop logging.
+        """
+        pair = snapshot["pair"]
+        price = snapshot["price"]
+        _tracker = self._active_tracker(pair)
+
+        if not _tracker.has_pending_buy:
+            return {"status": "no_pending", "pair": pair, "price": price}
+
+        pending = _tracker.pending_orders[-1]  # most recent pending
+        amount = pending["amount"]
+
+        if amount <= 0:
+            _tracker.pending_orders.clear()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_zero", "pair": pair, "price": price}
+
+        # Cancel any stale open orders that may still sit on the book.
+        self._cancel_open_orders(pair, ("buy",))
+
+        if self.config.dry_run:
+            logger.info("DRY-RUN resume-pending-buy %.8f %s @ %s", amount, pair, price)
+            _tracker.record_trade("buy", price, amount)
+            self._persist_after_trade(pair)
+            return {
+                "status": "resumed",
+                "action": "buy",
+                "pair": pair,
+                "price": price,
+                "amount": amount,
+                "portfolio": _tracker.as_dict(price),
+            }
+
+        if self.config.api_key is None:
+            raise ValueError("API credentials required for live trading")
+
+        base_coin = pair.split("_")[0].lower()
+        receive_key = f"receive_{base_coin}"
+
+        # Read fresh orderbook for adaptive pricing.
+        try:
+            depth = self.client.get_depth(pair, count=5)
+            asks = depth.get("sell") or []
+            best_ask = float(asks[0][0]) if asks else price
+        except Exception:
+            best_ask = price
+
+        entry_aggr = max(
+            self.config.entry_retry_aggressiveness_pct,
+            0.001,
+        )
+        retry_price = best_ask * (1 + entry_aggr)
+        _fmt_price = getattr(self.client, "format_price", None)
+        if callable(_fmt_price):
+            retry_price, _ = _fmt_price(pair, retry_price)
+
+        # Per-pair effective minimum.
+        _get_min = getattr(self.client, "get_pair_min_order", None)
+        _min_info = _get_min(pair) if callable(_get_min) else {}
+        _eff_min_idr = max(self.config.min_order_idr, _min_info.get("min_idr", 0.0))
+
+        if _eff_min_idr > 0 and amount * retry_price < _eff_min_idr:
+            logger.info(
+                "Resume pending buy: Rp%.0f below min Rp%.0f — cancelling pending (pair=%s)",
+                amount * retry_price, _eff_min_idr, pair,
+            )
+            _tracker.pending_orders.clear()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+
+        # Pre-order balance for fill verification.
+        pre_balance = 0.0
+        try:
+            acct_info = self.client.get_account_info()
+            balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+            pre_balance = float(balance_dict.get(base_coin) or "0")
+        except Exception:
+            pass
+
+        logger.info(
+            "🔄 Resuming pending buy %.8f %s @ Rp%.2f (pair=%s)",
+            amount, base_coin.upper(), retry_price, pair,
+        )
+        try:
+            order_resp = self.client.create_order(pair, "buy", retry_price, amount)
+        except RuntimeError as exc:
+            _parse_min = getattr(self.client, "parse_minimum_order_error", None)
+            _parsed = _parse_min(str(exc)) if callable(_parse_min) else None
+            if _parsed is not None:
+                logger.warning(
+                    "Resume pending buy hit exchange minimum — cancelling (pair=%s)", pair,
+                )
+                _tracker.pending_orders.clear()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            raise
+        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+
+        received = 0.0
+        try:
+            received = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
+        except (TypeError, ValueError):
+            received = 0.0
+
+        # Fallback: verify balance delta.
+        if received <= 0:
+            try:
+                acct_info = self.client.get_account_info()
+                balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+                actual = float(balance_dict.get(base_coin) or "0")
+                delta = actual - pre_balance
+                if delta > 0:
+                    received = min(amount, delta)
+            except Exception:
+                pass
+
+        if received > 0:
+            _tracker.record_trade("buy", retry_price, received)
+            logger.info(
+                "✅ Pending buy filled: %.8f %s @ Rp%.2f (pair=%s)",
+                received, base_coin.upper(), retry_price, pair,
+            )
+            self._ensure_position_feed(pair)
+            self._persist_after_trade(pair)
+            return {
+                "status": "resumed",
+                "action": "buy",
+                "pair": pair,
+                "price": retry_price,
+                "amount": received,
+                "portfolio": _tracker.as_dict(retry_price),
+            }
+
+        # Still not filled — update pending price, will retry next cycle.
+        _tracker.pending_orders[-1]["price"] = retry_price
+        logger.info(
+            "🔄 Pending buy still unfilled — will retry next cycle (pair=%s)", pair,
+        )
+        return {
+            "status": "pending",
+            "action": "buy",
+            "pair": pair,
+            "price": retry_price,
+            "amount": amount,
+        }
 
     def force_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """Sell the entire open base position at current market price.

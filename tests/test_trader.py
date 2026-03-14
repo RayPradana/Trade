@@ -6124,6 +6124,289 @@ class ChaseAlgorithmTests(unittest.TestCase):
         self.assertGreater(cached.get("min_coin", 0.0), 0.0)
 
 
+class ResumePendingBuyTests(unittest.TestCase):
+    """Tests for the pending buy resume mechanism."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, price, **extra):
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    def test_chase_exhaustion_marks_pending_buy(self):
+        """When all chase retries fail, tracker.has_pending_buy must be True."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": 0, "order_id": "123"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=2, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": "ponke_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=100.0,
+                amount=500.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertTrue(trader.tracker.has_pending_buy,
+                        "Tracker must be marked as pending-buy after chase exhaustion")
+        self.assertEqual(len(trader.tracker.pending_orders), 1)
+
+    def test_resume_pending_buy_fills(self):
+        """resume_pending_buy should fill a pending order and clear the flag."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": str(amount), "order_id": "456"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "500000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Simulate pending buy state
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+        self.assertTrue(trader.tracker.has_pending_buy)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertEqual(result["action"], "buy")
+        self.assertAlmostEqual(result["amount"], 500.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 500.0)
+        self.assertFalse(trader.tracker.has_pending_buy,
+                         "Pending flag should be cleared after successful fill")
+
+    def test_resume_pending_buy_still_unfilled(self):
+        """resume_pending_buy should update price and keep pending if still unfilled."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": "0", "order_id": "789"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "pending")
+        self.assertTrue(trader.tracker.has_pending_buy,
+                        "Pending flag should remain when still unfilled")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+    def test_resume_pending_buy_no_pending(self):
+        """resume_pending_buy should return no_pending when nothing pending."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+        self.assertEqual(result["status"], "no_pending")
+
+    def test_resume_pending_buy_dry_run(self):
+        """In dry_run mode, resume_pending_buy should simulate the fill."""
+        config = self._make_config(dry_run=True)
+        trader = Trader(config)
+
+        trader.tracker.mark_pending_buy(200.0, 50.0)
+        snap = self._make_snap("ponke_idr", 55.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertAlmostEqual(trader.tracker.base_position, 200.0)
+        self.assertFalse(trader.tracker.has_pending_buy)
+
+    def test_resume_pending_buy_below_min_order_cancels(self):
+        """When amount × price < min_order_idr, cancel the pending buy."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["10.0", "1"]], "sell": [["11.0", "1"]]}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 50000.0, "min_coin": 0.0}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(min_order_idr=50000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # amount=2, price≈11 → notional≈22 < 50000 → should cancel
+        trader.tracker.mark_pending_buy(2.0, 10.0)
+        snap = self._make_snap("ponke_idr", 11.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "cancelled_below_min")
+        self.assertFalse(trader.tracker.has_pending_buy,
+                         "Pending buy should be cancelled when below minimum")
+
+    def test_multi_position_pending_buy_appears_in_active_positions(self):
+        """In multi-position mode, a pending buy should appear in active_positions."""
+        config = self._make_config(
+            multi_position_enabled=True,
+            multi_position_max=3,
+        )
+        trader = Trader(config)
+
+        # Allocate and mark pending
+        tracker = trader.multi_manager.allocate_capital("perp_idr", min_order_idr=30000)
+        tracker.mark_pending_buy(100.0, 732.0)
+
+        active = trader.active_positions
+        self.assertIn("perp_idr", active,
+                       "Pair with pending buy should appear in active_positions")
+
+    def test_multi_position_both_filled_both_in_active(self):
+        """Both filled pairs must appear in active_positions."""
+        config = self._make_config(
+            multi_position_enabled=True,
+            multi_position_max=3,
+        )
+        trader = Trader(config)
+
+        t1 = trader.multi_manager.allocate_capital("perp_idr", min_order_idr=30000)
+        t1.record_trade("buy", 732.0, 100.0)
+
+        t2 = trader.multi_manager.allocate_capital("ponke_idr", min_order_idr=30000)
+        t2.record_trade("buy", 50.0, 1000.0)
+
+        active = trader.active_positions
+        self.assertIn("perp_idr", active, "First filled pair must be in active_positions")
+        self.assertIn("ponke_idr", active, "Second filled pair must be in active_positions")
+        self.assertEqual(len(active), 2)
+
+
 class AdaptiveLimitOrderTests(unittest.TestCase):
     """Tests for the adaptive limit order feature."""
 
