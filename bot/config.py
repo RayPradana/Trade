@@ -175,7 +175,8 @@ class BotConfig:
     state_backup_interval: int = 10  # save a backup copy every N scan cycles (0 = disabled)
     # Minimum 24-h IDR trading volume a pair must have to be analysed.
     # Pairs below this threshold are skipped during multi-pair scanning.
-    # Set to 0 to disable the filter (default).
+    # Set to 0 to disable the filter (default for direct instantiation).
+    # from_env() uses 500_000 as the default to filter dead/"koin sepi" pairs.
     min_volume_idr: float = 0.0
     # Optional path to a log file.  When set, every log line is written to
     # both stdout/stderr *and* this file.  Rotation is not handled here;
@@ -260,7 +261,8 @@ class BotConfig:
     # equivalent to the per-coin exposure cap at the portfolio level.
     max_portfolio_risk_pct: float = 0.0
     # Minimum total order-book depth (sum of top-20 bid and ask levels in IDR)
-    # a pair must have before it is analysed.  0 = no filter (default).
+    # a pair must have before it is analysed.  Set to 0 to disable (default
+    # for direct instantiation).  from_env() uses 100_000 as the default.
     min_liquidity_depth_idr: float = 0.0
     # Profit-buffer drawdown protection: stop new buys when the profit buffer
     # has fallen more than this fraction from its all-time peak.
@@ -741,7 +743,7 @@ class BotConfig:
             trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
             state_path=Path(os.getenv("STATE_PATH", "bot_state.json")),
             state_backup_interval=_env_int("STATE_BACKUP_INTERVAL", "10"),
-            min_volume_idr=_env_float("MIN_VOLUME_IDR", "0"),
+            min_volume_idr=_env_float("MIN_VOLUME_IDR", "500000"),
             log_file=os.getenv("LOG_FILE") or None,
             telegram_token=os.getenv("TELEGRAM_TOKEN") or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
@@ -764,7 +766,7 @@ class BotConfig:
             adaptive_interval_enabled=os.getenv("ADAPTIVE_INTERVAL_ENABLED", "false").lower() in {"1", "true", "yes"},
             adaptive_interval_min_seconds=_env_int("ADAPTIVE_INTERVAL_MIN_SECONDS", "30"),
             max_portfolio_risk_pct=_env_float("MAX_PORTFOLIO_RISK_PCT", "0"),
-            min_liquidity_depth_idr=_env_float("MIN_LIQUIDITY_DEPTH_IDR", "0"),
+            min_liquidity_depth_idr=_env_float("MIN_LIQUIDITY_DEPTH_IDR", "100000"),
             profit_buffer_drawdown_pct=_env_float("PROFIT_BUFFER_DRAWDOWN_PCT", "0"),
             trailing_tp_pct=_env_float("TRAILING_TP_PCT", "0.02"),
             conditional_tp_min_trend_strength=_env_float("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0"),

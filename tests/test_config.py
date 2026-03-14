@@ -63,7 +63,7 @@ class NewConfigFieldsTest(TestCase):
         from unittest.mock import patch
         with patch.dict(__import__("os").environ, {}, clear=True):
             cfg = BotConfig.from_env()
-            self.assertEqual(cfg.min_volume_idr, 0.0)
+            self.assertEqual(cfg.min_volume_idr, 500_000.0)
 
     def test_min_volume_idr_from_env(self):
         from unittest.mock import patch
@@ -265,7 +265,7 @@ class NewFeaturesConfigTest(TestCase):
         from unittest.mock import patch
         with patch.dict(__import__("os").environ, {}, clear=True):
             cfg = BotConfig.from_env()
-            self.assertEqual(cfg.min_liquidity_depth_idr, 0.0)
+            self.assertEqual(cfg.min_liquidity_depth_idr, 100_000.0)
 
     def test_liquidity_depth_from_env(self):
         from unittest.mock import patch

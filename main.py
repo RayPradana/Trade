@@ -971,6 +971,39 @@ def main() -> None:
                 # NOTE: We also resume when base_position > 0 — this handles
                 # multi-stage buys where stage 1 filled but stage 2 did not.
                 if held_tracker.has_pending_buy:
+                    # ── Re-analysis gate: check market conditions before resume ──
+                    # If market conditions changed significantly (sell signal or
+                    # strongly unfavorable regime), cancel the pending buy to
+                    # avoid entering a losing position blindly.
+                    _resume_decision = held_snapshot.get("decision")
+                    _resume_regime = held_snapshot.get("regime")
+                    _should_cancel_resume = False
+                    _cancel_reason = ""
+                    if _resume_decision is not None and _resume_decision.action == "sell":
+                        _should_cancel_resume = True
+                        _cancel_reason = f"sell signal ({getattr(_resume_decision, 'reason', '?')[:60]})"
+                    elif (
+                        _resume_regime is not None
+                        and getattr(_resume_regime, "regime", "") == "trending_down"
+                        and getattr(_resume_regime, "strength", 0) >= 0.5
+                    ):
+                        _should_cancel_resume = True
+                        _cancel_reason = f"regime trending_down strength={getattr(_resume_regime, 'strength', 0):.2f}"
+
+                    if _should_cancel_resume and held_tracker.base_position <= 0:
+                        logging.info(
+                            "⚠️ %sRESUME CANCELLED%s  %s%s%s  ·  re-analysis: %s",
+                            _BOLD, _RESET,
+                            _BOLD, held_pair, _RESET,
+                            _cancel_reason,
+                        )
+                        held_tracker.cancel_pending_buy()
+                        if hasattr(trader, 'multi_manager') and trader.multi_manager is not None:
+                            trader.multi_manager.return_position_cash(held_pair)
+                        trader._persist_after_trade(held_pair)
+                        consecutive_errors = 0
+                        continue
+
                     logging.info(
                         "🔄 %sRESUME%s  %s%s%s  ·  re-attempting pending buy @ Rp %s",
                         _BOLD, _RESET,

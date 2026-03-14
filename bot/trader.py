@@ -1845,6 +1845,15 @@ class Trader:
         # an empty list.  analyze_trade_flow will return a neutral result, and
         # _fetch_candles will use the OHLC cache instead.
         _empty_depth: Dict[str, Any] = {"buy": [], "sell": []}
+
+        def _is_usable_depth(d: Optional[Dict[str, Any]]) -> bool:
+            """Return True when the depth dict has actual orderbook data."""
+            if not d:
+                return False
+            buys = d.get("buy") or []
+            sells = d.get("sell") or []
+            return bool(buys or sells)
+
         # Determine the best available realtime snapshot for this pair:
         # 1. Per-pair position feed (started when a position on this pair is opened)
         # 2. Primary realtime feed (only covers self.config.pair)
@@ -1870,11 +1879,18 @@ class Trader:
                 # Prefer real-time WS orderbook from MultiPairFeed; empty only as
                 # last resort so OB signals are never silently neutral.
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
-                depth = _ws_depth or _rt_snap.get("depth") or _empty_depth
+                depth = (
+                    (_ws_depth if _is_usable_depth(_ws_depth) else None)
+                    or (_rt_snap.get("depth") if _is_usable_depth(_rt_snap.get("depth")) else None)
+                    or _empty_depth
+                )
             else:
                 snap_depth = _rt_snap.get("depth")
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
-                depth = snap_depth or _ws_depth
+                depth = (
+                    (snap_depth if _is_usable_depth(snap_depth) else None)
+                    or (_ws_depth if _is_usable_depth(_ws_depth) else None)
+                )
                 if not depth:
                     try:
                         depth = self.client.get_depth(pair, count=200)
@@ -1898,11 +1914,12 @@ class Trader:
             ticker = prefetched_ticker or _multi_ticker or self.client.get_ticker(pair)
             if skip_depth:
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
-                depth = _ws_depth or _empty_depth
+                depth = (_ws_depth if _is_usable_depth(_ws_depth) else None) or _empty_depth
             else:
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
+                _usable_ws = _ws_depth if _is_usable_depth(_ws_depth) else None
                 try:
-                    depth = _ws_depth or self.client.get_depth(pair, count=200)
+                    depth = _usable_ws or self.client.get_depth(pair, count=200)
                 except RuntimeError as exc:
                     if "429" in str(exc):
                         logger.warning(
@@ -2934,6 +2951,40 @@ class Trader:
                     ),
                     "portfolio": _tracker.as_dict(price),
                 }
+
+        # ── Global orderbook quality guard (koin sepi) ────────────────────────
+        # Apply basic orderbook quality checks to ALL coins, not just cheap ones.
+        # Uses the full-depth orderbook (200 levels from analyze_market) rather
+        # than the shallow execution-time depth (5 levels) for accuracy.
+        # Coins with only 1-2 bid levels AND extremely thin bid depth are
+        # unreliable for execution and exits can be impossible.
+        # Gated by small_coin_min_depth_idr to remain configurable.
+        _raw_depth = snapshot.get("raw_depth")
+        if (
+            decision.action == "buy"
+            and top_bid > 0
+            and self.config.small_coin_min_depth_idr > 0
+            and _raw_depth is not None
+        ):
+            _raw_bids = _raw_depth.get("buy") or []
+            _bid_count = len(_raw_bids)
+            if _bid_count < 3:
+                _bid_depth_idr = sum(
+                    float(b[0]) * float(b[1]) for b in _raw_bids
+                ) if _raw_bids else 0.0
+                # Very thin book: fewer than 3 bids AND low depth
+                if _bid_depth_idr < self.config.small_coin_min_depth_idr:
+                    logger.info(
+                        "Koin sepi %s: only %d bid level(s), depth Rp%.0f — skipping buy",
+                        snapshot["pair"], _bid_count, _bid_depth_idr,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            f"koin_sepi {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
+                        ),
+                        "portfolio": _tracker.as_dict(price),
+                    }
 
         # Spread anomaly detection
         if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
@@ -4679,7 +4730,67 @@ class Trader:
                 "portfolio": _tracker.as_dict(retry_price),
             }
 
-        # Still not filled — update pending price, will retry next cycle.
+        # Still not filled — try a market-crossing price before giving up.
+        # This ensures buy orders are actually filled rather than lingering
+        # indefinitely ("harus terisi").
+        if self.config.order_timeout_to_market:
+            _prev_oid = str(
+                (order_resp.get("return") or {}).get("order_id")
+                or order_resp.get("order_id")
+                or ""
+            )
+            if _prev_oid:
+                try:
+                    self.client.cancel_order(pair, _prev_oid, "buy")
+                except Exception:
+                    pass
+            market_price = best_ask * (1 + entry_aggr * 3)
+            if callable(_fmt_price):
+                market_price, _ = _fmt_price(pair, market_price)
+            if market_price > 0 and (_eff_min_idr <= 0 or amount * market_price >= _eff_min_idr):
+                logger.info(
+                    "resume_pending_buy: unfilled — market-price buy at Rp%.2f (pair=%s)",
+                    market_price, pair,
+                )
+                try:
+                    order_resp = self.client.create_order(pair, "buy", market_price, amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    _mkt_received = 0.0
+                    try:
+                        _mkt_received = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    if _mkt_received > 0:
+                        _tracker.record_trade("buy", market_price, _mkt_received)
+                        self._ensure_position_feed(pair)
+                        self._persist_after_trade(pair)
+                        return {
+                            "status": "resumed",
+                            "action": "buy",
+                            "pair": pair,
+                            "price": market_price,
+                            "amount": _mkt_received,
+                            "portfolio": _tracker.as_dict(market_price),
+                        }
+                except RuntimeError as _mkt_exc:
+                    _mkt_exc_str = str(_mkt_exc)
+                    if "Insufficient balance" in _mkt_exc_str:
+                        logger.warning(
+                            "resume_pending_buy: market fallback insufficient balance for %s",
+                            pair,
+                        )
+                    else:
+                        logger.warning(
+                            "resume_pending_buy: market fallback failed for %s: %s",
+                            pair, _mkt_exc,
+                        )
+                except Exception as _mkt_exc:
+                    logger.warning(
+                        "resume_pending_buy: market fallback failed for %s: %s",
+                        pair, _mkt_exc,
+                    )
+
+        # Update pending price, will retry next cycle.
         _tracker.pending_orders[-1]["price"] = retry_price
         logger.info(
             "🔄 Pending buy still unfilled — will retry next cycle (pair=%s)", pair,
@@ -4896,7 +5007,71 @@ class Trader:
                 "portfolio": _tracker.as_dict(retry_price),
             }
 
-        # Still not filled — update pending price, will retry next cycle.
+        # Still not filled — try a market-crossing price before giving up.
+        # This ensures sell orders are actually filled rather than lingering
+        # indefinitely ("harus terisi").
+        if self.config.order_timeout_to_market:
+            _prev_oid = str(
+                (order_resp.get("return") or {}).get("order_id")
+                or order_resp.get("order_id")
+                or ""
+            )
+            if _prev_oid:
+                try:
+                    self.client.cancel_order(pair, _prev_oid, "sell")
+                except Exception:
+                    pass
+            market_price = best_bid * (1 - entry_aggr * 3)
+            if callable(_fmt_price):
+                market_price, _ = _fmt_price(pair, market_price)
+            if market_price > 0 and (_eff_min_idr <= 0 or amount * market_price >= _eff_min_idr):
+                logger.info(
+                    "resume_pending_sell: unfilled — market-price sell at Rp%.2f (pair=%s)",
+                    market_price, pair,
+                )
+                try:
+                    order_resp = self.client.create_order(pair, "sell", market_price, amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    _mkt_spent = 0.0
+                    try:
+                        _mkt_spent = float((order_resp.get("return") or {}).get(spend_key) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    if _mkt_spent > 0:
+                        _tracker.record_trade("sell", market_price, _mkt_spent)
+                        remaining_sell = amount - _mkt_spent
+                        if remaining_sell > 0 and _tracker.base_position > 0:
+                            _tracker.mark_pending_sell(remaining_sell, market_price)
+                            self._persist_after_trade(pair)
+                            return {
+                                "status": "partial",
+                                "action": "sell",
+                                "pair": pair,
+                                "price": market_price,
+                                "amount": _mkt_spent,
+                                "remaining": remaining_sell,
+                                "portfolio": _tracker.as_dict(market_price),
+                            }
+                        if self.multi_manager is not None and _tracker.base_position <= 0:
+                            self.multi_manager.return_position_cash(pair)
+                        if _tracker.base_position <= 0:
+                            self._remove_position_feed(pair)
+                        self._persist_after_trade(pair)
+                        return {
+                            "status": "resumed",
+                            "action": "sell",
+                            "pair": pair,
+                            "price": market_price,
+                            "amount": _mkt_spent,
+                            "portfolio": _tracker.as_dict(market_price),
+                        }
+                except Exception as _mkt_exc:
+                    logger.warning(
+                        "resume_pending_sell: market fallback failed for %s: %s",
+                        pair, _mkt_exc,
+                    )
+
+        # Update pending price, will retry next cycle.
         _tracker.pending_sell_orders[-1]["price"] = retry_price
         logger.info(
             "🔄 Pending sell still unfilled — will retry next cycle (pair=%s)", pair,
@@ -5296,7 +5471,10 @@ class Trader:
                 continue
 
         # ── Market fallback if chase exhausted ───────────────────────────────
-        if sold_amount <= 0 and self.config.order_timeout_to_market:
+        # Use market fallback for ANY remaining unsold amount (not just when
+        # nothing was sold).  This ensures TP-triggered sells and force-sells
+        # are fully completed instead of being left as pending_sell.
+        if _chase_amount > 0 and self.config.order_timeout_to_market:
             _prev_oid = str(
                 (order_resp.get("return") or {}).get("order_id")
                 or order_resp.get("order_id")
