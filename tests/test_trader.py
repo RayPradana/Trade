@@ -3551,7 +3551,9 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         self.assertNotIn("cast_idr", trader._pair_last_trade)
 
     def test_all_staged_steps_individually_below_min_after_split(self):
-        """When total passes pre-check but every staged split is below min, must skip."""
+        """When total passes pre-check but individual staged splits would be
+        below min, the staging must collapse to a single step so the trade
+        executes instead of being needlessly skipped."""
         from bot.analysis import VolatilityStats
         # min_order_idr = 30000, price = 100
         # decision.amount = 400 → effective_amount capped at min(400, cash/100)
@@ -3559,6 +3561,7 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         # total IDR = 400 × 100 = 40000 > 30000 (passes pre-check)
         # staged fractions with vol=0.015, conf=0.5: [0.6, 0.4]
         # step1 = 240 × 100 = 24000 < 30000, step2 = 160 × 100 = 16000 < 30000
+        # → collapse to single step [400] → 40000 ≥ 30000 → executes
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=30000,
@@ -3595,8 +3598,89 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
             ),
         }
         outcome = trader.maybe_execute(snap)
-        self.assertEqual(outcome["status"], "skipped")
-        self.assertIn("all_steps_below_min_order", outcome["reason"])
+        # The staged entry collapses to a single step, so the trade executes.
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertEqual(len(outcome["executed_steps"]), 1,
+                         "collapsed staging should produce exactly 1 step")
+
+
+class StagedCollapseTests(unittest.TestCase):
+    """Tests for _collapse_staged_if_needed and staged entry min-order logic."""
+
+    def test_collapse_when_any_step_below_min(self):
+        """Staged amounts collapse to single step when a step is below minimum."""
+        staged = [1.5, 0.9, 0.6]  # at price 100 → [150, 90, 60] IDR
+        result = Trader._collapse_staged_if_needed(staged, 3.0, 100.0, 100.0)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], 3.0)
+
+    def test_no_collapse_when_all_above_min(self):
+        """When every step is above minimum, staging is preserved."""
+        staged = [5.0, 3.0, 2.0]  # at price 100 → [500, 300, 200] IDR
+        result = Trader._collapse_staged_if_needed(staged, 10.0, 100.0, 100.0)
+        self.assertEqual(result, staged)
+
+    def test_no_collapse_single_step(self):
+        """Single-step staging is always returned as-is."""
+        staged = [3.0]
+        result = Trader._collapse_staged_if_needed(staged, 3.0, 100.0, 100.0)
+        self.assertEqual(result, [3.0])
+
+    def test_no_collapse_min_order_zero(self):
+        """When min_order_idr is 0, no collapse occurs."""
+        staged = [0.01, 0.005, 0.003]
+        result = Trader._collapse_staged_if_needed(staged, 0.018, 100.0, 0.0)
+        self.assertEqual(result, staged)
+
+    def test_collapse_empty(self):
+        """Empty staged list returns empty."""
+        result = Trader._collapse_staged_if_needed([], 0.0, 100.0, 30000.0)
+        self.assertEqual(result, [])
+
+    def test_staged_entry_collapse_prevents_skip_dry_run(self):
+        """A borderline-sized order that would fail in multiple stages
+        should succeed as a single step after collapse (dry-run mode)."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_order_idr=30000,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            max_slippage_pct=0.05,
+        )
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["4999", "1"]], "sell": [["5001", "1"]]},
+        })()
+        # price=5000, amount=10 → total=50,000 IDR > 30K
+        # staged [0.5, 0.3, 0.2] = [25K, 15K, 10K] — all below 30K
+        # collapse → single step [50K] → executes
+        from bot.analysis import VolatilityStats
+        snap = {
+            "pair": "borderline_idr",
+            "price": 5000.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": VolatilityStats(volatility=0.03, avg_volume=1000.0),
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.5,
+                reason="test-borderline",
+                target_price=5000.0,
+                amount=10.0,
+                stop_loss=4500.0,
+                take_profit=5500.0,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertEqual(len(outcome["executed_steps"]), 1)
 
 
 class WhaleTrackingTests(unittest.TestCase):

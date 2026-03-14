@@ -1683,7 +1683,7 @@ class Trader:
         # individual staged tranches don't fall below the exchange minimum
         # order size and cause the entire trade to be skipped.
         min_eq = self.config.staged_entry_min_equity
-        if min_eq > 0 and self.tracker.cash < min_eq:
+        if min_eq > 0 and self.tracker.cash <= min_eq:
             max_steps = 1
 
         if volatility < 0.01 and confidence >= 0.75:
@@ -1713,6 +1713,27 @@ class Trader:
             return [effective_amount]
         scale = effective_amount / decision_amount
         return [max(0.0, amt * scale) for amt in staged]
+
+    @staticmethod
+    def _collapse_staged_if_needed(
+        staged: List[float],
+        effective_amount: float,
+        price: float,
+        min_order_idr: float,
+    ) -> List[float]:
+        """Collapse staged entry to a single step when any step falls below
+        the exchange minimum order value.
+
+        This prevents the situation where a borderline-size order is split
+        into multiple stages that each individually fall below the minimum,
+        causing every stage to be skipped even though the *total* order would
+        have been accepted.
+        """
+        if len(staged) <= 1 or price <= 0 or min_order_idr <= 0:
+            return staged
+        if any(s * price < min_order_idr for s in staged if s > 0):
+            return [effective_amount] if effective_amount > 0 else []
+        return staged
 
     def analyze_market(
         self,
@@ -3043,6 +3064,7 @@ class Trader:
             }
 
         staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
+        staged = self._collapse_staged_if_needed(staged, effective_amount, reference_price, self.config.min_order_idr)
 
         if not self._validate_balance(snapshot["pair"], decision.action, effective_amount, reference_price):
             return {"status": "skipped", "reason": "balance_check_failed", "portfolio": _tracker.as_dict(price)}
@@ -3058,6 +3080,7 @@ class Trader:
                 effective_amount = min(effective_amount, max_affordable)
                 # Re-derive staged after adjustment
                 staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
+                staged = self._collapse_staged_if_needed(staged, effective_amount, reference_price, self.config.min_order_idr)
 
         _pre_trade_avg_cost = _tracker.avg_cost
 
