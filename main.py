@@ -999,6 +999,47 @@ def main() -> None:
                     consecutive_errors = 0
                     continue  # next held pair
 
+                # ── Resume pending (unfilled) sell orders ─────────────────
+                # When a sell was placed but never filled, keep adjusting the
+                # price until it IS filled so no order is left hanging.
+                if getattr(held_tracker, "has_pending_sell", False):
+                    logging.info(
+                        "🔄 %sRESUME SELL%s  %s%s%s  ·  re-attempting pending sell @ Rp %s",
+                        _BOLD, _RESET,
+                        _BOLD, held_pair, _RESET,
+                        f"{held_price:15,.2f}",
+                    )
+                    resume_sell_out = trader.resume_pending_sell(held_snapshot)
+                    if resume_sell_out.get("status") == "resumed":
+                        portfolio = held_tracker.as_dict(held_price)
+                        logging.info(
+                            "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s",
+                            _DIM, _RESET,
+                            _BOLD, resume_sell_out.get("amount", 0), _RESET,
+                            f"{held_price:15,.2f}",
+                        )
+                        _log_portfolio(
+                            portfolio,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                        _notify(
+                            config,
+                            f"🔄 PENDING SELL FILLED {held_pair} @ Rp {held_price:,.0f}\n"
+                            f"Amount: {resume_sell_out.get('amount', 0):.8f}\n"
+                            f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
+                        )
+                    elif resume_sell_out.get("status") in ("cancelled_below_min", "cancelled_zero", "no_position"):
+                        logging.info(
+                            "❌ Pending sell cancelled for %s: %s",
+                            held_pair, resume_sell_out.get("status"),
+                        )
+                    else:
+                        _still_holding = True
+                    consecutive_errors = 0
+                    continue  # next held pair
+
                 if config.trailing_stop_pct > 0:
                     held_tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
 
@@ -1158,6 +1199,19 @@ def main() -> None:
                         exit_reason,
                     )
                     force_outcome = trader.force_sell(held_snapshot)
+
+                    # When force_sell returns pending_sell, the order was not
+                    # filled — keep the position active for resume on next cycle.
+                    if force_outcome.get("status") == "pending_sell":
+                        logging.info(
+                            "🔄 %sPENDING SELL%s  %s%s%s  ·  sell not filled — will retry next cycle",
+                            _BOLD, _RESET,
+                            _BOLD, held_pair, _RESET,
+                        )
+                        _still_holding = True
+                        consecutive_errors = 0
+                        continue
+
                     portfolio = held_tracker.as_dict(held_price)
                     logging.info(
                         "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s",
@@ -1330,11 +1384,17 @@ def main() -> None:
                 _stop_pair = snapshot["pair"]
                 if trader._active_tracker(_stop_pair).base_position > 0:
                     force_outcome = trader.force_sell(snapshot)
-                    logging.info(
-                        "   📤 Force-sold : %s%.8f%s coin  ·  Rp %s",
-                        _BOLD, force_outcome.get("amount", 0), _RESET,
-                        f"{force_outcome.get('price', 0):15,.2f}",
-                    )
+                    if force_outcome.get("status") == "pending_sell":
+                        logging.info(
+                            "🔄 %sPENDING SELL%s  %s  — sell not filled, will retry next cycle",
+                            _BOLD, _RESET, _stop_pair,
+                        )
+                    else:
+                        logging.info(
+                            "   📤 Force-sold : %s%.8f%s coin  ·  Rp %s",
+                            _BOLD, force_outcome.get("amount", 0), _RESET,
+                            f"{force_outcome.get('price', 0):15,.2f}",
+                        )
                 # Re-compute portfolio after any liquidation
                 portfolio = trader._active_tracker(_stop_pair).as_dict(snapshot["price"])
                 logging.info(
