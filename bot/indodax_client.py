@@ -63,8 +63,8 @@ class IndodaxClient:
         self._last_public_request: float = 0.0
         # Per-pair minimum order cache:
         #   keys are pair names (e.g. "btc_idr")
-        #   values are dicts with "min_coin" (min base currency amount)
-        #   and "min_idr" (min IDR value).
+        #   values are dicts with "min_coin" (min traded/coin amount)
+        #   and "min_idr" (min base/IDR value).
         self._pair_min_order: Dict[str, Dict[str, float]] = {}
         # TTL for the pair-minimum-order cache.  Defaults to 3600 s (1 hour).
         # Indodax rarely changes minimum order requirements, but a TTL ensures
