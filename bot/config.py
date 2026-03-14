@@ -124,7 +124,7 @@ class BotConfig:
     # ── Professional Order Execution ──────────────────────────────────────────
     # Chase algorithm: max retries following price when order is not filled.
     # Each retry re-reads the orderbook and adjusts the limit price.
-    # 0 = fall back to legacy single-retry behaviour.
+    # 0 = fall back to legacy single-retry behaviour.  Recommended: 1–5.
     chase_max_retries: int = 3
     # After all chase retries are exhausted, convert the unfilled remainder to
     # a market-price order so the bot does not miss the move entirely.
