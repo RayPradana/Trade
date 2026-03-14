@@ -683,8 +683,8 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(order_type, "sell")
         self.assertAlmostEqual(amount, 5.0)
 
-    def test_force_sell_below_minimum_keeps_position(self) -> None:
-        """When sell value is below min IDR, force_sell must keep the position instead of clearing dust."""
+    def test_force_sell_below_minimum_clears_dust(self) -> None:
+        """When sell value is below min IDR, force_sell must clear the dust position."""
 
         class _LiveClient(GuardedTrader._Client):
             cancel_called = False
@@ -728,10 +728,9 @@ class TraderSelectionTests(unittest.TestCase):
 
         outcome = trader.force_sell(snapshot)
 
-        self.assertEqual(outcome["status"], "below_minimum")
-        # Position must be preserved for monitoring
-        self.assertAlmostEqual(trader.tracker.base_position, 2.27518843, places=8)
-        self.assertFalse(_LiveClient.cancel_called)
+        self.assertEqual(outcome["status"], "dust_cleared")
+        # Position must be cleared since it's unsellable dust
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0, places=8)
         self.assertFalse(_LiveClient.order_called)
 
     def test_analyze_with_retry_succeeds_after_429(self) -> None:
@@ -3965,6 +3964,58 @@ class ForceSellDustTests(unittest.TestCase):
         outcome = trader.force_sell(snapshot)
         self.assertEqual(outcome["status"], "dust_cleared")
         self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+
+    def test_force_sell_clears_dust_idr_below_config_min_without_api_call(self) -> None:
+        """When sell IDR value is below config min_order_idr, force_sell must clear
+        dust without making an API call — even when per-pair min is not cached."""
+
+        class _LiveClient(GuardedTrader._Client):
+            order_placed = False
+
+            def get_account_info(self):
+                return {"return": {"balance": {"perp": "0.1", "idr": "1000000"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["14210", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                _LiveClient.order_placed = True
+                raise RuntimeError("Should not reach create_order")
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+            min_order_idr=30_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        # Position: 0.1 PERP @ 14,210 IDR → value ≈ Rp1421 < Rp30,000
+        trader.tracker.record_trade("buy", 14_210.0, 0.1)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="trailing_tp_triggered",
+            target_price=14_210.0,
+            amount=0.1,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "perp_idr", "price": 14_210.0, "decision": decision}
+
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "dust_cleared")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        # Must not have attempted the API call
+        self.assertFalse(_LiveClient.order_placed)
 
 
 class RiskHoldCancellationTests(unittest.TestCase):

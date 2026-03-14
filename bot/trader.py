@@ -4105,11 +4105,11 @@ class Trader:
         is_below_coin_min = min_coin_per_pair > 0 and amount < min_coin_per_pair
         is_below_idr_min = effective_min_idr > 0 and sell_idr_value < effective_min_idr
 
-        # ── Dust check (coin + IDR) ─────────────────────────────────────
-        # When both the coin amount and the IDR value are below their
-        # respective minimums, the position is truly unsellable dust —
-        # clear it so the bot can move on.
-        if is_below_coin_min and is_below_idr_min:
+        # ── Dust check (IDR value below minimum) ────────────────────────
+        # When the IDR value is below the effective minimum, the position
+        # is unsellable dust — clear it so the bot can move on without
+        # making an API call that would always be rejected by the exchange.
+        if is_below_idr_min:
             logger.warning(
                 "force_sell: amount %.8f %s (Rp %.0f) is below exchange minimums "
                 "(min_coin=%.8f, min_idr=%.0f) — clearing dust position",
@@ -4132,28 +4132,6 @@ class Trader:
             }
             self._persist_after_trade(pair)
             return outcome
-
-        # ── IDR-level minimum check (exchange-reported) ──────────────────
-        # When the exchange has a per-pair IDR minimum and the sell value
-        # is below it, keep the position for monitoring rather than
-        # discarding it — the position may grow or be aggregated later.
-        if min_idr_per_pair > 0 and sell_idr_value < min_idr_per_pair:
-            logger.warning(
-                "force_sell: sell amount %.8f %s (Rp %.0f) is below exchange minimum "
-                "(min_idr=%.0f) — skipping sell and keeping position to monitor",
-                amount,
-                pair.split("_")[0].upper(),
-                sell_idr_value,
-                min_idr_per_pair,
-            )
-            return {
-                "status": "below_minimum",
-                "pair": pair,
-                "price": reference_price,
-                "amount": amount,
-                "min_idr": min_idr_per_pair,
-                "portfolio": _tracker.as_dict(reference_price),
-            }
 
         # ── Place the sell order ─────────────────────────────────────────────
         try:
