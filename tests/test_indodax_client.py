@@ -41,27 +41,36 @@ class IndodaxClientPrecisionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = _DummyClient()
 
-    def test_idr_price_defaults_to_integer_when_no_increment_cache(self):
+    def test_limit_buy_idr_pair_sends_coin_amount_only(self):
+        """Per API docs: limit buy must send coin amount, NOT idr."""
         resp = self.client.create_order("dupe_idr", "buy", 146.1234, 100)
         self.assertEqual(resp["price"], "146")
-        # IDR total should use the rounded price
-        self.assertEqual(resp["idr"], "14600")
-        # IDR buys should also include base coin quantity
+        # Limit buy on IDR pair: coin amount only, no idr field.
         self.assertEqual(resp["dupe"], "100.00000000")
-        self.assertEqual(resp["amount"], "100.00000000")
+        self.assertNotIn("idr", resp)
+        self.assertNotIn("amount", resp)
+
+    def test_market_buy_idr_pair_sends_idr_only(self):
+        """Per API docs: market buy only supports idr amount."""
+        resp = self.client.create_order("dupe_idr", "buy", 146.1234, 100, order_kind="market")
+        self.assertEqual(resp["idr"], "14600")
+        self.assertNotIn("dupe", resp)
+        self.assertNotIn("amount", resp)
 
     def test_non_idr_price_keeps_eight_decimals(self):
         resp = self.client.create_order("btc_usdt", "sell", 12345.67890123, 0.1)
         self.assertEqual(resp["price"], "12345.67890123")
-        self.assertEqual(resp["amount"], "0.10000000")
         self.assertEqual(resp["btc"], "0.10000000")
+        self.assertNotIn("amount", resp)
 
     def test_price_uses_increment_when_cached(self):
         self.client._price_increments = {"dupe_idr": "0.01"}
         self.client._price_increments_expires = time.time() + 3600
+        # Limit buy: coin amount, no idr
         resp = self.client.create_order("dupe_idr", "buy", 146.1234, 10)
         self.assertEqual(resp["price"], "146.12")
-        self.assertEqual(resp["idr"], "1461")
+        self.assertEqual(resp["dupe"], "10.00000000")
+        self.assertNotIn("idr", resp)
 
     def test_client_order_id_and_time_in_force_pass_through(self):
         resp = self.client.create_order(
@@ -74,6 +83,25 @@ class IndodaxClientPrecisionTest(unittest.TestCase):
         )
         self.assertEqual(resp["client_order_id"], "clientx-123")
         self.assertEqual(resp["time_in_force"], "GTC")
+
+    def test_integer_amount_precision_for_whole_number_coins(self):
+        """Coins with integer trade_min_traded_currency must format amount without decimals."""
+        # Simulate a pair that requires integer amounts (e.g. low-price token)
+        self.client._amount_precisions["token_idr"] = 0
+        resp = self.client.create_order("token_idr", "sell", 5, 150.7)
+        self.assertEqual(resp["token"], "151")
+        self.assertNotIn("amount", resp)
+
+    def test_amount_precision_default_eight_decimals(self):
+        """Without cached precision, amounts default to 8 decimal places."""
+        resp = self.client.create_order("btc_idr", "sell", 500000000, 0.00123456)
+        self.assertEqual(resp["btc"], "0.00123456")
+
+    def test_explicit_idr_override_still_works(self):
+        """Passing idr= explicitly should still send idr (backward compat)."""
+        resp = self.client.create_order("btc_idr", "buy", 500000000, 0.001, idr=500000)
+        self.assertEqual(resp["idr"], "500000")
+        self.assertNotIn("btc", resp)
 
 
 class IndodaxClientNewEndpointsTest(unittest.TestCase):
@@ -160,6 +188,109 @@ class IndodaxClientNewEndpointsTest(unittest.TestCase):
             def json(self): return {"data": [{"orderId": "123"}]}
         result = IndodaxClient._handle_v2_response(_Resp())
         self.assertEqual(result["data"][0]["orderId"], "123")
+
+
+class IndodaxClientAmountPrecisionTest(unittest.TestCase):
+    """Tests for per-pair amount precision (format_amount, load_pair_min_orders)."""
+
+    def test_format_amount_defaults_to_eight_decimals(self):
+        """Without cached precision, format_amount uses 8 decimal places."""
+        client = _DummyClient()
+        amt, prec = client.format_amount("btc_idr", 0.001234567890)
+        self.assertEqual(prec, 8)
+        self.assertAlmostEqual(amt, 0.00123457, places=8)
+
+    def test_format_amount_integer_precision(self):
+        """Coins with precision 0 must return integer amounts."""
+        client = _DummyClient()
+        client._amount_precisions["token_idr"] = 0
+        amt, prec = client.format_amount("token_idr", 150.7)
+        self.assertEqual(prec, 0)
+        self.assertEqual(amt, 151.0)
+
+    def test_load_pair_min_orders_derives_amount_precision(self):
+        """load_pair_min_orders should set precision 0 for integer min coins."""
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        client._amount_precisions = {}
+
+        # Per Indodax /api/pairs docs:
+        #   trade_min_base_currency = minimum IDR value
+        #   trade_min_traded_currency = minimum COIN amount
+        pairs_data = [
+            {
+                "id": "btcidr",
+                "ticker_id": "btc_idr",
+                "trade_min_base_currency": "50000",
+                "trade_min_traded_currency": "0.0001",
+            },
+            {
+                "id": "tokenidr",
+                "ticker_id": "token_idr",
+                "trade_min_base_currency": "10000",
+                "trade_min_traded_currency": "1",
+            },
+            {
+                "id": "dogeidr",
+                "ticker_id": "doge_idr",
+                "trade_min_base_currency": "5000",
+                "trade_min_traded_currency": "100",
+            },
+        ]
+        client.load_pair_min_orders(pairs_data)
+
+        # BTC: trade_min_traded_currency=0.0001 (fractional) → 8 decimals
+        self.assertEqual(client._amount_precisions["btcidr"], 8)
+        self.assertEqual(client._amount_precisions["btc_idr"], 8)
+
+        # TOKEN: trade_min_traded_currency=1 (integer) → 0 decimals
+        self.assertEqual(client._amount_precisions["tokenidr"], 0)
+        self.assertEqual(client._amount_precisions["token_idr"], 0)
+
+        # DOGE: trade_min_traded_currency=100 (integer) → 0 decimals
+        self.assertEqual(client._amount_precisions["dogeidr"], 0)
+        self.assertEqual(client._amount_precisions["doge_idr"], 0)
+
+    def test_load_pair_min_orders_stores_under_both_key_formats(self):
+        """Cache should be accessible via both 'btcidr' and 'btc_idr' keys."""
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        client._amount_precisions = {}
+
+        pairs_data = [
+            {
+                "id": "btcidr",
+                "ticker_id": "btc_idr",
+                "trade_min_base_currency": "50000",
+                "trade_min_traded_currency": "0.0001",
+            },
+        ]
+        client.load_pair_min_orders(pairs_data)
+
+        # Both key formats should exist in the cache
+        self.assertIn("btcidr", client._pair_min_order)
+        self.assertIn("btc_idr", client._pair_min_order)
+        # trade_min_traded_currency → min_idr in the existing code mapping
+        self.assertAlmostEqual(client._pair_min_order["btc_idr"]["min_idr"], 0.0001)
+        # Amount precision should also be stored under both keys
+        self.assertEqual(client._amount_precisions["btc_idr"], 8)
+        self.assertEqual(client._amount_precisions["btcidr"], 8)
+
+    def test_create_order_sell_integer_amount_coin(self):
+        """Sell order for integer-amount coin must not have decimals."""
+        client = _DummyClient()
+        client._amount_precisions["doge_idr"] = 0
+        resp = client.create_order("doge_idr", "sell", 5, 1500)
+        self.assertEqual(resp["doge"], "1500")
+        self.assertNotIn(".", resp["doge"])
+
+    def test_create_order_buy_integer_amount_coin(self):
+        """Limit buy for integer-amount coin must not have decimals."""
+        client = _DummyClient()
+        client._amount_precisions["doge_idr"] = 0
+        resp = client.create_order("doge_idr", "buy", 5, 1500)
+        self.assertEqual(resp["doge"], "1500")
+        self.assertNotIn("idr", resp)
 
 
 if __name__ == "__main__":

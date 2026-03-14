@@ -297,6 +297,7 @@ class LoadPairMinOrdersFromDataTests(unittest.TestCase):
 
         client = IndodaxClient.__new__(IndodaxClient)
         client._pair_min_order = {}
+        client._amount_precisions = {}
         client.session = None  # Would explode if used
         client.base_url = "https://indodax.com"
         client.timeout = 10
@@ -322,6 +323,7 @@ class LoadPairMinOrdersFromDataTests(unittest.TestCase):
 
         client = IndodaxClient.__new__(IndodaxClient)
         client._pair_min_order = {}
+        client._amount_precisions = {}
         client.session = None
         client.base_url = "https://indodax.com"
         client.timeout = 10
@@ -338,6 +340,7 @@ class LoadPairMinOrdersFromDataTests(unittest.TestCase):
 
         client = IndodaxClient.__new__(IndodaxClient)
         client._pair_min_order = {}
+        client._amount_precisions = {}
 
         rest_calls = []
 

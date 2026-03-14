@@ -71,6 +71,11 @@ class IndodaxClient:
         # the cache is eventually refreshed when the bot runs for multiple days.
         self._pair_min_order_cache_ttl: float = 3600.0
         self._pair_min_order_expires: float = 0.0
+        # Per-pair amount precision cache.  Derived from ``trade_min_traded_currency``
+        # in ``/api/pairs``.  Coins whose minimum is an integer (e.g. 1, 100) require
+        # integer amounts (precision 0), while fractional minimums (e.g. 0.0001)
+        # imply 8-decimal precision.  Used by :meth:`format_amount`.
+        self._amount_precisions: Dict[str, int] = {}
         # Price increment cache (tick size per pair) from /api/price_increments.
         # keys are pair names (e.g. "btc_idr"), values are Decimal-compatible strings.
         self._price_increments: Dict[str, str] = {}
@@ -131,6 +136,12 @@ class IndodaxClient:
         populates :attr:`_pair_min_order` for quick lookup before order
         placement so that "Minimum order" errors are prevented proactively.
 
+        Also derives per-pair **amount precision** from
+        ``trade_min_traded_currency``: coins whose minimum is an integer
+        (e.g. ``1``, ``100``) require integer amounts (precision ``0``),
+        while fractional minimums (e.g. ``0.0001``) allow up to 8 decimals.
+        This prevents the Indodax API error *"amount can't be in decimal."*
+
         :param pairs_info: Optional pre-fetched ``/api/pairs`` response data.
             When provided the cache is populated from this list *without*
             making an additional REST call.  Pass the data that was already
@@ -155,6 +166,9 @@ class IndodaxClient:
             pair_id = (info.get("id") or info.get("pair_id") or "").lower().replace("/", "_")
             if not pair_id:
                 continue
+            # Also store under the ticker_id key (e.g. "btc_idr") so that
+            # lookups from the trade API (which uses underscore format) work.
+            ticker_id = (info.get("ticker_id") or "").lower()
             try:
                 min_coin = float(info.get("trade_min_base_currency") or 0)
             except (TypeError, ValueError):
@@ -163,7 +177,27 @@ class IndodaxClient:
                 min_idr = float(info.get("trade_min_traded_currency") or 0)
             except (TypeError, ValueError):
                 min_idr = 0.0
-            self._pair_min_order[pair_id] = {"min_coin": min_coin, "min_idr": min_idr}
+            entry = {"min_coin": min_coin, "min_idr": min_idr}
+            self._pair_min_order[pair_id] = entry
+            if ticker_id and ticker_id != pair_id:
+                self._pair_min_order[ticker_id] = entry
+
+            # Derive amount precision from trade_min_traded_currency.
+            # Per Indodax API docs, trade_min_traded_currency is the minimum
+            # quantity of the *coin* (e.g. 0.0001 BTC, 100 DOGE).
+            # If this minimum is a whole number the exchange rejects fractional
+            # amounts ("amount can't be in decimal.") → precision 0.
+            # Otherwise default to 8 decimals (standard crypto precision).
+            amt_precision = 8  # default for fractional coins (BTC, ETH, etc.)
+            try:
+                min_traded = float(info.get("trade_min_traded_currency") or 0)
+            except (TypeError, ValueError):
+                min_traded = 0.0
+            if min_traded > 0 and float(int(min_traded)) == min_traded:
+                amt_precision = 0
+            self._amount_precisions[pair_id] = amt_precision
+            if ticker_id and ticker_id != pair_id:
+                self._amount_precisions[ticker_id] = amt_precision
             loaded += 1
         logger.info("load_pair_min_orders: cached minimum orders for %d pairs", loaded)
         ttl = getattr(self, "_pair_min_order_cache_ttl", 3600.0)
@@ -393,6 +427,22 @@ class IndodaxClient:
 
         return quantized_price, precision
 
+    def format_amount(self, pair: str, amount: float) -> Tuple[float, int]:
+        """Round *amount* to the precision expected by the exchange for *pair*.
+
+        Some Indodax coins (typically low-price tokens) only accept integer
+        amounts.  The precision is derived from the ``trade_min_traded_currency``
+        field cached by :meth:`load_pair_min_orders`.  Returns the (possibly
+        rounded) amount plus the decimal precision for string formatting.
+
+        If no pair info is cached, defaults to 8 decimal places — the standard
+        crypto precision that works for most pairs.
+        """
+        precision = self._amount_precisions.get(pair.lower(), 8)
+        if precision == 0:
+            return float(round(amount)), 0
+        return round(amount, precision), precision
+
     def create_order(
         self,
         pair: str,
@@ -406,13 +456,26 @@ class IndodaxClient:
         idr: Optional[float] = None,
         btc: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Place a trade order according to Indodax Private REST API docs.
+        """Place a trade order per `Indodax Private REST API docs`_.
 
-        Supports documented optional parameters:
-        - order_type (``order_kind``) : ``limit`` / ``market`` (default ``limit``)
-        - client_order_id            : user-supplied id (<= 36 chars, [A-Za-z0-9_-])
-        - time_in_force              : currently ``GTC`` or ``MOC`` for limit
-        - idr / btc                  : explicit amount fields per API docs
+        Follows the documented trade endpoint parameters:
+
+        - **Limit buy**: sends coin amount (e.g. ``btc=0.001``), *not* ``idr``.
+          Per API docs: *"Request will be rejected if you send BUY order
+          request with both idr set & order_type set to LIMIT."*
+          Recommendation (Sept 2022): *"send btc instead idr and use
+          order_type: limit"* to avoid under-filled orders.
+        - **Market buy**: sends ``idr`` amount only.  Per API docs:
+          *"Currently MARKET BUY order only support amount in idr."*
+        - **Sell**: sends coin amount.
+
+        Amount formatting respects per-pair precision derived from
+        ``/api/pairs`` ``trade_min_traded_currency`` field.  Coins whose
+        minimum is an integer (e.g. ``1``) are sent without decimals to
+        avoid the Indodax API error *"amount can't be in decimal."*
+
+        .. _Indodax Private REST API docs:
+           https://github.com/btcid/indodax-official-api-docs/blob/master/Private-RestAPI.md
         """
         price, precision = self.format_price(pair, price)
         price_str = f"{price:.{precision}f}"
@@ -420,26 +483,30 @@ class IndodaxClient:
         base_coin = pair.split("_", 1)[0]
         is_idr_pair = pair.endswith("_idr")
 
+        # Per-pair amount precision (integer for some low-price coins).
+        _, amt_precision = self.format_amount(pair, amount)
+
         if order_type == "buy":
-            if idr is not None:
+            if order_kind == "market" and is_idr_pair:
+                # Market buy on IDR pair: only idr amount supported.
+                if idr is not None:
+                    payload["idr"] = f"{float(idr):.0f}"
+                else:
+                    idr_total = round(price * amount)
+                    payload["idr"] = f"{idr_total:.0f}"
+            elif idr is not None:
+                # Explicit idr override (backwards compatibility).
                 payload["idr"] = f"{float(idr):.0f}"
-            elif is_idr_pair:
-                idr_total = round(price * amount)
-                payload["idr"] = f"{idr_total:.0f}"
-                coin_amt = amount
-                amount_str = f"{coin_amt:.8f}"
-                payload[base_coin] = amount_str
-                payload["amount"] = amount_str
             else:
+                # Limit buy (default): coin amount only — no idr.
                 coin_amt = btc if btc is not None else amount
-                amount_str = f"{coin_amt:.8f}"
+                amount_str = f"{coin_amt:.{amt_precision}f}"
                 payload[base_coin] = amount_str
-                payload["amount"] = amount_str
         else:
+            # Sell: always coin amount.
             coin_amt = btc if btc is not None else amount
-            amount_str = f"{coin_amt:.8f}"
+            amount_str = f"{coin_amt:.{amt_precision}f}"
             payload[base_coin] = amount_str
-            payload["amount"] = amount_str
 
         if client_order_id:
             if len(client_order_id) > 36:

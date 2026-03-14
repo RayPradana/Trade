@@ -4555,6 +4555,7 @@ class PairMinOrderCacheTests(unittest.TestCase):
 
         client = IndodaxClient.__new__(IndodaxClient)
         client._pair_min_order = {}
+        client._amount_precisions = {}
 
         class _MockSession:
             def get(self, url, **kwargs):
