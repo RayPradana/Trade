@@ -8278,3 +8278,218 @@ class ConfigDefaultsTests(unittest.TestCase):
         config = BotConfig(api_key=None, resume_buy_wait_seconds=-1)
         with self.assertRaises(ValueError):
             config._validate()
+
+
+# ── Tests for force_sell market fallback on partial fill ──────────────────
+class ForceSellMarketFallbackOnPartialTests(unittest.TestCase):
+    """force_sell market fallback must fire even when chase had a partial fill."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_market_fallback_fires_on_partial_fill(self):
+        """After partial fill in chase, market fallback should sell the remainder."""
+
+        class _LiveClient(GuardedTrader._Client):
+            _call_count = 0
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                self._call_count += 1
+                if self._call_count == 1:
+                    # Initial sell: not filled (sits on book)
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "101"}}
+                elif self._call_count == 2:
+                    # Chase retry 1: partial fill 3 BTC
+                    return {"success": 1, "return": {"spend_btc": "3.0", "order_id": "102"}}
+                elif self._call_count == 3:
+                    # Chase retry 2: no fill
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "103"}}
+                else:
+                    # Market fallback: fills the remaining 2 BTC
+                    return {"success": 1, "return": {"spend_btc": "2.0", "order_id": "104"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def invalidate_open_orders_cache(self, pair):
+                pass
+
+        config = BotConfig(
+            api_key="key", api_secret="secret", dry_run=False,
+            initial_capital=1_000_000.0, min_order_idr=0.0,
+            multi_position_enabled=False, chase_max_retries=2,
+            order_timeout_to_market=True,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": None}
+        outcome = trader.force_sell(snapshot)
+
+        # All 5 BTC should be sold (3 from chase + 2 from market fallback)
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+
+# ── Tests for resume_pending_sell market fallback ─────────────────────────
+class ResumePendingSellMarketFallbackTests(unittest.TestCase):
+    """resume_pending_sell should use market fallback when initial order unfilled."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_market_fallback_on_unfilled_resume_sell(self):
+        """When initial resume sell is unfilled, market fallback should fire."""
+
+        class _LiveClient(GuardedTrader._Client):
+            _call_count = 0
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                self._call_count += 1
+                if self._call_count == 1:
+                    # First order: not filled
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "200"}}
+                else:
+                    # Market fallback: fills all 5 BTC
+                    return {"success": 1, "return": {"spend_btc": "5.0", "order_id": "201"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+        config = BotConfig(
+            api_key="key", api_secret="secret", dry_run=False,
+            initial_capital=1_000_000.0, min_order_idr=0.0,
+            multi_position_enabled=False, order_timeout_to_market=True,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+        trader.tracker.mark_pending_sell(5.0, 105.0)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "resumed")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+
+# ── Tests for koin sepi global guard ──────────────────────────────────────
+class KoinSepiGlobalGuardTests(unittest.TestCase):
+    """Test global orderbook quality guard for koin sepi (illiquid coins)."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_thin_raw_depth_blocks_buy(self):
+        """Coins with < 3 raw bid levels AND thin depth should be blocked."""
+        config = BotConfig(api_key=None, dry_run=True, small_coin_min_depth_idr=50_000.0)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "1"], ["99", "1"]], "sell": [["101", "1"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        # Set raw_depth with only 2 bid levels, thin depth
+        snap["raw_depth"] = {"buy": [["100", "1"], ["99", "1"]], "sell": [["101", "1"]]}
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("koin_sepi", outcome.get("reason", ""))
+
+    def test_deep_raw_depth_allows_buy(self):
+        """Coins with enough raw bid levels should pass the guard."""
+        config = BotConfig(api_key=None, dry_run=True, small_coin_min_depth_idr=50_000.0)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["1000", "100"], ["999", "100"], ["998", "100"]],
+                "sell": [["1001", "100"]],
+            },
+        })()
+        snap = _make_buy_snap(price=1000.0, confidence=0.9)
+        # 3+ bid levels
+        snap["raw_depth"] = {
+            "buy": [["1000", "100"], ["999", "100"], ["998", "100"]],
+            "sell": [["1001", "100"]],
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertNotIn("koin_sepi", outcome.get("reason", ""))
+
+    def test_no_raw_depth_skips_guard(self):
+        """When raw_depth is not in snapshot, the guard should not trigger."""
+        config = BotConfig(api_key=None, dry_run=True, small_coin_min_depth_idr=50_000.0)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "1"]], "sell": [["100.05", "1"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        # No raw_depth key - guard should not fire
+        snap.pop("raw_depth", None)
+        outcome = trader.maybe_execute(snap)
+        self.assertNotIn("koin_sepi", outcome.get("reason", ""))
+
+
+# ── Tests for from_env defaults ───────────────────────────────────────────
+class FromEnvProtectiveDefaultsTests(unittest.TestCase):
+    """from_env() should set protective defaults for koin sepi filtering."""
+
+    def test_min_volume_idr_default_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_volume_idr, 500_000.0)
+
+    def test_min_liquidity_depth_idr_default_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_liquidity_depth_idr, 100_000.0)
+
+    def test_overridable_via_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MIN_VOLUME_IDR": "0", "MIN_LIQUIDITY_DEPTH_IDR": "0"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_volume_idr, 0.0)
+            self.assertEqual(cfg.min_liquidity_depth_idr, 0.0)
