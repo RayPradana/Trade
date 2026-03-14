@@ -88,6 +88,10 @@ class PortfolioTracker:
         self._tp_activated: bool = False
         self._trailing_tp_stop: Optional[float] = None
         self._trailing_tp_peak: Optional[float] = None
+        # Once trailing TP fires a sell signal, this flag prevents the next
+        # evaluation cycle from flipping the decision back to "hold" if the
+        # price bounces.  Cleared when the position is actually closed.
+        self._tp_sell_committed: bool = False
         # Loss streak and strategy stats
         self.loss_streak: int = 0
         self._all_sell_pnls: List[float] = []
@@ -190,6 +194,7 @@ class PortfolioTracker:
                 self._tp_activated = False
                 self._trailing_tp_stop = None
                 self._trailing_tp_peak = None
+                self._tp_sell_committed = False
                 # Reset position open time on full close
                 self.position_open_time = 0.0
 
@@ -220,6 +225,7 @@ class PortfolioTracker:
         self._tp_activated = False
         self._trailing_tp_stop = None
         self._trailing_tp_peak = None
+        self._tp_sell_committed = False
         self.position_open_time = 0.0
         self.pending_orders.clear()
 
@@ -274,6 +280,15 @@ class PortfolioTracker:
     def tp_activated(self) -> bool:
         """``True`` once the initial TP level has been reached in the current position."""
         return self._tp_activated
+
+    @property
+    def tp_sell_committed(self) -> bool:
+        """``True`` when a trailing-TP sell has been triggered and must not be reverted."""
+        return self._tp_sell_committed
+
+    def commit_tp_sell(self) -> None:
+        """Mark that a sell has been triggered by trailing TP so it won't be undone."""
+        self._tp_sell_committed = True
 
     @property
     def position_hold_seconds(self) -> float:

@@ -27,7 +27,7 @@ from .analysis import (
 )
 from .config import BotConfig
 
-SCALP_SPREAD_THRESHOLD = 0.0015
+SCALP_SPREAD_THRESHOLD = 0.003
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
@@ -172,20 +172,22 @@ def score_strategies(
         "swing_trading": 0.0,
         "position_trading": 0.0,
     }
-    # Scalping: tight spread, strong imbalance, low volatility
+    # Scalping: tight spread, strong imbalance, low-to-moderate volatility
     if orderbook.spread_pct < SCALP_SPREAD_THRESHOLD:
-        scores["scalping"] += 0.5
-    if abs(orderbook.imbalance) > 0.25:
+        scores["scalping"] += 0.4
+    if orderbook.spread_pct < SCALP_SPREAD_THRESHOLD * 0.5:
+        scores["scalping"] += 0.1  # extra bonus for very tight spreads
+    if abs(orderbook.imbalance) > 0.20:
         scores["scalping"] += 0.3
-    if vol.volatility < 0.01:
+    if vol.volatility < 0.015:
         scores["scalping"] += 0.2
 
     # Day trading: trending with moderate volatility
     if trend.direction != "flat":
         scores["day_trading"] += 0.4
-    if 0.01 <= vol.volatility <= 0.03:
+    if 0.005 <= vol.volatility <= 0.03:
         scores["day_trading"] += 0.4
-    if trend.strength > 0.01:
+    if trend.strength > 0.008:
         scores["day_trading"] += 0.2
 
     # Swing trading: strong trend with higher volatility
@@ -203,8 +205,8 @@ def score_strategies(
     if regime is not None:
         if regime.regime == "volatile":
             scores["position_trading"] += 0.4
-            scores["scalping"] *= 0.3
-            scores["day_trading"] *= 0.5
+            scores["scalping"] *= 0.5  # Scalping penalized in volatile markets
+            scores["day_trading"] *= 0.6
         elif regime.regime == "ranging":
             scores["scalping"] += 0.3
             scores["position_trading"] *= 0.7
@@ -229,11 +231,11 @@ def select_strategy(
             return "scalping"
     if (
         orderbook.spread_pct < SCALP_SPREAD_THRESHOLD
-        and abs(orderbook.imbalance) > 0.25
-        and vol.volatility < 0.01
+        and abs(orderbook.imbalance) > 0.20
+        and vol.volatility < 0.015
     ):
         return "scalping"
-    if trend.direction != "flat" and vol.volatility >= 0.01 and vol.volatility <= 0.03:
+    if trend.direction != "flat" and vol.volatility >= 0.005 and vol.volatility <= 0.03:
         return "day_trading"
     if trend.direction != "flat" and trend.strength > 0.01 and vol.volatility > 0.015:
         return "swing_trading"
@@ -317,6 +319,7 @@ def _position_size(
     vol: VolatilityStats,
     effective_capital: Optional[float] = None,
     ob_imbalance: float = 0.0,
+    effective_min_confidence: Optional[float] = None,
 ) -> float:
     """Dynamic position sizing: base size = risk_per_trade * capital / price.
 
@@ -337,11 +340,20 @@ def _position_size(
     :param ob_imbalance: Current order-book imbalance
         ``(bid_vol − ask_vol) / (bid_vol + ask_vol)``, range ``−1 … +1``.
         Used for the OB imbalance size boost when the feature is enabled.
+    :param effective_min_confidence: When provided, overrides
+        ``config.min_confidence`` for the fallback sizing gate.  Pass the
+        value from ``_min_confidence_threshold()`` so that adaptive
+        thresholds are honoured consistently.
     """
     if current_price <= 0:
         return 0.0
     # Use compounding capital when available, otherwise fall back to initial_capital
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
+
+    # Resolve the confidence gate: prefer the caller-supplied adaptive value
+    # over the static config default so that signals which already passed the
+    # adaptive gate in maybe_execute are not silently zeroed out here.
+    _min_conf = effective_min_confidence if effective_min_confidence is not None else config.min_confidence
 
     # ── Confidence-tier-based sizing ─────────────────────────────────────────
     if config.confidence_position_sizing_enabled:
@@ -353,7 +365,7 @@ def _position_size(
             # value so that valid signals are not silently discarded.
             min_order_idr = getattr(config, "min_order_idr", 0.0)
             if (
-                confidence >= config.min_confidence
+                confidence >= _min_conf
                 and min_order_idr > 0
                 and capital >= min_order_idr * 1.003
             ):
@@ -370,7 +382,7 @@ def _position_size(
             # minimum, use the minimum order value.
             min_order_idr = getattr(config, "min_order_idr", 0.0)
             if (
-                confidence >= config.min_confidence
+                confidence >= _min_conf
                 and min_order_idr > 0
                 and capital >= min_order_idr * 1.003
             ):

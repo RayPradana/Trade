@@ -943,6 +943,7 @@ def main() -> None:
             # conditions on shared tracker state.
             _active = list(trader.active_positions.items())
             _still_holding = False
+            _has_pending_order = False  # shorter sleep when orders await fill
 
             # Fetch market snapshots for all held pairs in parallel.
             _held_snapshots: dict = {}
@@ -998,6 +999,7 @@ def main() -> None:
                         )
                     else:
                         _still_holding = True
+                        _has_pending_order = True
                     consecutive_errors = 0
                     continue  # next held pair
 
@@ -1044,6 +1046,7 @@ def main() -> None:
                         )
                     else:
                         _still_holding = True
+                        _has_pending_order = True
                     consecutive_errors = 0
                     continue  # next held pair
 
@@ -1302,7 +1305,13 @@ def main() -> None:
                 if not config.multi_position_enabled or trader.at_max_positions():
                     if config.run_once:
                         break
-                    time.sleep(config.position_check_interval_seconds)
+                    # Use shorter sleep when orders are pending fill to retry faster
+                    _sleep = (
+                        config.resume_buy_wait_seconds
+                        if _has_pending_order
+                        else config.position_check_interval_seconds
+                    )
+                    time.sleep(_sleep)
                     continue
                 # Multi-position with free slots: scan for additional pairs now.
                 logging.info(

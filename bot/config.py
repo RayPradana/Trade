@@ -125,10 +125,14 @@ class BotConfig:
     # Chase algorithm: max retries following price when order is not filled.
     # Each retry re-reads the orderbook and adjusts the limit price.
     # 0 = fall back to legacy single-retry behaviour.  Recommended: 1–5.
-    chase_max_retries: int = 3
+    chase_max_retries: int = 5
     # After all chase retries are exhausted, convert the unfilled remainder to
     # a market-price order so the bot does not miss the move entirely.
     order_timeout_to_market: bool = True
+    # Maximum seconds the monitoring loop waits before retrying a pending
+    # (unfilled) buy order.  Keeps exposure time short so capital is not
+    # locked up waiting for a fill.
+    resume_buy_wait_seconds: int = 20
     # Smart entry buffer: when enabled, the bot waits for one additional
     # confirmation read of the orderbook (spread + direction check) before
     # committing the very first buy order.  Helps avoid false breakouts.
@@ -718,8 +722,9 @@ class BotConfig:
             max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", "0.001"),
             entry_aggressiveness_pct=_env_float("ENTRY_AGGRESSIVENESS_PCT", "0.0005"),
             entry_retry_aggressiveness_pct=_env_float("ENTRY_RETRY_AGGRESSIVENESS_PCT", "0.001"),
-            chase_max_retries=_env_int("CHASE_MAX_RETRIES", "3"),
+            chase_max_retries=_env_int("CHASE_MAX_RETRIES", "5"),
             order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
+            resume_buy_wait_seconds=_env_int("RESUME_BUY_WAIT_SECONDS", "20"),
             smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "true").lower() in {"1", "true", "yes"},
             entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.35"),
             adaptive_order_enabled=os.getenv("ADAPTIVE_ORDER_ENABLED", "true").lower() in {"1", "true", "yes"},
@@ -929,6 +934,8 @@ class BotConfig:
             raise ValueError("ENTRY_RETRY_AGGRESSIVENESS_PCT must be non-negative")
         if self.chase_max_retries < 0:
             raise ValueError("CHASE_MAX_RETRIES must be non-negative")
+        if self.resume_buy_wait_seconds < 0:
+            raise ValueError("RESUME_BUY_WAIT_SECONDS must be non-negative")
         if self.initial_capital <= 0:
             raise ValueError("INITIAL_CAPITAL must be positive (e.g. INITIAL_CAPITAL=1000000)")
         if self.staged_entry_steps <= 0:

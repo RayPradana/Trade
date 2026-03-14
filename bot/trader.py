@@ -2915,6 +2915,26 @@ class Trader:
                     "portfolio": _tracker.as_dict(price),
                 }
 
+        # ── Global 24-h volume guard (all coins) ─────────────────────────────
+        # Regardless of price, skip buys on pairs with very low daily trading
+        # volume.  "Koin sepi" (dead/illiquid pairs) often show healthy spreads
+        # but fills are unreliable and exits can be impossible.
+        if decision.action == "buy" and self.config.min_volume_idr > 0:
+            _vol_24h = float(snapshot.get("volume_24h_idr") or 0.0)
+            if _vol_24h < self.config.min_volume_idr:
+                logger.info(
+                    "Low 24h volume on %s: Rp%.0f < min Rp%.0f — skipping buy",
+                    snapshot["pair"], _vol_24h, self.config.min_volume_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"low_24h_volume {_vol_24h:.0f}"
+                        f" < min {self.config.min_volume_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
+
         # Spread anomaly detection
         if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
             live_spread_pct = (top_ask - top_bid) / top_bid
@@ -3100,11 +3120,16 @@ class Trader:
             total_depth = self._liquidity_depth_idr(depth, price)
             if total_depth is None:
                 # Depth data unavailable (API error / unexpected format).
-                # Do NOT treat as thin market — skip the filter and proceed.
+                # Treat as thin market — safer to skip than enter blindly.
                 logger.warning(
-                    "Depth data unavailable for %s — skipping liquidity check",
+                    "Depth data unavailable for %s — skipping buy (no liquidity data)",
                     snapshot["pair"],
                 )
+                return {
+                    "status": "skipped",
+                    "reason": "depth_data_unavailable",
+                    "portfolio": _tracker.as_dict(price),
+                }
             elif total_depth < self.config.min_liquidity_depth_idr:
                 logger.info(
                     "Thin market on %s: depth Rp%.0f < min Rp%.0f — skipping buy",
@@ -3156,7 +3181,7 @@ class Trader:
                 effective_amount <= 0
                 and max_affordable > 0
                 and reference_price > 0
-                and decision.confidence >= self.config.min_confidence
+                and decision.confidence >= _effective_min_conf
             ):
                 min_viable = self.config.min_order_idr / reference_price * (1 + 1e-9)
                 if min_viable <= max_affordable:
@@ -4398,6 +4423,12 @@ class Trader:
         price = snapshot["price"]
         _tracker = self._active_tracker(snapshot["pair"])
 
+        # Once a sell was already committed (triggered in a previous cycle but
+        # the order hasn't fully filled yet), keep returning the sell signal so
+        # it is not accidentally reverted to "hold" if the price bounces.
+        if _tracker.tp_sell_committed:
+            return "trailing_tp_triggered"
+
         # If neither feature is configured → standard TP behaviour (close now)
         dynamic_tp_enabled = (
             config.trailing_tp_pct > 0
@@ -4413,6 +4444,7 @@ class Trader:
             _tracker.trailing_tp_stop is not None
             and price <= _tracker.trailing_tp_stop
         ):
+            _tracker.commit_tp_sell()
             return "trailing_tp_triggered"
 
         # Check whether market conditions allow holding
@@ -4424,6 +4456,7 @@ class Trader:
                 "Conditional TP: conditions failed at price=%.2f — taking profit",
                 price,
             )
+            _tracker.commit_tp_sell()
             return "target_profit_reached"
 
         # Conditions still bullish — activate / advance the trailing TP floor
