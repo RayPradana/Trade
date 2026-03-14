@@ -8122,3 +8122,159 @@ class EntryQualityScoringTests(unittest.TestCase):
         score = trader._entry_quality_score(snap)
         self.assertLess(score, 0.2,
                         f"Score should be low for bearish signals, got {score}")
+
+
+# ── Trailing TP committed sell (trader integration) tests ─────────────────────
+class TrailingTPCommittedTraderTests(unittest.TestCase):
+    """Tests that evaluate_dynamic_tp respects the tp_sell_committed flag."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _snap(self, price=110.0, trend_strength=0.5, imbalance=0.2, rsi=60.0):
+        from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats, MomentumIndicators
+        trend = TrendResult(direction="up", strength=trend_strength, fast_ma=100.0, slow_ma=95.0)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=10.0, ask_volume=8.0, imbalance=imbalance)
+        indicators = MomentumIndicators(rsi=rsi, macd=1.0, macd_signal=0.5, macd_hist=0.5, bb_upper=115.0, bb_mid=105.0, bb_lower=95.0)
+        return {
+            "pair": "btc_idr",
+            "price": price,
+            "trend": trend,
+            "orderbook": ob,
+            "volatility": VolatilityStats(volatility=0.01, avg_volume=100.0),
+            "indicators": indicators,
+        }
+
+    def test_committed_sell_stays_after_price_bounce(self):
+        """Once trailing TP fires a sell, bouncing price should NOT revert to hold."""
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02, multi_position_enabled=False)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        trader.tracker.activate_trailing_tp(120.0, 0.02)  # floor = 117.6
+
+        # Price falls below floor → triggers sell
+        result = trader.evaluate_dynamic_tp(self._snap(price=116.0))
+        self.assertEqual(result, "trailing_tp_triggered")
+        self.assertTrue(trader.tracker.tp_sell_committed)
+
+        # Price bounces back above floor → should STILL return sell (committed)
+        result2 = trader.evaluate_dynamic_tp(self._snap(price=125.0))
+        self.assertEqual(result2, "trailing_tp_triggered")
+
+    def test_committed_cleared_on_position_close(self):
+        """The committed flag is cleared when the position is fully closed."""
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02, multi_position_enabled=False)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        trader.tracker.commit_tp_sell()
+
+        # Close position
+        trader.tracker.record_trade("sell", 120.0, 1.0)
+        self.assertFalse(trader.tracker.tp_sell_committed)
+
+    def test_conditional_tp_also_commits(self):
+        """When conditions fail, the sell should also be committed."""
+        config = BotConfig(
+            api_key=None,
+            conditional_tp_min_trend_strength=0.5,
+            multi_position_enabled=False,
+        )
+        trader = Trader(config)
+        # Trend strength 0.2 < 0.5 → close and commit
+        result = trader.evaluate_dynamic_tp(self._snap(trend_strength=0.2))
+        self.assertEqual(result, "target_profit_reached")
+        self.assertTrue(trader.tracker.tp_sell_committed)
+
+        # Next call should stay committed
+        result2 = trader.evaluate_dynamic_tp(self._snap(trend_strength=0.8))
+        self.assertEqual(result2, "trailing_tp_triggered")
+
+
+# ── Global volume filter tests ────────────────────────────────────────────────
+class GlobalVolumeFilterTests(unittest.TestCase):
+    """Tests for the global 24h volume filter in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_low_volume_skips_buy(self):
+        """When 24h volume < min_volume_idr, buy should be skipped."""
+        config = BotConfig(api_key=None, min_volume_idr=1_000_000.0, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        snap["volume_24h_idr"] = 500_000.0  # below threshold
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("low_24h_volume", outcome["reason"])
+
+    def test_adequate_volume_passes(self):
+        """When 24h volume >= min_volume_idr, buy should NOT be blocked by volume filter."""
+        config = BotConfig(api_key=None, min_volume_idr=1_000_000.0, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        snap["volume_24h_idr"] = 5_000_000.0  # above threshold
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome.get("reason", ""), "low_24h_volume")
+
+
+# ── Depth data unavailable tests ──────────────────────────────────────────────
+class DepthUnavailableTests(unittest.TestCase):
+    """Tests that buy is skipped when depth data is unavailable and
+    min_liquidity_depth_idr is configured."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_depth_unavailable_skips_buy(self):
+        """When depth data returns None and min_liquidity_depth_idr > 0, skip buy."""
+        config = BotConfig(api_key=None, min_liquidity_depth_idr=100_000.0, dry_run=True)
+        trader = Trader(config)
+        # Depth returns None values (simulating API error)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        # Monkey-patch _liquidity_depth_idr to return None
+        trader._liquidity_depth_idr = lambda depth, price: None
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("depth_data_unavailable", outcome["reason"])
+
+
+# ── Config defaults tests ─────────────────────────────────────────────────────
+class ConfigDefaultsTests(unittest.TestCase):
+    """Tests for new config defaults."""
+
+    def test_chase_max_retries_default(self):
+        config = BotConfig(api_key=None)
+        self.assertEqual(config.chase_max_retries, 5)
+
+    def test_resume_buy_wait_seconds_default(self):
+        config = BotConfig(api_key=None)
+        self.assertEqual(config.resume_buy_wait_seconds, 20)
+
+    def test_resume_buy_wait_seconds_validation(self):
+        config = BotConfig(api_key=None, resume_buy_wait_seconds=-1)
+        with self.assertRaises(ValueError):
+            config._validate()

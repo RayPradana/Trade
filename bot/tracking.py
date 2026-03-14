@@ -378,6 +378,9 @@ class PortfolioTracker:
         ttp_peak = state.get("trailing_tp_peak")
         if ttp_peak is not None:
             self._trailing_tp_peak = float(ttp_peak)
+        tp_committed = state.get("tp_sell_committed")
+        if tp_committed is not None:
+            self._tp_sell_committed = bool(tp_committed)
         # Restore loss streak and strategy stats
         self.loss_streak = int(state.get("loss_streak", 0))
         self._all_sell_pnls = list(state.get("all_sell_pnls", []))
@@ -473,6 +476,7 @@ class PortfolioTracker:
             # Trailing TP
             "tp_activated": self._tp_activated,
             "trailing_tp_stop": self._trailing_tp_stop,
+            "tp_sell_committed": self._tp_sell_committed,
             # Pending orders (e.g., buy placed but not yet filled)
             "pending_orders": list(self.pending_orders),
             # Pending sell orders (sell placed but not yet filled)
@@ -504,6 +508,7 @@ class PortfolioTracker:
             "tp_activated": self._tp_activated,
             "trailing_tp_stop": self._trailing_tp_stop,
             "trailing_tp_peak": self._trailing_tp_peak,
+            "tp_sell_committed": self._tp_sell_committed,
             "loss_streak": self.loss_streak,
             "all_sell_pnls": self._all_sell_pnls,
             "strategy_stats": self._strategy_stats,
