@@ -6687,3 +6687,218 @@ class LiquidityCheckTests(unittest.TestCase):
         outcome = trader.maybe_execute(snap)
         # Should not be skipped for liquidity reasons
         self.assertNotEqual(outcome.get("reason", ""), "liquidity_too_thin")
+
+
+class PendingSellTests(unittest.TestCase):
+    """Tests for the pending sell mechanism and resume_pending_sell."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_tracker_pending_sell_lifecycle(self):
+        """mark_pending_sell / has_pending_sell / clear_pending_sell work correctly."""
+        tracker = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        self.assertFalse(tracker.has_pending_sell)
+        tracker.mark_pending_sell(1.0, 50000.0)
+        self.assertTrue(tracker.has_pending_sell)
+        self.assertEqual(len(tracker.pending_sell_orders), 1)
+        tracker.clear_pending_sell()
+        self.assertFalse(tracker.has_pending_sell)
+
+    def test_record_trade_sell_clears_pending_sell(self):
+        """A filled sell (record_trade) must clear any pending sell markers."""
+        tracker = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        tracker.record_trade("buy", 100.0, 5.0)
+        tracker.mark_pending_sell(5.0, 105.0)
+        self.assertTrue(tracker.has_pending_sell)
+        tracker.record_trade("sell", 105.0, 5.0)
+        self.assertFalse(tracker.has_pending_sell)
+
+    def test_pending_sell_persisted_in_state(self):
+        """pending_sell_orders must survive to_state/load_state round-trip."""
+        tracker = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        tracker.record_trade("buy", 100.0, 5.0)
+        tracker.mark_pending_sell(5.0, 105.0)
+        state = tracker.to_state()
+        self.assertIn("pending_sell_orders", state)
+        self.assertEqual(len(state["pending_sell_orders"]), 1)
+
+        # Restore
+        tracker2 = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        tracker2.load_state(state)
+        self.assertTrue(tracker2.has_pending_sell)
+        self.assertAlmostEqual(tracker2.pending_sell_orders[0]["amount"], 5.0)
+
+    def test_active_positions_includes_pending_sell(self):
+        """active_positions must include pairs with pending sells."""
+        from bot.tracking import MultiPositionManager
+
+        mgr = MultiPositionManager(
+            initial_capital=10_000_000.0,
+            max_positions=3,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        t = mgr.allocate_capital("btc_idr")
+        t.record_trade("buy", 100.0, 5.0)
+        t.record_trade("sell", 105.0, 5.0)  # fully closed
+        # No position, but mark pending sell
+        t.mark_pending_sell(5.0, 105.0)
+        self.assertIn("btc_idr", mgr.active_positions)
+        self.assertTrue(mgr.has_position("btc_idr"))
+
+    def test_force_sell_marks_pending_on_unfilled_order(self):
+        """When the sell order is placed on the book (has order_id) but not
+        filled, force_sell must mark it as pending_sell for resume."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                # Return an order_id under "return" — signaling the order was
+                # placed on the book but NOT yet filled.
+                return {"success": 1, "return": {"order_id": "999", "spend_btc": "0"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+            chase_max_retries=1,
+            order_timeout_to_market=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=105.0,
+            amount=5.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "pending_sell")
+        self.assertTrue(trader.tracker.has_pending_sell)
+
+    def test_force_sell_with_spend_confirms_fill(self):
+        """When the order response includes spend_<coin>, force_sell records
+        the trade as completed."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                return {"success": 1, "return": {"spend_btc": str(amount)}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=105.0,
+            amount=5.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertFalse(trader.tracker.has_pending_sell)
+
+    def test_resume_pending_sell_dry_run(self):
+        """resume_pending_sell in dry-run mode must record the trade directly."""
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+        trader.tracker.mark_pending_sell(5.0, 105.0)
+        self.assertTrue(trader.tracker.has_pending_sell)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "resumed")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertFalse(trader.tracker.has_pending_sell)
+
+    def test_resume_pending_sell_no_pending(self):
+        """resume_pending_sell returns no_pending when there is nothing to resume."""
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+        self.assertEqual(outcome["status"], "no_pending")
