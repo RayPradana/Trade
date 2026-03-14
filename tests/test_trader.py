@@ -4565,8 +4565,8 @@ class PairMinOrderCacheTests(unittest.TestCase):
                     def raise_for_status(self): pass
                     def json(self):
                         return [
-                            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
-                            {"id": "wtecidr", "trade_min_base_currency": "3333.33333333", "trade_min_traded_currency": "10000"},
+                            {"id": "btcidr", "trade_min_base_currency": "10000", "trade_min_traded_currency": "0.0001"},
+                            {"id": "wtecidr", "trade_min_base_currency": "10000", "trade_min_traded_currency": "3333.33333333"},
                         ]
                 return _Resp()
 

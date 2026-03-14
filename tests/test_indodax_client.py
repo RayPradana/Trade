@@ -277,8 +277,8 @@ class IndodaxClientAmountPrecisionTest(unittest.TestCase):
         # Both key formats should exist in the cache
         self.assertIn("btcidr", client._pair_min_order)
         self.assertIn("btc_idr", client._pair_min_order)
-        # trade_min_traded_currency → min_idr in the existing code mapping
-        self.assertAlmostEqual(client._pair_min_order["btc_idr"]["min_idr"], 0.0001)
+        # trade_min_base_currency → min_idr (minimum IDR/base amount)
+        self.assertAlmostEqual(client._pair_min_order["btc_idr"]["min_idr"], 50000.0)
         # Amount precision should also be stored under both keys
         self.assertEqual(client._amount_precisions["btc_idr"], 8)
         self.assertEqual(client._amount_precisions["btcidr"], 8)

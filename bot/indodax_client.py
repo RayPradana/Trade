@@ -131,8 +131,8 @@ class IndodaxClient:
         """Fetch exchange pair list and cache per-pair minimum order sizes.
 
         The Indodax ``/api/pairs`` endpoint returns a list of pair objects,
-        each containing ``trade_min_base_currency`` (minimum coin amount) and
-        ``trade_min_traded_currency`` (minimum IDR amount).  This method
+        each containing ``trade_min_base_currency`` (minimum IDR/base amount) and
+        ``trade_min_traded_currency`` (minimum coin amount).  This method
         populates :attr:`_pair_min_order` for quick lookup before order
         placement so that "Minimum order" errors are prevented proactively.
 
@@ -175,11 +175,11 @@ class IndodaxClient:
             base_cur = (info.get("base_currency") or "").lower()
             constructed_key = f"{traded_cur}_{base_cur}" if traded_cur and base_cur else ""
             try:
-                min_coin = float(info.get("trade_min_base_currency") or 0)
+                min_coin = float(info.get("trade_min_traded_currency") or 0)
             except (TypeError, ValueError):
                 min_coin = 0.0
             try:
-                min_idr = float(info.get("trade_min_traded_currency") or 0)
+                min_idr = float(info.get("trade_min_base_currency") or 0)
             except (TypeError, ValueError):
                 min_idr = 0.0
             entry = {"min_coin": min_coin, "min_idr": min_idr}

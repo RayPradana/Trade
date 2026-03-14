@@ -287,8 +287,8 @@ class LoadPairMinOrdersFromDataTests(unittest.TestCase):
 
     def _make_pairs_data(self):
         return [
-            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
-            {"id": "ethidr", "trade_min_base_currency": "0.001", "trade_min_traded_currency": "5000"},
+            {"id": "btcidr", "trade_min_base_currency": "10000", "trade_min_traded_currency": "0.0001"},
+            {"id": "ethidr", "trade_min_base_currency": "5000", "trade_min_traded_currency": "0.001"},
         ]
 
     def test_load_from_data_skips_rest_call(self):
@@ -395,8 +395,8 @@ class NoDuplicatePairsCallTest(unittest.TestCase):
         from bot.strategies import StrategyDecision
 
         pairs_data = [
-            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
-            {"id": "ethidr", "trade_min_base_currency": "0.001", "trade_min_traded_currency": "5000"},
+            {"id": "btcidr", "trade_min_base_currency": "10000", "trade_min_traded_currency": "0.0001"},
+            {"id": "ethidr", "trade_min_base_currency": "5000", "trade_min_traded_currency": "0.001"},
         ]
         get_pairs_call_count = []
 
@@ -410,9 +410,9 @@ class NoDuplicatePairsCallTest(unittest.TestCase):
                 # min-order fields (for the cache).
                 return [
                     {"name": "btc_idr", "id": "btcidr",
-                     "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
+                     "trade_min_base_currency": "10000", "trade_min_traded_currency": "0.0001"},
                     {"name": "eth_idr", "id": "ethidr",
-                     "trade_min_base_currency": "0.001", "trade_min_traded_currency": "5000"},
+                     "trade_min_base_currency": "5000", "trade_min_traded_currency": "0.001"},
                 ]
 
             def get_summaries(self):
