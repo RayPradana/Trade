@@ -139,7 +139,7 @@ class BotConfig:
     # 0→1 score and skips buys when the score is below this threshold.
     # Higher values → pickier entry, lower values → more aggressive.
     # 0 disables the check entirely.
-    entry_quality_min_score: float = 0.35
+    entry_quality_min_score: float = 0.25
     # Adaptive limit order: when enabled, the first buy order is placed
     # slightly above best_bid (passive) rather than at best_ask (aggressive).
     # This gives a better fill price when the market isn't trending hard.

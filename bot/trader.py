@@ -3147,6 +3147,26 @@ class Trader:
             max_affordable = max(0.0, available_cash / (reference_price * self._FEE_BUFFER))
             effective_amount = min(decision.amount, max_affordable)
 
+            # ── Fallback minimum sizing ──────────────────────────────────────
+            # When the strategy decision returned amount=0 (e.g. confidence
+            # tier dead-zone or missing stop-loss data) but cash is available
+            # and the signal passed the confidence gate, use the minimum order
+            # value so the trade is not silently dropped.
+            if (
+                effective_amount <= 0
+                and max_affordable > 0
+                and reference_price > 0
+                and decision.confidence >= self.config.min_confidence
+            ):
+                min_viable = self.config.min_order_idr / reference_price * (1 + 1e-9)
+                if min_viable <= max_affordable:
+                    effective_amount = min_viable
+                    logger.info(
+                        "Fallback position sizing: %.8f coins (min_order_idr Rp%.0f)",
+                        effective_amount,
+                        self.config.min_order_idr,
+                    )
+
             # ── Bump up to minimum order value when possible ─────────────────
             # When the computed amount falls below the exchange minimum but the
             # available cash can cover it, raise the amount to the minimum so
@@ -3193,7 +3213,15 @@ class Trader:
             effective_amount = min(effective_amount, max_affordable)
 
         if effective_amount <= 0:
-            logger.info("Skip due to insufficient balance/position | action=%s", decision.action)
+            _diag_cash = available_cash if decision.action == "buy" else _tracker.base_position
+            logger.info(
+                "Skip due to insufficient balance/position | action=%s "
+                "decision_amount=%.8f available=%.2f price=%.2f",
+                decision.action,
+                decision.amount,
+                _diag_cash,
+                reference_price,
+            )
             outcome = {
                 "status": "skipped",
                 "reason": "insufficient balance or position",

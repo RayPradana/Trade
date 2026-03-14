@@ -283,16 +283,21 @@ def confidence_position_pct(confidence: float, config: BotConfig) -> float:
     """Return the position size as a fraction of capital for the given confidence level.
 
     Used when ``config.confidence_position_sizing_enabled`` is True.
-    Returns 0.0 when confidence is below ``config.confidence_tier_skip`` (skip trade).
+    Returns 0.0 when confidence is below the effective skip threshold.
+
+    The effective skip threshold is ``min(confidence_tier_skip, min_confidence)``
+    so that signals which already passed the bot's confidence gate are never
+    silently zeroed out by a higher tier-skip value.
 
     Tier mapping (defaults):
-      < 0.40  → 0.0   (skip)
-      0.40–0.50 → 10 %
+      < effective_skip → 0.0   (skip)
+      effective_skip–0.50 → 10 %  (low tier)
       0.50–0.65 → 15 %
       0.65–0.80 → 20 %
       > 0.80  → 25 %
     """
-    if confidence < config.confidence_tier_skip:
+    effective_skip = min(config.confidence_tier_skip, config.min_confidence)
+    if confidence < effective_skip:
         return 0.0
     if confidence < config.confidence_tier_low:
         return config.confidence_tier_low_pct
@@ -342,24 +347,49 @@ def _position_size(
     if config.confidence_position_sizing_enabled:
         pct = confidence_position_pct(confidence, config)
         if pct <= 0.0:
-            return 0.0
-        size = (pct * capital) / current_price
+            # Fallback: when primary confidence sizing yields 0 but the signal
+            # already passed the bot's confidence gate (confidence ≥ min_confidence)
+            # and capital can cover the exchange minimum, use the minimum order
+            # value so that valid signals are not silently discarded.
+            min_order_idr = getattr(config, "min_order_idr", 0.0)
+            if (
+                confidence >= config.min_confidence
+                and min_order_idr > 0
+                and capital >= min_order_idr * 1.003
+            ):
+                size = min_order_idr / current_price * (1 + 1e-9)
+            else:
+                return 0.0
+        else:
+            size = (pct * capital) / current_price
     else:
         # ── Original risk/stop-distance-based sizing ──────────────────────────
         if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
-            return 0.0
-        # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
-        risk = adaptive_risk_per_trade(capital, config)
-        # Compute how many units of the base asset represent one "risk unit" of capital
-        dynamic_base = (risk * capital) / current_price
-        desired_risk_value = capital * risk
-        base_order_risk = risk_per_unit * dynamic_base
-        dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
-        scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
-        confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
-        volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
-        size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
-        size = max(size, dynamic_base * 0.25)
+            # Fallback: when stop-loss data is unavailable but the signal
+            # passed the confidence gate and capital can cover the exchange
+            # minimum, use the minimum order value.
+            min_order_idr = getattr(config, "min_order_idr", 0.0)
+            if (
+                confidence >= config.min_confidence
+                and min_order_idr > 0
+                and capital >= min_order_idr * 1.003
+            ):
+                size = min_order_idr / current_price * (1 + 1e-9)
+            else:
+                return 0.0
+        else:
+            # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
+            risk = adaptive_risk_per_trade(capital, config)
+            # Compute how many units of the base asset represent one "risk unit" of capital
+            dynamic_base = (risk * capital) / current_price
+            desired_risk_value = capital * risk
+            base_order_risk = risk_per_unit * dynamic_base
+            dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
+            scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
+            confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
+            volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
+            size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
+            size = max(size, dynamic_base * 0.25)
 
     # ── Orderbook imbalance size boost ───────────────────────────────────────
     if (
