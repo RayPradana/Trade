@@ -173,10 +173,12 @@ class PortfolioTracker:
             if self.position_open_time == 0.0:
                 self.position_open_time = time.time()
             # Anchor trailing stop/TP baseline at the buy fill price.
-            # This ensures the trailing mechanisms start from the actual entry
-            # price rather than a potentially lower mark price observed later.
+            # Use the highest price seen across all buys so that averaging down
+            # never lowers the peak (and thus never widens the trailing stop).
             if self._peak_price is None:
                 self._peak_price = price
+            else:
+                self._peak_price = max(self._peak_price, price)
             if self._trailing_tp_peak is None and self._tp_activated:
                 self._trailing_tp_peak = price
         elif action == "sell":

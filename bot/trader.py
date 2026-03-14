@@ -4912,12 +4912,16 @@ class Trader:
         )
 
         # ── Pump detection: bypass limit order, switch to market immediately ──
-        # When a genuine price pump is active (pump_protection_pct > 0, price
-        # has risen by at least that fraction) and it is NOT a fake pump (i.e.
-        # not a spike-then-reversal), there is a live upward move happening.
-        # A pending limit order priced below the rising market will never fill;
-        # switch to a market-crossing price so the bot does not miss the move.
-        if self._is_pumped(pair, price) and not self._is_fake_pump(pair, price):
+        # When pump detection is configured (pump_protection_pct > 0), a genuine
+        # price pump is active, and it is NOT a fake pump (spike-then-reversal),
+        # there is a live upward move happening.  A pending limit order priced
+        # below the rising market will never fill; switch to a market-crossing
+        # price so the bot does not miss the move.
+        if (
+            self.config.pump_protection_pct > 0
+            and self._is_pumped(pair, price)
+            and not self._is_fake_pump(pair, price)
+        ):
             _pump_market_price = best_ask * (1 + entry_aggr * 2)
             _fmt_price = getattr(self.client, "format_price", None)
             if callable(_fmt_price):
