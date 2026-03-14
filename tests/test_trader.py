@@ -7353,3 +7353,423 @@ class FeeBufferTests(unittest.TestCase):
             executed_amount = outcome.get("amount", 0)
             self.assertLess(executed_amount, 1.0,
                             "Executed amount should be reduced by fee buffer")
+
+
+# ── Smart Market Fallback / Dynamic Sizing / Liquidity / Re-entry ──────────
+
+class SmartMarketFallbackTests(unittest.TestCase):
+    """Tests for regime-aware market order fallback."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=2,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, action, price, amount, **extra):
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=amount,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    # -- _should_use_market_fallback tests --
+
+    def test_buy_market_allowed_trending_up(self):
+        """Market fallback should be allowed for buy when trending up."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.5, description="test"))
+        self.assertTrue(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_buy_market_blocked_ranging(self):
+        """Market fallback should be blocked for buy when ranging."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="ranging", strength=0.5, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_buy_market_blocked_trending_down(self):
+        """Market fallback should be blocked for buy when trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_down", strength=0.6, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_buy_market_blocked_no_regime(self):
+        """Market fallback should be blocked when no regime data."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0)
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_sell_market_allowed_trending_down(self):
+        """Market fallback should be allowed for sell when trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_down", strength=0.5, description="test"))
+        self.assertTrue(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_sell_market_allowed_volatile(self):
+        """Market fallback should be allowed for sell when volatile."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="volatile", strength=0.5, description="test"))
+        self.assertTrue(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_sell_market_blocked_trending_up(self):
+        """Market fallback should be blocked for sell when trending up."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.5, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_sell_market_blocked_ranging(self):
+        """Market fallback should be blocked for sell when ranging."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="ranging", strength=0.5, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_buy_market_weak_trending_up_blocked(self):
+        """Weak trending up (strength < 0.3) should block market buy."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.2, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    # -- Buy chase: no market fallback when regime is not trending up --
+
+    def test_buy_chase_no_market_when_ranging(self):
+        """Buy chase should NOT fall back to market order when regime is ranging."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price})
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+            def invalidate_account_info_cache(self):
+                pass
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=2, order_timeout_to_market=True)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0,
+                               regime=MarketRegime(regime="ranging", strength=0.5, description="test"))
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 2 chase = 3 orders (no market fallback)
+        self.assertEqual(len(created), 3,
+                         f"Expected 3 orders (no market fallback), got {len(created)}")
+
+
+class DynamicPositionSizingTests(unittest.TestCase):
+    """Tests for regime-adjusted position sizing."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1_000_000.0,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def test_trending_up_boosts_size(self):
+        """Trending up regime should boost position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="trending_up", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertGreater(result, 100.0)
+        self.assertLessEqual(result, 120.0)  # max +20%
+
+    def test_volatile_reduces_size(self):
+        """Volatile regime should reduce position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="volatile", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertLess(result, 100.0)
+        self.assertGreaterEqual(result, 70.0)  # max -30%
+
+    def test_trending_down_reduces_size(self):
+        """Trending down regime should reduce position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="trending_down", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertLess(result, 100.0)
+        self.assertGreaterEqual(result, 70.0)
+
+    def test_ranging_no_change(self):
+        """Ranging regime should not change position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="ranging", strength=0.5, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertEqual(result, 100.0)
+
+    def test_no_regime_no_change(self):
+        """Missing regime should not change position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertEqual(result, 100.0)
+
+    def test_zero_amount_unchanged(self):
+        """Zero amount should remain zero."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="trending_up", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(0.0, snap)
+        self.assertEqual(result, 0.0)
+
+
+class LiquidityAwareExecutionTests(unittest.TestCase):
+    """Tests for liquidity-adjusted order amount."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(api_key=None, dry_run=True, initial_capital=1_000_000.0)
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def test_amount_capped_at_40pct_of_depth(self):
+        """Order amount should be capped at 40% of visible depth."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "raw_depth": {"sell": [["100", "10"], ["101", "10"]], "buy": [["99", "5"]]},
+            "price": 100.0,
+            "decision": StrategyDecision(
+                mode="day_trading", action="buy", confidence=0.9, reason="test",
+                target_price=100.0, amount=100.0, stop_loss=None, take_profit=None,
+            ),
+        }
+        # Total ask depth = 10 + 10 = 20 coins; 40% = 8.0
+        result = trader._liquidity_adjusted_amount(100.0, snap)
+        self.assertAlmostEqual(result, 8.0, places=1)
+
+    def test_amount_not_capped_when_within_depth(self):
+        """Order amount should not be changed when within 40% of depth."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "raw_depth": {"sell": [["100", "1000"]], "buy": [["99", "500"]]},
+            "price": 100.0,
+            "decision": StrategyDecision(
+                mode="day_trading", action="buy", confidence=0.9, reason="test",
+                target_price=100.0, amount=5.0, stop_loss=None, take_profit=None,
+            ),
+        }
+        # Total ask depth = 1000 coins; 40% = 400; 5 < 400 → no cap
+        result = trader._liquidity_adjusted_amount(5.0, snap)
+        self.assertEqual(result, 5.0)
+
+    def test_no_depth_data_unchanged(self):
+        """Missing depth data should not change amount."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"raw_depth": None, "price": 100.0, "decision": None}
+        result = trader._liquidity_adjusted_amount(100.0, snap)
+        self.assertEqual(result, 100.0)
+
+    def test_sell_uses_bid_side_depth(self):
+        """Sell orders should check bid-side depth."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "raw_depth": {"sell": [["100", "1000"]], "buy": [["99", "5"]]},
+            "price": 100.0,
+            "decision": StrategyDecision(
+                mode="day_trading", action="sell", confidence=0.9, reason="test",
+                target_price=100.0, amount=100.0, stop_loss=None, take_profit=None,
+            ),
+        }
+        # Total bid depth = 5 coins; 40% = 2.0
+        result = trader._liquidity_adjusted_amount(100.0, snap)
+        self.assertAlmostEqual(result, 2.0, places=1)
+
+
+class ReentryAnalysisTests(unittest.TestCase):
+    """Tests for analyze_reentry_opportunity."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(api_key=None, dry_run=True, initial_capital=1_000_000.0)
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def test_reentry_suggested_when_not_trending_down(self):
+        """Re-entry should be suggested when regime is not trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="ranging", strength=0.3, description="test"),
+            "trend": TrendResult(direction="neutral", strength=0.01, fast_ma=100.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=1000.0, ask_volume=800.0,
+                imbalance=0.1, spread_pct=0.02,
+            ),
+            "levels": type("SR", (), {"support": [95.0, 90.0], "resistance": [110.0]})(),
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["reentry"])
+        self.assertLess(result["target_price"], 100.0)
+
+    def test_no_reentry_when_trending_down(self):
+        """Re-entry should be skipped when strongly trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="trending_down", strength=0.6, description="test"),
+            "trend": TrendResult(direction="down", strength=0.05, fast_ma=95.0, slow_ma=100.0),
+            "orderbook": None,
+            "levels": None,
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNone(result)
+
+    def test_no_reentry_when_heavy_sell_pressure(self):
+        """Re-entry should be skipped when orderbook shows heavy sell pressure."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="ranging", strength=0.3, description="test"),
+            "trend": TrendResult(direction="neutral", strength=0.005, fast_ma=100.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=100.0, ask_volume=800.0,
+                imbalance=-0.5, spread_pct=0.02,
+            ),
+            "levels": None,
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNone(result)
+
+    def test_reentry_uses_support_level(self):
+        """Re-entry target should use nearest support level below current price."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="trending_up", strength=0.3, description="test"),
+            "trend": TrendResult(direction="up", strength=0.02, fast_ma=102.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=1000.0, ask_volume=500.0,
+                imbalance=0.3, spread_pct=0.02,
+            ),
+            "levels": type("SR", (), {"support": [98.0, 95.0], "resistance": [110.0]})(),
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["target_price"], 98.0)
+
+    def test_reentry_fallback_1pct_dip(self):
+        """Without support levels, target should be 1% below current price."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="ranging", strength=0.3, description="test"),
+            "trend": TrendResult(direction="neutral", strength=0.005, fast_ma=100.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=500.0, ask_volume=500.0,
+                imbalance=0.0, spread_pct=0.02,
+            ),
+            "levels": type("SR", (), {"support": [], "resistance": []})(),
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["target_price"], 99.0, places=1)
+
+    def test_no_reentry_zero_price(self):
+        """Re-entry should be skipped when price is zero."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": None, "trend": None, "orderbook": None, "levels": None, "price": 0}
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNone(result)
