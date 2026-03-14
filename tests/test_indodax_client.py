@@ -358,5 +358,201 @@ class IndodaxClientAmountPrecisionTest(unittest.TestCase):
         self.assertNotIn(".", resp["doge"])
 
 
+class DecimalRetryTest(unittest.TestCase):
+    """Test auto-retry when exchange returns 'amount can't be in decimal.'."""
+
+    def test_create_order_retries_on_decimal_error(self):
+        """create_order must retry with integer amount on 'decimal' API error."""
+        client = _DummyClient()
+        # Simulate precision cache missing for doge_idr → defaults to 8 decimals
+        # First _enqueue_private call raises the error; second succeeds.
+        call_count = {"n": 0}
+        original_enqueue = client._enqueue_private
+
+        def _fake_enqueue(method, params=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError(
+                    "API error: {'success': 0, 'error': \"amount can't be in decimal.\"}"
+                )
+            # Return params on retry so we can inspect them.
+            return params
+
+        client._enqueue_private = _fake_enqueue
+        resp = client.create_order("doge_idr", "sell", 5, 150.7)
+        # Retry must have sent integer amount (no decimal).
+        self.assertEqual(resp["doge"], "151")
+        self.assertNotIn(".", resp["doge"])
+        self.assertEqual(call_count["n"], 2)
+
+    def test_create_order_updates_precision_cache_on_decimal_error(self):
+        """After retrying, the precision cache must be updated to 0."""
+        client = _DummyClient()
+        call_count = {"n": 0}
+
+        def _fake_enqueue(method, params=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError(
+                    "API error: {'success': 0, 'error': \"amount can't be in decimal.\"}"
+                )
+            return params
+
+        client._enqueue_private = _fake_enqueue
+        client.create_order("doge_idr", "sell", 5, 150.7)
+        # Both key formats must be cached as precision 0.
+        self.assertEqual(client._amount_precisions.get("doge_idr"), 0)
+        self.assertEqual(client._amount_precisions.get("dogeidr"), 0)
+
+    def test_create_order_buy_retries_on_decimal_error(self):
+        """Limit buy must also retry with integer amount on decimal error."""
+        client = _DummyClient()
+        call_count = {"n": 0}
+
+        def _fake_enqueue(method, params=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError(
+                    "API error: {'success': 0, 'error': \"amount can't be in decimal.\"}"
+                )
+            return params
+
+        client._enqueue_private = _fake_enqueue
+        resp = client.create_order("doge_idr", "buy", 5, 150.7)
+        self.assertEqual(resp["doge"], "151")
+        self.assertNotIn(".", resp["doge"])
+
+    def test_create_order_non_decimal_error_not_retried(self):
+        """Non-decimal RuntimeErrors must propagate without retry."""
+        client = _DummyClient()
+
+        def _fake_enqueue(method, params=None):
+            raise RuntimeError("API error: some other error")
+
+        client._enqueue_private = _fake_enqueue
+        with self.assertRaises(RuntimeError) as ctx:
+            client.create_order("doge_idr", "sell", 5, 150)
+        self.assertIn("some other error", str(ctx.exception))
+
+
+class DecimalPrecisionDetectionTest(unittest.TestCase):
+    """Test Decimal-based precision detection in load_pair_min_orders."""
+
+    def _make_client(self):
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        client._amount_precisions = {}
+        return client
+
+    def test_string_integer_min_gives_precision_zero(self):
+        """trade_min_traded_currency='100' → precision 0."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "dogeidr", "ticker_id": "doge_idr",
+            "trade_min_base_currency": "5000",
+            "trade_min_traded_currency": "100",
+        }])
+        self.assertEqual(client._amount_precisions["doge_idr"], 0)
+
+    def test_string_fractional_min_gives_precision_eight(self):
+        """trade_min_traded_currency='0.0001' → precision 8."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "btcidr", "ticker_id": "btc_idr",
+            "trade_min_base_currency": "50000",
+            "trade_min_traded_currency": "0.0001",
+        }])
+        self.assertEqual(client._amount_precisions["btc_idr"], 8)
+
+    def test_numeric_integer_min_gives_precision_zero(self):
+        """trade_min_traded_currency=100 (int) → precision 0."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "dogeidr", "ticker_id": "doge_idr",
+            "trade_min_base_currency": 5000,
+            "trade_min_traded_currency": 100,
+        }])
+        self.assertEqual(client._amount_precisions["doge_idr"], 0)
+
+    def test_numeric_float_integer_min_gives_precision_zero(self):
+        """trade_min_traded_currency=100.0 (float) → precision 0 via Decimal.normalize()."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "dogeidr", "ticker_id": "doge_idr",
+            "trade_min_base_currency": 5000,
+            "trade_min_traded_currency": 100.0,
+        }])
+        self.assertEqual(client._amount_precisions["doge_idr"], 0)
+
+    def test_zero_min_defaults_to_eight(self):
+        """trade_min_traded_currency=0 → precision 8 (unknown, safe default)."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "unknownidr", "ticker_id": "unknown_idr",
+            "trade_min_base_currency": "5000",
+            "trade_min_traded_currency": "0",
+        }])
+        self.assertEqual(client._amount_precisions["unknown_idr"], 8)
+
+    def test_missing_min_defaults_to_eight(self):
+        """Missing trade_min_traded_currency → precision 8."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "unknownidr", "ticker_id": "unknown_idr",
+            "trade_min_base_currency": "5000",
+        }])
+        self.assertEqual(client._amount_precisions["unknown_idr"], 8)
+
+    def test_string_one_min_gives_precision_zero(self):
+        """trade_min_traded_currency='1' → precision 0."""
+        client = self._make_client()
+        client.load_pair_min_orders([{
+            "id": "tokenidr", "ticker_id": "token_idr",
+            "trade_min_base_currency": "10000",
+            "trade_min_traded_currency": "1",
+        }])
+        self.assertEqual(client._amount_precisions["token_idr"], 0)
+
+
+class FormatAmountAutoRefreshTest(unittest.TestCase):
+    """Test that format_amount auto-refreshes cache on miss."""
+
+    def test_format_amount_refreshes_on_cache_miss(self):
+        """format_amount should try to refresh pair data when precision unknown."""
+        client = _DummyClient()
+        # Start with empty precision cache.
+        client._amount_precisions = {}
+        # The _DummyClient._get returns {} which won't populate the cache,
+        # but _maybe_refresh_pair_min_orders should be called.
+        refreshed = {"called": False}
+        original_refresh = client._maybe_refresh_pair_min_orders
+
+        def _track_refresh():
+            refreshed["called"] = True
+            # Simulate loading — set precision for doge_idr to 0.
+            client._amount_precisions["doge_idr"] = 0
+            client._amount_precisions["dogeidr"] = 0
+
+        client._maybe_refresh_pair_min_orders = _track_refresh
+        amt, prec = client.format_amount("doge_idr", 150.7)
+        self.assertTrue(refreshed["called"])
+        self.assertEqual(prec, 0)
+        self.assertEqual(amt, 151.0)
+
+    def test_format_amount_no_refresh_when_cached(self):
+        """format_amount must not refresh when precision is already cached."""
+        client = _DummyClient()
+        client._amount_precisions["doge_idr"] = 0
+        refreshed = {"called": False}
+
+        def _track_refresh():
+            refreshed["called"] = True
+
+        client._maybe_refresh_pair_min_orders = _track_refresh
+        amt, prec = client.format_amount("doge_idr", 150.7)
+        self.assertFalse(refreshed["called"])
+        self.assertEqual(prec, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

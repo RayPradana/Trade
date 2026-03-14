@@ -198,13 +198,18 @@ class IndodaxClient:
             # If this minimum is a whole number the exchange rejects fractional
             # amounts ("amount can't be in decimal.") → precision 0.
             # Otherwise default to 8 decimals (standard crypto precision).
+            # Use Decimal for accurate decimal-place counting, avoiding
+            # float-comparison edge cases.
             amt_precision = 8  # default for fractional coins (BTC, ETH, etc.)
-            try:
-                min_traded = float(info.get("trade_min_traded_currency") or 0)
-            except (TypeError, ValueError):
-                min_traded = 0.0
-            if min_traded > 0 and float(int(min_traded)) == min_traded:
-                amt_precision = 0
+            raw_min = info.get("trade_min_traded_currency")
+            if raw_min is not None:
+                try:
+                    d = Decimal(str(raw_min)).normalize()
+                    if d > 0 and d.as_tuple().exponent >= 0:
+                        # No decimal places — integer coin (e.g. 1, 100, 50000)
+                        amt_precision = 0
+                except (InvalidOperation, ValueError, TypeError):
+                    pass
             for key in all_keys:
                 self._amount_precisions[key] = amt_precision
             loaded += 1
@@ -395,6 +400,11 @@ class IndodaxClient:
             raise RuntimeError(f"Failed to obtain private WS token: {data}")
         return {"connToken": ret["connToken"], "channel": ret["channel"]}
 
+    def _maybe_refresh_pair_min_orders(self) -> None:
+        """Auto-refresh pair minimum-order and amount-precision caches when stale."""
+        if not self._amount_precisions or self.is_pair_min_order_cache_stale():
+            self.load_pair_min_orders()
+
     def _maybe_refresh_price_increments(self) -> None:
         if not self._price_increments or self.is_price_increment_cache_stale():
             self.load_price_increments()
@@ -444,16 +454,23 @@ class IndodaxClient:
         field cached by :meth:`load_pair_min_orders`.  Returns the (possibly
         rounded) amount plus the decimal precision for string formatting.
 
-        If no pair info is cached, defaults to 8 decimal places — the standard
-        crypto precision that works for most pairs.
+        If no pair info is cached, attempts to auto-refresh from the API.
+        Falls back to 8 decimal places when the pair is still unknown.
         """
         key = pair.lower()
         precision = self._amount_precisions.get(key)
         if precision is None:
-            # Fallback: try without underscores (e.g. "dogeidr" for "doge_idr")
-            # to handle cases where ticker_id was absent from /api/pairs.
             alt_key = key.replace("_", "")
-            precision = self._amount_precisions.get(alt_key, 8)
+            precision = self._amount_precisions.get(alt_key)
+        if precision is None:
+            # Cache miss — try refreshing pair data from the API.
+            try:
+                self._maybe_refresh_pair_min_orders()
+            except Exception:
+                pass
+            precision = self._amount_precisions.get(key)
+            if precision is None:
+                precision = self._amount_precisions.get(key.replace("_", ""), 8)
         if precision == 0:
             return float(round(amount)), 0
         return round(amount, precision), precision
@@ -529,7 +546,24 @@ class IndodaxClient:
         if time_in_force:
             payload["time_in_force"] = time_in_force
 
-        return self._enqueue_private("trade", payload)
+        try:
+            return self._enqueue_private("trade", payload)
+        except RuntimeError as exc:
+            if "can't be in decimal" not in str(exc):
+                raise
+            # The exchange requires integer amounts for this pair.
+            # Update the precision cache and retry with integer formatting.
+            pair_key = pair.lower()
+            for k in (pair_key, pair_key.replace("_", "")):
+                self._amount_precisions[k] = 0
+            logger.warning(
+                "Retrying order with integer amount for %s (was: %s)",
+                pair, payload.get(base_coin, payload.get("idr")),
+            )
+            if base_coin in payload:
+                coin_val = btc if btc is not None else amount
+                payload[base_coin] = str(int(round(coin_val)))
+            return self._enqueue_private("trade", payload)
 
     def cancel_order(self, pair: str, order_id: str, order_type: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"pair": pair, "order_id": order_id}
