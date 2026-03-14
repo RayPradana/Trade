@@ -7773,3 +7773,352 @@ class ReentryAnalysisTests(unittest.TestCase):
         snap = {"regime": None, "trend": None, "orderbook": None, "levels": None, "price": 0}
         result = trader.analyze_reentry_opportunity(snap)
         self.assertIsNone(result)
+
+
+# ── Tests for partial-fill resume and entry quality scoring ───────────────
+
+
+class ResumePendingBuyPartialFillTests(unittest.TestCase):
+    """Tests for partial-fill handling in resume_pending_buy."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, price, **extra):
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    def test_partial_buy_fill_remarked_pending(self):
+        """When resume_pending_buy gets a partial fill, the remainder should
+        be re-marked as pending so it is retried."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                # Partial fill: only receive half the requested amount
+                return {"success": 1, "return": {f"receive_{coin}": str(amount * 0.5), "order_id": "456"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "5000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 30000.0, "min_coin": 0.0}
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Mark 1000 coins as pending buy (1000 * 101 = 101_000 IDR total,
+        # so remainder of 500 * 101 = 50_500 > 30_000 min)
+        trader.tracker.mark_pending_buy(1000.0, 100.0)
+        self.assertTrue(trader.tracker.has_pending_buy)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertAlmostEqual(result["amount"], 500.0)
+        # 500 filled
+        self.assertAlmostEqual(trader.tracker.base_position, 500.0)
+        # Remainder should still be pending
+        self.assertTrue(trader.tracker.has_pending_buy,
+                        "Remainder should be re-marked as pending_buy")
+        self.assertAlmostEqual(trader.tracker.pending_orders[0]["amount"], 500.0,
+                               msg="Remaining 500 should be marked pending")
+
+
+class ResumePendingSellPartialFillTests(unittest.TestCase):
+    """Tests for partial-fill handling in resume_pending_sell."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_partial_sell_fill_remarked_pending(self):
+        """When resume_pending_sell gets a partial fill, the remainder
+        should be re-marked as pending_sell."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                # Partial fill: only sell 3 out of 5
+                return {"success": 1, "return": {"spend_btc": "3.0", "order_id": "888"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+            chase_max_retries=1,
+            order_timeout_to_market=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+        trader.tracker.mark_pending_sell(5.0, 105.0)
+        self.assertTrue(trader.tracker.has_pending_sell)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "partial")
+        self.assertAlmostEqual(outcome["amount"], 3.0)
+        self.assertAlmostEqual(outcome["remaining"], 2.0)
+        # 3 sold, 2 remaining as position
+        self.assertAlmostEqual(trader.tracker.base_position, 2.0)
+        # Remainder should be marked as pending sell
+        self.assertTrue(trader.tracker.has_pending_sell,
+                        "Remaining 2 BTC should be re-marked as pending_sell")
+        self.assertAlmostEqual(trader.tracker.pending_sell_orders[0]["amount"], 2.0)
+
+
+class ForceSellPartialFillTests(unittest.TestCase):
+    """Tests for partial-fill handling in force_sell chase loop."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_force_sell_partial_marks_remainder_pending(self):
+        """When force_sell chase sells partially, the remainder should be
+        marked as pending_sell."""
+
+        class _LiveClient(GuardedTrader._Client):
+            _call_count = 0
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                self._call_count += 1
+                if self._call_count == 1:
+                    # First order: placed on book, not filled
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "999"}}
+                elif self._call_count == 2:
+                    # Chase retry: partial fill of 3 BTC
+                    return {"success": 1, "return": {"spend_btc": "3.0", "order_id": "1000"}}
+                else:
+                    # Subsequent chase: no fill
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "1001"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def invalidate_open_orders_cache(self, pair):
+                pass
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+            chase_max_retries=2,
+            order_timeout_to_market=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": None}
+        outcome = trader.force_sell(snapshot)
+
+        # Should have partial fill recorded (3 BTC sold)
+        self.assertEqual(outcome["status"], "pending_sell")
+        self.assertAlmostEqual(outcome["amount"], 3.0)
+        self.assertAlmostEqual(outcome.get("remaining", 0), 2.0)
+        # Remaining 2 BTC should still be in position and marked pending sell
+        self.assertAlmostEqual(trader.tracker.base_position, 2.0)
+        self.assertTrue(trader.tracker.has_pending_sell,
+                        "Remaining 2 BTC should be marked as pending_sell")
+
+
+class EntryQualityScoringTests(unittest.TestCase):
+    """Tests for the entry quality scoring mechanism."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_trader(self, min_score=0.35):
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            entry_quality_min_score=min_score,
+            min_confidence=0.0,
+        )
+        trader = Trader(config)
+        # Stub client so maybe_execute doesn't make real API calls
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        return trader
+
+    def test_high_quality_entry_allowed(self):
+        """Strong trending_up regime + up trend should pass quality check."""
+        trader = self._make_trader(min_score=0.35)
+        regime = MarketRegime(regime="trending_up", strength=0.7, description="test")
+        trend = TrendResult(direction="up", strength=0.05, fast_ma=101.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9, trend=trend)
+        snap["regime"] = regime
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be blocked by entry quality (may succeed or hit other guards)
+        self.assertNotIn("entry_quality_low", outcome.get("reason", ""))
+
+    def test_low_quality_entry_blocked(self):
+        """Trending_down regime + down trend should fail quality check."""
+        trader = self._make_trader(min_score=0.35)
+        regime = MarketRegime(regime="trending_down", strength=0.7, description="test")
+        trend = TrendResult(direction="down", strength=0.05, fast_ma=99.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9, trend=trend)
+        snap["regime"] = regime
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("entry_quality_low", outcome["reason"])
+
+    def test_quality_check_disabled_when_zero(self):
+        """When entry_quality_min_score=0, the check is disabled."""
+        trader = self._make_trader(min_score=0.0)
+        regime = MarketRegime(regime="trending_down", strength=0.7, description="test")
+        trend = TrendResult(direction="down", strength=0.05, fast_ma=99.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9, trend=trend)
+        snap["regime"] = regime
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be blocked by entry quality (min_score=0 disables the check)
+        self.assertNotIn("entry_quality_low", outcome.get("reason", ""))
+
+    def test_score_neutral_when_no_signals(self):
+        """When no signals available, score should be neutral (0.5)."""
+        trader = self._make_trader(min_score=0.35)
+        snap = {"pair": "btc_idr", "price": 100.0}
+        score = trader._entry_quality_score(snap)
+        self.assertAlmostEqual(score, 0.5,
+                               msg="No-signal score should be neutral 0.5")
+
+    def test_score_high_for_strong_uptrend(self):
+        """Strong uptrend with all signals bullish should give high score."""
+        trader = self._make_trader()
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "regime": MarketRegime(regime="trending_up", strength=0.8, description="test"),
+            "trend": TrendResult(direction="up", strength=0.06, fast_ma=102.0, slow_ma=100.0),
+            "volume_accel": type("VA", (), {"detected": True, "acceleration_ratio": 2.5})(),
+            "micro_trend": type("MT", (), {"direction": "up", "strength": 0.05})(),
+            "ob_pressure": type("OP", (), {"signal": "buy", "pressure": 0.6})(),
+        }
+        score = trader._entry_quality_score(snap)
+        self.assertGreater(score, 0.6,
+                           f"Score should be high for bullish signals, got {score}")
+
+    def test_score_low_for_downtrend(self):
+        """Downtrend signals should produce a low score."""
+        trader = self._make_trader()
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "regime": MarketRegime(regime="trending_down", strength=0.8, description="test"),
+            "trend": TrendResult(direction="down", strength=0.06, fast_ma=98.0, slow_ma=100.0),
+            "volume_accel": type("VA", (), {"detected": False, "acceleration_ratio": 0.5})(),
+            "micro_trend": type("MT", (), {"direction": "down", "strength": 0.05})(),
+            "ob_pressure": type("OP", (), {"signal": "sell", "pressure": 0.6})(),
+        }
+        score = trader._entry_quality_score(snap)
+        self.assertLess(score, 0.2,
+                        f"Score should be low for bearish signals, got {score}")
