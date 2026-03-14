@@ -3372,17 +3372,21 @@ class Trader:
         if self.config.min_liquidity_depth_idr > 0 and decision.action == "buy":
             total_depth = self._liquidity_depth_idr(depth, price)
             if total_depth is None:
-                # Depth data unavailable (API error / unexpected format).
-                # Treat as thin market — safer to skip than enter blindly.
+                # Execution-depth REST call returned an unexpected format
+                # (e.g. the API returned an error dict).  Fall back to the
+                # pre-validated snapshot depth before concluding the data is
+                # truly unavailable.
+                _snap_raw = snapshot.get("raw_depth") or {}
+                total_depth = self._liquidity_depth_idr(_snap_raw, price)
+            if total_depth is None:
+                # Both depth sources are unavailable.  Per the
+                # _liquidity_depth_idr docstring the caller must skip the
+                # liquidity check (allow the trade) rather than blocking a
+                # valid signal due to a transient API failure.
                 logger.warning(
-                    "Depth data unavailable for %s — skipping buy (no liquidity data)",
+                    "Depth data unavailable for %s — skipping liquidity check (allowing trade)",
                     snapshot["pair"],
                 )
-                return {
-                    "status": "skipped",
-                    "reason": "depth_data_unavailable",
-                    "portfolio": _tracker.as_dict(price),
-                }
             elif total_depth < self.config.min_liquidity_depth_idr:
                 logger.info(
                     "Thin market on %s: depth Rp%.0f < min Rp%.0f — skipping buy",
@@ -3422,6 +3426,28 @@ class Trader:
                 )
             else:
                 available_cash = _tracker.cash
+                # ── Cash sync with exchange ──────────────────────────────────
+                # When the tracker shows no cash (all capital deployed) but the
+                # exchange might have IDR available (e.g. after a bot restart
+                # without a full position restore), re-query the real balance and
+                # use it for sizing — prevents false "insufficient balance" skips.
+                if (
+                    available_cash <= 0
+                    and self.config.api_key is not None
+                    and getattr(self.config, "balance_check_enabled", False)
+                ):
+                    try:
+                        _acct = self.client.get_account_info()
+                        _bal = (_acct.get("return") or {}).get("balance") or {}
+                        _real_idr = float(_bal.get("idr") or "0")
+                        if _real_idr > available_cash:
+                            logger.info(
+                                "Cash sync for buy on %s: tracker=%.2f → exchange=%.2f",
+                                _pair, available_cash, _real_idr,
+                            )
+                            available_cash = _real_idr
+                    except Exception as _cash_exc:
+                        logger.debug("Cash sync failed for %s: %s", _pair, _cash_exc)
             max_affordable = max(0.0, available_cash / (reference_price * self._FEE_BUFFER))
             effective_amount = min(decision.amount, max_affordable)
 
@@ -3468,6 +3494,30 @@ class Trader:
                 )
         elif decision.action == "sell":
             max_sellable = max(0.0, _tracker.base_position)
+            # ── Position sync with exchange ──────────────────────────────────
+            # When the tracker shows no position but the exchange holds a real
+            # balance (e.g. after a restart / manual trade outside the bot),
+            # re-query the real balance and update the tracker so the sell is
+            # not silently skipped.
+            if (
+                max_sellable <= 0
+                and self.config.api_key is not None
+                and getattr(self.config, "balance_check_enabled", False)
+            ):
+                try:
+                    _acct = self.client.get_account_info()
+                    _bal = (_acct.get("return") or {}).get("balance") or {}
+                    _base_coin = _pair.split("_")[0].lower()
+                    _real_pos = float(_bal.get(_base_coin) or "0")
+                    if _real_pos > 0:
+                        logger.info(
+                            "Position sync for sell on %s: tracker=%.8f → exchange=%.8f — using exchange balance",
+                            _pair, _tracker.base_position, _real_pos,
+                        )
+                        _tracker.base_position = _real_pos
+                        max_sellable = _real_pos
+                except Exception as _pos_exc:
+                    logger.debug("Position sync failed for %s: %s", _pair, _pos_exc)
             effective_amount = min(decision.amount, max_sellable)
             # When selling, if the amount is below the exchange minimum but we
             # hold the full position, sell everything rather than being stuck

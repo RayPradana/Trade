@@ -8235,7 +8235,7 @@ class GlobalVolumeFilterTests(unittest.TestCase):
 
 # ── Depth data unavailable tests ──────────────────────────────────────────────
 class DepthUnavailableTests(unittest.TestCase):
-    """Tests that buy is skipped when depth data is unavailable and
+    """Tests for depth fallback and allow-on-unavailable behaviour when
     min_liquidity_depth_idr is configured."""
 
     def setUp(self):
@@ -8244,22 +8244,171 @@ class DepthUnavailableTests(unittest.TestCase):
     def tearDown(self):
         logging.disable(logging.NOTSET)
 
-    def test_depth_unavailable_skips_buy(self):
-        """When depth data returns None and min_liquidity_depth_idr > 0, skip buy."""
+    def test_depth_unavailable_allows_buy(self):
+        """When both depth sources return None, trade is allowed (not blocked)."""
         config = BotConfig(api_key=None, min_liquidity_depth_idr=100_000.0, dry_run=True)
         trader = Trader(config)
-        # Depth returns None values (simulating API error)
         trader.client = type("_C", (), {
             "get_depth": lambda self, *a, **kw: {
                 "buy": [["100", "10"]], "sell": [["100.05", "10"]],
             },
         })()
-        # Monkey-patch _liquidity_depth_idr to return None
+        # Monkey-patch _liquidity_depth_idr to return None for both calls
         trader._liquidity_depth_idr = lambda depth, price: None
         snap = _make_buy_snap(price=100.0, confidence=0.9)
         outcome = trader.maybe_execute(snap)
+        # Trade must NOT be blocked with depth_data_unavailable
+        self.assertNotEqual(outcome.get("reason", ""), "depth_data_unavailable")
+        # It should be executed (dry-run) or skipped for an unrelated reason
+        self.assertIn(outcome["status"], ("executed", "simulated", "skipped", "pending"))
+
+    def test_depth_unavailable_falls_back_to_snap_raw_depth(self):
+        """When execution-depth returns bad format, snapshot raw_depth is used."""
+        config = BotConfig(
+            api_key=None,
+            min_liquidity_depth_idr=1_000_000_000.0,
+            small_coin_min_depth_idr=0.0,  # disable koin_sepi guard
+            dry_run=True,
+        )
+        trader = Trader(config)
+        # Execution-depth REST call returns an error dict (no buy/sell keys)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"error": "rate limited"},
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        # raw_depth in snapshot has valid but thin data (depth = 100*10 + 100.05*10 = 2000.5)
+        snap["raw_depth"] = {
+            "buy": [["100", "10"]],
+            "sell": [["100.05", "10"]],
+        }
+        outcome = trader.maybe_execute(snap)
+        # Thin market from snapshot raw_depth should trigger thin_market skip
         self.assertEqual(outcome["status"], "skipped")
-        self.assertIn("depth_data_unavailable", outcome["reason"])
+        self.assertIn("thin_market", outcome["reason"])
+
+    def test_depth_fallback_to_snap_allows_when_deep_enough(self):
+        """When execution-depth is unavailable but snapshot raw_depth meets threshold, allow."""
+        config = BotConfig(api_key=None, min_liquidity_depth_idr=100.0, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"error": "unavailable"},
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        # raw_depth has 10 coins at 100 IDR = 1000 IDR — above the 100 IDR threshold
+        snap["raw_depth"] = {
+            "buy": [["100", "10"]],
+            "sell": [["100.05", "10"]],
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome.get("reason", ""), "depth_data_unavailable")
+        self.assertNotIn("thin_market", outcome.get("reason", ""))
+
+
+# ── Balance / position sync tests ─────────────────────────────────────────────
+class BalanceSyncTests(unittest.TestCase):
+    """Tests for on-the-fly exchange balance sync when tracker shows zero cash
+    (buy) or zero position (sell), preventing false 'insufficient balance or
+    position' skips after a restart / manual trade."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _live_client(self, idr: float = 0.0, btc: float = 0.0):
+        """Minimal client stub that returns controlled balances."""
+        class _C:
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100", "10"]], "sell": [["100.05", "10"]]}
+
+            def get_account_info(self):
+                return {
+                    "success": 1,
+                    "return": {"balance": {"idr": str(idr), "btc": str(btc)}},
+                }
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+        return _C()
+
+    def test_sell_syncs_position_from_exchange(self):
+        """When tracker.base_position=0 but exchange has balance, sell proceeds."""
+        config = BotConfig(
+            api_key="k", api_secret="s",
+            balance_check_enabled=True,
+            multi_position_enabled=False,
+            initial_capital=0.0,
+            dry_run=True,
+        )
+        trader = Trader(config)
+        trader.client = self._live_client(idr=0.0, btc=0.5)
+        # Tracker starts with zero position — simulates a restart / state loss
+        self.assertEqual(trader.tracker.base_position, 0.0)
+        snap = _make_buy_snap(price=100.0, action="sell", confidence=0.9)
+        snap["decision"] = StrategyDecision(
+            mode="scalping", action="sell", confidence=0.9,
+            reason="test", target_price=100.0, amount=0.5,
+            stop_loss=95.0, take_profit=105.0,
+        )
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be skipped with 'insufficient balance or position'
+        self.assertNotEqual(outcome.get("reason", ""), "insufficient balance or position")
+        # Tracker should have been updated to the real balance
+        # (either via the sync or the trade itself)
+        self.assertIn(outcome["status"], ("executed", "simulated", "skipped", "pending"))
+
+    def test_sell_no_sync_when_dry_run_no_key(self):
+        """Sell stays as 'insufficient' when api_key=None (no sync possible)."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            multi_position_enabled=False,
+            initial_capital=0.0,
+        )
+        trader = Trader(config)
+        trader.client = self._live_client(idr=0.0, btc=0.5)
+        # Tracker has zero position; api_key=None prevents sync
+        snap = _make_buy_snap(price=100.0, action="sell", confidence=0.9)
+        snap["decision"] = StrategyDecision(
+            mode="scalping", action="sell", confidence=0.9,
+            reason="test", target_price=100.0, amount=0.5,
+            stop_loss=95.0, take_profit=105.0,
+        )
+        outcome = trader.maybe_execute(snap)
+        # No api_key → no balance sync → insufficient skip is expected
+        self.assertEqual(outcome.get("reason", ""), "insufficient balance or position")
+
+    def test_buy_syncs_cash_from_exchange(self):
+        """When tracker.cash=0 but exchange has IDR, buy is allowed."""
+        config = BotConfig(
+            api_key="k", api_secret="s",
+            balance_check_enabled=True,
+            multi_position_enabled=False,
+            initial_capital=0.0,
+            dry_run=True,
+        )
+        trader = Trader(config)
+        trader.client = self._live_client(idr=500_000.0, btc=0.0)
+        self.assertEqual(trader.tracker.cash, 0.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be skipped for insufficient balance
+        self.assertNotEqual(outcome.get("reason", ""), "insufficient balance or position")
+        self.assertIn(outcome["status"], ("executed", "simulated", "skipped", "pending"))
+
+    def test_buy_no_sync_when_api_key_missing(self):
+        """Buy stays insufficient when api_key=None (no sync possible)."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            multi_position_enabled=False,
+            initial_capital=0.0,
+        )
+        trader = Trader(config)
+        trader.client = self._live_client(idr=500_000.0, btc=0.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome.get("reason", ""), "insufficient balance or position")
 
 
 # ── Config defaults tests ─────────────────────────────────────────────────────
