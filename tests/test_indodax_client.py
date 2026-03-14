@@ -63,6 +63,13 @@ class IndodaxClientPrecisionTest(unittest.TestCase):
         self.assertEqual(resp["btc"], "0.10000000")
         self.assertNotIn("amount", resp)
 
+    def test_sell_idr_pair_sends_coin_amount_only(self):
+        """Per API docs: sell must send coin amount, not idr."""
+        resp = self.client.create_order("btc_idr", "sell", 500000000, 0.001)
+        self.assertEqual(resp["btc"], "0.00100000")
+        self.assertNotIn("idr", resp)
+        self.assertNotIn("amount", resp)
+
     def test_price_uses_increment_when_cached(self):
         self.client._price_increments = {"dupe_idr": "0.01"}
         self.client._price_increments_expires = time.time() + 3600
