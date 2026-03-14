@@ -6903,3 +6903,368 @@ class PendingSellTests(unittest.TestCase):
         snapshot = {"pair": "btc_idr", "price": 105.0}
         outcome = trader.resume_pending_sell(snapshot)
         self.assertEqual(outcome["status"], "no_pending")
+
+
+class InsufficientBalanceTests(unittest.TestCase):
+    """Tests for handling 'Insufficient balance' API errors."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, price, **extra):
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    # ── resume_pending_buy: IDR balance check ──────────────────────────────
+
+    def test_resume_pending_buy_adjusts_amount_on_low_idr(self):
+        """resume_pending_buy should reduce amount when IDR balance is low."""
+
+        created_orders = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created_orders.append({"amount": amount, "price": price})
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": str(amount), "order_id": "789"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                # Only 50k IDR available — not enough for 500 coins @ ~101
+                return {"return": {"balance": {"ponke": "0", "idr": "50000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        # Amount should be reduced to fit the available IDR balance
+        self.assertTrue(len(created_orders) > 0)
+        self.assertLess(created_orders[0]["amount"], 500.0,
+                        "Amount should be adjusted below original 500 to fit IDR balance")
+
+    def test_resume_pending_buy_cancels_when_no_idr(self):
+        """resume_pending_buy should cancel when IDR balance is zero."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "cancelled_zero")
+        self.assertFalse(trader.tracker.has_pending_buy)
+
+    # ── resume_pending_buy: API error ──────────────────────────────────────
+
+    def test_resume_pending_buy_handles_insufficient_balance_error(self):
+        """resume_pending_buy should catch 'Insufficient balance' and cancel."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                return None
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "cancelled_insufficient")
+        self.assertFalse(trader.tracker.has_pending_buy)
+
+    # ── resume_pending_sell: API error ─────────────────────────────────────
+
+    def test_resume_pending_sell_handles_insufficient_balance_error(self):
+        """resume_pending_sell should catch 'Insufficient balance' and cancel."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "100000"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                return None
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+        trader.tracker.mark_pending_sell(500.0, 105.0)
+
+        snap = self._make_snap("ponke_idr", 105.0)
+        result = trader.resume_pending_sell(snap)
+
+        self.assertEqual(result["status"], "cancelled_insufficient")
+        self.assertFalse(trader.tracker.has_pending_sell)
+
+    # ── Chase loop: insufficient balance ───────────────────────────────────
+
+    def test_buy_chase_handles_insufficient_balance(self):
+        """Buy chase loop should catch 'Insufficient balance' and accept partial fill."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # First order placed but not filled
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                # Chase retry: insufficient balance
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "0", "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = {
+            "pair": "cjl_idr",
+            "price": 270.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=270.0,
+                amount=111.11,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        # Should NOT raise — the chase loop catches 'Insufficient balance' gracefully
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 1 failed chase attempt (caught, not re-raised)
+        self.assertEqual(len(created), 2)
+
+    def test_sell_chase_handles_insufficient_balance(self):
+        """Sell chase loop should catch 'Insufficient balance' and accept partial fill."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # First order placed but not filled
+                    return {"success": 1, "return": {"order_id": "1", "spend_cjl": 0}}
+                # Chase retry: insufficient balance
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "111", "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Pre-establish a position so we can sell
+        trader.tracker.record_trade("buy", 200.0, 111.11)
+
+        snap = {
+            "pair": "cjl_idr",
+            "price": 270.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="sell",
+                confidence=0.9,
+                reason="test",
+                target_price=270.0,
+                amount=111.11,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        # Should NOT raise — the chase loop catches 'Insufficient balance' gracefully
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 1 failed chase attempt (caught, not re-raised)
+        self.assertEqual(len(created), 2)

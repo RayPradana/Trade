@@ -3332,6 +3332,21 @@ class Trader:
                 self._consecutive_errors = 0
                 # Invalidate balance cache so next getInfo reflects the new order.
                 getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+            except RuntimeError as exc:
+                if "Insufficient balance" in str(exc):
+                    logger.warning(
+                        "Insufficient balance for %s %s @ Rp%.2f × %.8f — skipping step (pair=%s)",
+                        decision.action, snapshot["pair"].split("_")[0].upper(),
+                        reference_price, step_amount, snapshot["pair"],
+                    )
+                    remaining_amount -= step_amount
+                    executed_steps.append({"amount": 0.0, "price": reference_price, "skipped": True})
+                    continue
+                self._consecutive_errors += 1
+                if self.config.circuit_breaker_max_errors > 0 and self._consecutive_errors >= self.config.circuit_breaker_max_errors:
+                    self._circuit_breaker_until = time.time() + self.config.circuit_breaker_pause_seconds
+                    logger.warning("Circuit breaker triggered after %d errors: %s", self._consecutive_errors, exc)
+                raise
             except Exception as exc:
                 self._consecutive_errors += 1
                 if self.config.circuit_breaker_max_errors > 0 and self._consecutive_errors >= self.config.circuit_breaker_max_errors:
@@ -3423,8 +3438,9 @@ class Trader:
                     try:
                         order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, _chase_amount)
                     except RuntimeError as _chase_exc:
+                        _chase_exc_str = str(_chase_exc)
                         _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
-                        _parsed = _parse_min_chase(str(_chase_exc)) if callable(_parse_min_chase) else None
+                        _parsed = _parse_min_chase(_chase_exc_str) if callable(_parse_min_chase) else None
                         if _parsed is not None:
                             logger.warning(
                                 "Chase[%d] buy hit exchange minimum order (%.8f %s) — accepting partial fill (pair=%s)",
@@ -3438,6 +3454,12 @@ class Trader:
                                     _cached["min_idr"] = _new_min_idr
                                 if _parsed > _cached.get("min_coin", 0.0):
                                     _cached["min_coin"] = _parsed
+                            break
+                        if "Insufficient balance" in _chase_exc_str:
+                            logger.warning(
+                                "Chase[%d] buy insufficient balance — accepting partial fill (pair=%s)",
+                                _chase_i + 1, snapshot["pair"],
+                            )
                             break
                         raise
                     getattr(self.client, "invalidate_account_info_cache", lambda: None)()
@@ -3480,10 +3502,20 @@ class Trader:
                             "Chase exhausted — converting buy to market-price order at %.10f (pair=%s)",
                             market_price, snapshot["pair"],
                         )
-                        order_resp = self.client.create_order(snapshot["pair"], decision.action, market_price, _chase_amount)
-                        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
-                        reference_price = market_price
-                        received_amount = _calc_received_amount(order_resp, pre_step_position)
+                        try:
+                            order_resp = self.client.create_order(snapshot["pair"], decision.action, market_price, _chase_amount)
+                        except RuntimeError as _mkt_exc:
+                            if "Insufficient balance" in str(_mkt_exc):
+                                logger.warning(
+                                    "Chase market buy: insufficient balance — accepting partial fill (pair=%s)",
+                                    snapshot["pair"],
+                                )
+                            else:
+                                raise
+                        else:
+                            getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                            reference_price = market_price
+                            received_amount = _calc_received_amount(order_resp, pre_step_position)
 
                 if received_amount <= 0:
                     logger.info(
@@ -3575,8 +3607,9 @@ class Trader:
                                 snapshot["pair"], decision.action, retry_price, _chase_amount,
                             )
                         except RuntimeError as _chase_exc:
+                            _chase_exc_str = str(_chase_exc)
                             _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
-                            _parsed = _parse_min_chase(str(_chase_exc)) if callable(_parse_min_chase) else None
+                            _parsed = _parse_min_chase(_chase_exc_str) if callable(_parse_min_chase) else None
                             if _parsed is not None:
                                 logger.warning(
                                     "Chase[%d] sell hit exchange minimum order (%.8f %s) — accepting partial fill (pair=%s)",
@@ -3590,6 +3623,12 @@ class Trader:
                                         _cached["min_idr"] = _new_min_idr
                                     if _parsed > _cached.get("min_coin", 0.0):
                                         _cached["min_coin"] = _parsed
+                                break
+                            if "Insufficient balance" in _chase_exc_str:
+                                logger.warning(
+                                    "Chase[%d] sell insufficient balance — accepting partial fill (pair=%s)",
+                                    _chase_i + 1, snapshot["pair"],
+                                )
                                 break
                             raise
                         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
@@ -3633,14 +3672,24 @@ class Trader:
                                 "Chase exhausted — converting sell to market-price order at %.10f (pair=%s)",
                                 market_price, snapshot["pair"],
                             )
-                            order_resp = self.client.create_order(
-                                snapshot["pair"], decision.action, market_price, _chase_amount,
-                            )
-                            getattr(self.client, "invalidate_account_info_cache", lambda: None)()
-                            reference_price = market_price
-                            _sell_spent = float(
-                                (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
-                            )
+                            try:
+                                order_resp = self.client.create_order(
+                                    snapshot["pair"], decision.action, market_price, _chase_amount,
+                                )
+                            except RuntimeError as _mkt_exc:
+                                if "Insufficient balance" in str(_mkt_exc):
+                                    logger.warning(
+                                        "Chase market sell: insufficient balance — accepting partial fill (pair=%s)",
+                                        snapshot["pair"],
+                                    )
+                                else:
+                                    raise
+                            else:
+                                getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                                reference_price = market_price
+                                _sell_spent = float(
+                                    (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                                )
 
                     # Update received for the record_trade below
                     if _sell_spent > 0:
@@ -4125,14 +4174,46 @@ class Trader:
                 self.multi_manager.return_position_cash(pair)
             return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
 
-        # Pre-order balance for fill verification.
+        # Pre-order balance for fill verification & IDR sufficiency check.
         pre_balance = 0.0
+        idr_balance = 0.0
         try:
             acct_info = self.client.get_account_info()
             balance_dict = (acct_info.get("return") or {}).get("balance") or {}
             pre_balance = float(balance_dict.get(base_coin) or "0")
+            idr_balance = float(balance_dict.get("idr") or "0")
         except Exception:
             pass
+
+        # Check IDR balance is sufficient; adjust amount downward if needed.
+        needed_idr = amount * retry_price
+        if idr_balance > 0 and needed_idr > idr_balance:
+            adjusted = idr_balance / retry_price * 0.995  # 0.5% margin for fees
+            if _eff_min_idr > 0 and adjusted * retry_price < _eff_min_idr:
+                logger.warning(
+                    "resume_pending_buy: IDR balance Rp%.0f insufficient for "
+                    "Rp%.0f and adjusted amount below minimum — cancelling (pair=%s)",
+                    idr_balance, needed_idr, pair,
+                )
+                _tracker.pending_orders.clear()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            logger.warning(
+                "resume_pending_buy: IDR balance Rp%.0f < needed Rp%.0f — "
+                "adjusting buy amount %.8f → %.8f (pair=%s)",
+                idr_balance, needed_idr, amount, adjusted, pair,
+            )
+            amount = adjusted
+        elif idr_balance <= 0 and not self.config.dry_run:
+            logger.warning(
+                "resume_pending_buy: no IDR balance — cancelling pending buy (pair=%s)",
+                pair,
+            )
+            _tracker.pending_orders.clear()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_zero", "pair": pair, "price": retry_price}
 
         logger.info(
             "🔄 Resuming pending buy %.8f %s @ Rp%.2f (pair=%s)",
@@ -4141,8 +4222,9 @@ class Trader:
         try:
             order_resp = self.client.create_order(pair, "buy", retry_price, amount)
         except RuntimeError as exc:
+            exc_str = str(exc)
             _parse_min = getattr(self.client, "parse_minimum_order_error", None)
-            _parsed = _parse_min(str(exc)) if callable(_parse_min) else None
+            _parsed = _parse_min(exc_str) if callable(_parse_min) else None
             if _parsed is not None:
                 logger.warning(
                     "Resume pending buy hit exchange minimum — cancelling (pair=%s)", pair,
@@ -4151,6 +4233,14 @@ class Trader:
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            if "Insufficient balance" in exc_str:
+                logger.warning(
+                    "Resume pending buy: insufficient balance — cancelling (pair=%s)", pair,
+                )
+                _tracker.pending_orders.clear()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_insufficient", "pair": pair, "price": retry_price}
             raise
         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
 
@@ -4324,8 +4414,9 @@ class Trader:
         try:
             order_resp = self.client.create_order(pair, "sell", retry_price, amount)
         except RuntimeError as exc:
+            exc_str = str(exc)
             _parse_min = getattr(self.client, "parse_minimum_order_error", None)
-            _parsed = _parse_min(str(exc)) if callable(_parse_min) else None
+            _parsed = _parse_min(exc_str) if callable(_parse_min) else None
             if _parsed is not None:
                 logger.warning(
                     "Resume pending sell hit exchange minimum — clearing dust (pair=%s)",
@@ -4336,6 +4427,15 @@ class Trader:
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            if "Insufficient balance" in exc_str:
+                logger.warning(
+                    "Resume pending sell: insufficient balance — clearing (pair=%s)", pair,
+                )
+                _tracker.clear_pending_sell()
+                _tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_insufficient", "pair": pair, "price": retry_price}
             raise
         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
 
@@ -4603,8 +4703,26 @@ class Trader:
                         }
                         self._persist_after_trade(pair)
                         return outcome
-            # Amount was not below the parsed minimum — bubble up so the caller
-            # sees the real failure instead of silently clearing the position.
+            # Amount was not below the parsed minimum — check for insufficient balance
+            if "Insufficient balance" in exc_str:
+                logger.warning(
+                    "force_sell: insufficient balance for %s — clearing position",
+                    pair,
+                )
+                _tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                outcome = {
+                    "status": "dust_cleared",
+                    "pair": pair,
+                    "price": reference_price,
+                    "amount": amount,
+                    "portfolio": _tracker.as_dict(reference_price),
+                }
+                self._persist_after_trade(pair)
+                return outcome
+            # bubble up so the caller sees the real failure instead of silently
+            # clearing the position.
             raise
 
         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
@@ -4721,11 +4839,18 @@ class Trader:
             try:
                 order_resp = self.client.create_order(pair, "sell", retry_price, _chase_amount)
             except RuntimeError as _chase_exc:
+                _chase_exc_str = str(_chase_exc)
                 _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
-                _parsed = _parse_min_chase(str(_chase_exc)) if callable(_parse_min_chase) else None
+                _parsed = _parse_min_chase(_chase_exc_str) if callable(_parse_min_chase) else None
                 if _parsed is not None:
                     logger.warning(
                         "force_sell chase[%d] hit exchange minimum — accepting partial (pair=%s)",
+                        _chase_i + 1, pair,
+                    )
+                    break
+                if "Insufficient balance" in _chase_exc_str:
+                    logger.warning(
+                        "force_sell chase[%d] insufficient balance — accepting partial (pair=%s)",
                         _chase_i + 1, pair,
                     )
                     break
