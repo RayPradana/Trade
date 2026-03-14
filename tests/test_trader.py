@@ -4604,6 +4604,15 @@ class PairMinOrderCacheTests(unittest.TestCase):
         result = IndodaxClient.parse_minimum_order_error("Some other error")
         self.assertIsNone(result)
 
+    def test_parse_minimum_order_error_with_is(self) -> None:
+        """parse_minimum_order_error must handle 'Minimum order is X COIN' format."""
+        from bot.indodax_client import IndodaxClient
+
+        msg = "API error: {'success': 0, 'error': 'Minimum order is 37.03703703 CJL.', 'error_code': ''}"
+        result = IndodaxClient.parse_minimum_order_error(msg)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 37.03703703, places=5)
+
 
 class TimeBasedExitTest(unittest.TestCase):
     """Tests for the time-based exit feature (MAX_HOLD_SECONDS)."""
@@ -5963,6 +5972,156 @@ class ChaseAlgorithmTests(unittest.TestCase):
 
         # Only initial order should be placed; chase + market fallback should skip
         self.assertEqual(len(created), 1, f"Expected 1 order (market fallback skipped due to min), got {len(created)}")
+
+    def test_buy_chase_uses_per_pair_min_when_config_min_is_zero(self):
+        """Chase should respect per-pair exchange minimum even when config.min_order_idr is 0."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {"cjl_idr": {"min_coin": 37.0, "min_idr": 10_000.0}}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    _balance[0] = 100.0  # partial fill of 100 out of ~111
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # min_order_idr=0 (unconfigured), but exchange pair minimum is 10000 IDR / 37 CJL
+        # After partial fill of 100, remaining ~11.11 → below pair min of 37 CJL
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        outcome = trader.maybe_execute(snap)
+
+        # Only the initial order; chase should skip due to per-pair min
+        self.assertEqual(len(created), 1, f"Expected 1 order (chase skipped per-pair min), got {len(created)}")
+
+    def test_buy_chase_catches_runtime_minimum_order_error(self):
+        """Chase should catch RuntimeError with 'Minimum order' and break gracefully."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    _balance[0] = 100.0
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                # Exchange rejects the chase retry
+                raise RuntimeError("API error: {'success': 0, 'error': 'Minimum order is 37.03703703 CJL.', 'error_code': ''}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # min_order_idr=0 (no pre-check catches it), exchange rejects at API level
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        # Should NOT raise — the chase loop catches the RuntimeError gracefully
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 1 failed chase attempt
+        self.assertEqual(len(created), 2)
+        # Cache should be updated with the parsed minimum
+        cached = trader.client._pair_min_order.get("cjl_idr", {})
+        self.assertGreater(cached.get("min_coin", 0.0), 0.0)
+
+    def test_sell_chase_catches_runtime_minimum_order_error(self):
+        """Sell chase should catch RuntimeError with 'Minimum order' and break gracefully."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    return {"success": 1, "return": {"order_id": "1", "spend_cjl": 140.0, "receive_idr": 37800}}
+                raise RuntimeError("API error: {'success': 0, 'error': 'Minimum order is 37.03703703 CJL.', 'error_code': ''}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "10", "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 270.0, 150.0)
+
+        snap = self._make_snap("cjl_idr", "sell", 270.0, 150.0)
+        # Should NOT raise
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(len(created), 2)
+        cached = trader.client._pair_min_order.get("cjl_idr", {})
+        self.assertGreater(cached.get("min_coin", 0.0), 0.0)
 
 
 class AdaptiveLimitOrderTests(unittest.TestCase):

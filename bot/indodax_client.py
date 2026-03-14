@@ -639,6 +639,7 @@ class IndodaxClient:
         """Extract the minimum required coin amount from a 'Minimum order' error.
 
         Indodax returns messages like ``"Minimum order 3333.33333333 WTEC"``
+        or ``"Minimum order is 37.03703703 CJL."``
         when a sell/buy amount is below the exchange floor.  This helper parses
         that message and returns the minimum amount as a float, or ``None`` if
         the message does not match the expected pattern.
@@ -647,7 +648,7 @@ class IndodaxClient:
                               dict, or the full ``str(exc)`` text.
         :returns: Minimum coin amount (float) or ``None``.
         """
-        match = re.search(r"Minimum order\s+([\d.]+)", error_message, re.IGNORECASE)
+        match = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", error_message, re.IGNORECASE)
         if match:
             try:
                 return float(match.group(1))

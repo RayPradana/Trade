@@ -3339,6 +3339,13 @@ class Trader:
             # market order after all chase retries are exhausted.
             received_amount = _calc_received_amount(order_resp, pre_step_position)
 
+            # ── Per-pair effective minimum for chase ─────────────────────────
+            _get_min_chase = getattr(self.client, "get_pair_min_order", None)
+            _min_chase_info = _get_min_chase(snapshot["pair"]) if callable(_get_min_chase) else {}
+            _pair_min_idr_chase = _min_chase_info.get("min_idr", 0.0)
+            _pair_min_coin_chase = _min_chase_info.get("min_coin", 0.0)
+            _effective_min_idr_chase = max(self.config.min_order_idr, _pair_min_idr_chase)
+
             # ── Partial fill management (buy) ─────────────────────────────────
             # If the order was partially filled (0 < received < step_amount),
             # record the filled portion and chase only the remaining quantity.
@@ -3391,11 +3398,13 @@ class Trader:
                             retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
 
                     # Check remaining chase amount still meets minimum order
-                    if self.config.min_order_idr > 0 and _chase_amount * retry_price < self.config.min_order_idr:
+                    _chase_below_idr = _effective_min_idr_chase > 0 and _chase_amount * retry_price < _effective_min_idr_chase
+                    _chase_below_coin = _pair_min_coin_chase > 0 and _chase_amount < _pair_min_coin_chase
+                    if _chase_below_idr or _chase_below_coin:
                         logger.info(
                             "Chase[%d] remaining amount %.8f × Rp%.2f = Rp%.0f below min Rp%.0f — accepting partial fill (pair=%s)",
                             _chase_i + 1, _chase_amount, retry_price, _chase_amount * retry_price,
-                            self.config.min_order_idr, snapshot["pair"],
+                            _effective_min_idr_chase, snapshot["pair"],
                         )
                         break
 
@@ -3403,7 +3412,26 @@ class Trader:
                         "Chase[%d/%d] buy at %.10f → %.10f (pair=%s)",
                         _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
                     )
-                    order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, _chase_amount)
+                    try:
+                        order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, _chase_amount)
+                    except RuntimeError as _chase_exc:
+                        _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
+                        _parsed = _parse_min_chase(str(_chase_exc)) if callable(_parse_min_chase) else None
+                        if _parsed is not None:
+                            logger.warning(
+                                "Chase[%d] buy hit exchange minimum order (%.8f %s) — accepting partial fill (pair=%s)",
+                                _chase_i + 1, _parsed, snapshot["pair"].split("_")[0].upper(), snapshot["pair"],
+                            )
+                            _cache = getattr(self.client, "_pair_min_order", None)
+                            if isinstance(_cache, dict):
+                                _cached = _cache.setdefault(snapshot["pair"].lower(), {})
+                                _new_min_idr = _parsed * retry_price
+                                if _new_min_idr > _cached.get("min_idr", 0.0):
+                                    _cached["min_idr"] = _new_min_idr
+                                if _parsed > _cached.get("min_coin", 0.0):
+                                    _cached["min_coin"] = _parsed
+                            break
+                        raise
                     getattr(self.client, "invalidate_account_info_cache", lambda: None)()
                     reference_price = retry_price
                     received_amount = _calc_received_amount(order_resp, pre_step_position)
@@ -3434,10 +3462,10 @@ class Trader:
                     _fmt_price = getattr(self.client, "format_price", None)
                     if callable(_fmt_price):
                         market_price, _ = _fmt_price(snapshot["pair"], market_price)
-                    if self.config.min_order_idr > 0 and _chase_amount * market_price < self.config.min_order_idr:
+                    if _effective_min_idr_chase > 0 and _chase_amount * market_price < _effective_min_idr_chase:
                         logger.info(
                             "Chase exhausted — remaining buy Rp%.0f below min Rp%.0f, accepting partial fill (pair=%s)",
-                            _chase_amount * market_price, self.config.min_order_idr, snapshot["pair"],
+                            _chase_amount * market_price, _effective_min_idr_chase, snapshot["pair"],
                         )
                     else:
                         logger.info(
@@ -3519,11 +3547,13 @@ class Trader:
                                 retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
 
                         # Check remaining chase amount still meets minimum order
-                        if self.config.min_order_idr > 0 and _chase_amount * retry_price < self.config.min_order_idr:
+                        _chase_below_idr = _effective_min_idr_chase > 0 and _chase_amount * retry_price < _effective_min_idr_chase
+                        _chase_below_coin = _pair_min_coin_chase > 0 and _chase_amount < _pair_min_coin_chase
+                        if _chase_below_idr or _chase_below_coin:
                             logger.info(
                                 "Chase[%d] remaining sell %.8f × Rp%.2f = Rp%.0f below min Rp%.0f — accepting partial fill (pair=%s)",
                                 _chase_i + 1, _chase_amount, retry_price, _chase_amount * retry_price,
-                                self.config.min_order_idr, snapshot["pair"],
+                                _effective_min_idr_chase, snapshot["pair"],
                             )
                             break
 
@@ -3531,9 +3561,28 @@ class Trader:
                             "Chase[%d/%d] sell at %.10f → %.10f (pair=%s)",
                             _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
                         )
-                        order_resp = self.client.create_order(
-                            snapshot["pair"], decision.action, retry_price, _chase_amount,
-                        )
+                        try:
+                            order_resp = self.client.create_order(
+                                snapshot["pair"], decision.action, retry_price, _chase_amount,
+                            )
+                        except RuntimeError as _chase_exc:
+                            _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
+                            _parsed = _parse_min_chase(str(_chase_exc)) if callable(_parse_min_chase) else None
+                            if _parsed is not None:
+                                logger.warning(
+                                    "Chase[%d] sell hit exchange minimum order (%.8f %s) — accepting partial fill (pair=%s)",
+                                    _chase_i + 1, _parsed, snapshot["pair"].split("_")[0].upper(), snapshot["pair"],
+                                )
+                                _cache = getattr(self.client, "_pair_min_order", None)
+                                if isinstance(_cache, dict):
+                                    _cached = _cache.setdefault(snapshot["pair"].lower(), {})
+                                    _new_min_idr = _parsed * retry_price
+                                    if _new_min_idr > _cached.get("min_idr", 0.0):
+                                        _cached["min_idr"] = _new_min_idr
+                                    if _parsed > _cached.get("min_coin", 0.0):
+                                        _cached["min_coin"] = _parsed
+                                break
+                            raise
                         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
                         reference_price = retry_price
 
@@ -3565,10 +3614,10 @@ class Trader:
                         _fmt_price = getattr(self.client, "format_price", None)
                         if callable(_fmt_price):
                             market_price, _ = _fmt_price(snapshot["pair"], market_price)
-                        if self.config.min_order_idr > 0 and _chase_amount * market_price < self.config.min_order_idr:
+                        if _effective_min_idr_chase > 0 and _chase_amount * market_price < _effective_min_idr_chase:
                             logger.info(
                                 "Chase exhausted — remaining sell Rp%.0f below min Rp%.0f, accepting partial fill (pair=%s)",
-                                _chase_amount * market_price, self.config.min_order_idr, snapshot["pair"],
+                                _chase_amount * market_price, _effective_min_idr_chase, snapshot["pair"],
                             )
                         else:
                             logger.info(
@@ -4146,7 +4195,7 @@ class Trader:
             if parsed_min is None:
                 # Fallback: detect via the error text directly
                 import re as _re
-                _m = _re.search(r"Minimum order\s+([\d.]+)", exc_str, _re.IGNORECASE)
+                _m = _re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", exc_str, _re.IGNORECASE)
                 if _m:
                     try:
                         parsed_min = float(_m.group(1))
