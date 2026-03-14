@@ -367,9 +367,19 @@ class RealtimeFeed:
                 daemon=True,
             )
             wst.start()
-            wst.join(timeout=30.0)
+            # Block until the WS thread finishes (connection closed) or
+            # stop is requested.  The old 30-second timeout could expire
+            # while the connection was still healthy, causing the loop to
+            # open *another* connection and accumulate zombie sockets.
+            while wst.is_alive() and not self._stop.is_set():
+                wst.join(timeout=5.0)
+            # If stop was requested while WS is still connected, force-close.
             if wst.is_alive():
-                logger.debug("RealtimeFeed WS thread did not finish within timeout")
+                try:
+                    ws_app.close()
+                except Exception:
+                    pass
+                wst.join(timeout=5.0)
 
             if self._stop.is_set():
                 break
@@ -805,9 +815,19 @@ class MultiPairFeed:
                 daemon=True,
             )
             wst.start()
-            wst.join(timeout=30.0)
+            # Block until the WS thread finishes (connection closed) or
+            # stop is requested.  The old 30-second timeout could expire
+            # while the connection was still healthy, causing the loop to
+            # open *another* connection and accumulate zombie sockets.
+            while wst.is_alive() and not self._stop.is_set():
+                wst.join(timeout=5.0)
+            # If stop was requested while WS is still connected, force-close.
             if wst.is_alive():
-                logger.debug("MultiPairFeed WS thread did not finish within timeout")
+                try:
+                    ws_app.close()
+                except Exception:
+                    pass
+                wst.join(timeout=5.0)
 
             if self._stop.is_set():
                 break
@@ -1118,6 +1138,16 @@ class PrivateFeed:
             daemon=True,
         )
         wst.start()
-        wst.join(timeout=30.0)
+        # Block until the WS thread finishes (connection closed) or
+        # stop is requested.  The old 30-second timeout could expire
+        # while the connection was still healthy, causing the loop to
+        # open *another* connection and accumulate zombie sockets.
+        while wst.is_alive() and not self._stop.is_set():
+            wst.join(timeout=5.0)
+        # If stop was requested while WS is still connected, force-close.
         if wst.is_alive():
-            logger.debug("PrivateFeed: WS thread did not finish within timeout")
+            try:
+                ws_app.close()
+            except Exception:
+                pass
+            wst.join(timeout=5.0)
