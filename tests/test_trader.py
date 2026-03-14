@@ -6406,6 +6406,73 @@ class ResumePendingBuyTests(unittest.TestCase):
         self.assertIn("ponke_idr", active, "Second filled pair must be in active_positions")
         self.assertEqual(len(active), 2)
 
+    def test_sell_unfilled_after_chase_does_not_record_phantom_sell(self):
+        """When a sell order is not filled after chase, base_position must remain > 0."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price, "amount": amount})
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"spend_{coin}": 0, "order_id": str(len(created))}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=2, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Pre-buy position so we can sell
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 500.0)
+
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": "ponke_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="sell",
+                confidence=0.9,
+                reason="test",
+                target_price=100.0,
+                amount=500.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+
+        # Position must remain intact — no phantom sell
+        self.assertGreater(trader.tracker.base_position, 0.0,
+                           "Position must remain when sell was not filled on exchange")
+        # The step should be marked as pending
+        pending_steps = [s for s in outcome.get("executed_steps", []) if s.get("pending")]
+        self.assertTrue(len(pending_steps) > 0,
+                        "Unfilled sell step should be marked as pending")
+
 
 class AdaptiveLimitOrderTests(unittest.TestCase):
     """Tests for the adaptive limit order feature."""

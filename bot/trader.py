@@ -3638,7 +3638,18 @@ class Trader:
                     if _sell_spent > 0:
                         received_amount = _sell_spent
                     else:
-                        received_amount = step_amount  # fallback for record_trade
+                        # Sell not filled after chase — do NOT record a phantom
+                        # sell.  Leave the position intact so the monitoring loop
+                        # retries the exit on the next cycle.
+                        logger.info(
+                            "Sell order not filled after %d chase retries (pair=%s) — will retry next cycle",
+                            _max_chase, snapshot["pair"],
+                        )
+                        remaining_amount -= _chase_amount
+                        executed_steps.append(
+                            {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
+                        )
+                        continue
 
             step_amount = min(step_amount, received_amount)
             _tracker.record_trade(decision.action, reference_price, step_amount)
