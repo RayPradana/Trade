@@ -299,6 +299,64 @@ class IndodaxClientAmountPrecisionTest(unittest.TestCase):
         self.assertEqual(resp["doge"], "1500")
         self.assertNotIn("idr", resp)
 
+    def test_format_amount_fallback_no_underscore(self):
+        """format_amount should find precision via no-underscore key fallback."""
+        client = _DummyClient()
+        # Only store under the id format (no underscore).
+        client._amount_precisions["dogeidr"] = 0
+        # Lookup with underscore format should still find it.
+        amt, prec = client.format_amount("doge_idr", 150.7)
+        self.assertEqual(prec, 0)
+        self.assertEqual(amt, 151.0)
+
+    def test_load_pair_min_orders_constructed_key_from_currencies(self):
+        """Cache should use traded_currency + base_currency as fallback key."""
+        client = IndodaxClient.__new__(IndodaxClient)
+        client._pair_min_order = {}
+        client._amount_precisions = {}
+
+        # Pair without ticker_id — only id + traded/base currency available.
+        pairs_data = [
+            {
+                "id": "tokenidr",
+                "traded_currency": "token",
+                "base_currency": "idr",
+                "trade_min_base_currency": "10000",
+                "trade_min_traded_currency": "1",
+            },
+        ]
+        client.load_pair_min_orders(pairs_data)
+
+        # Should be cached under "tokenidr" (from id) and "token_idr" (constructed).
+        self.assertIn("tokenidr", client._amount_precisions)
+        self.assertIn("token_idr", client._amount_precisions)
+        self.assertEqual(client._amount_precisions["token_idr"], 0)
+        self.assertIn("token_idr", client._pair_min_order)
+
+    def test_create_order_sell_btc_param_integer_coin(self):
+        """Sell with explicit btc= param for integer coin must not have decimals."""
+        client = _DummyClient()
+        client._amount_precisions["doge_idr"] = 0
+        resp = client.create_order("doge_idr", "sell", 5, 999, btc=1500.7)
+        self.assertEqual(resp["doge"], "1501")
+        self.assertNotIn(".", resp["doge"])
+
+    def test_create_order_buy_btc_param_integer_coin(self):
+        """Limit buy with explicit btc= param for integer coin must not have decimals."""
+        client = _DummyClient()
+        client._amount_precisions["doge_idr"] = 0
+        resp = client.create_order("doge_idr", "buy", 5, 999, btc=1500.3)
+        self.assertEqual(resp["doge"], "1500")
+        self.assertNotIn(".", resp["doge"])
+
+    def test_create_order_fractional_amount_no_decimal_error(self):
+        """Amount with many decimals should be formatted to pair precision."""
+        client = _DummyClient()
+        client._amount_precisions["doge_idr"] = 0
+        # Amount from float arithmetic with many decimal places.
+        resp = client.create_order("doge_idr", "sell", 5, 150.999999999999)
+        self.assertNotIn(".", resp["doge"])
+
 
 if __name__ == "__main__":
     unittest.main()

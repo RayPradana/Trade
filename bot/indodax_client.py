@@ -169,6 +169,11 @@ class IndodaxClient:
             # Also store under the ticker_id key (e.g. "btc_idr") so that
             # lookups from the trade API (which uses underscore format) work.
             ticker_id = (info.get("ticker_id") or "").lower()
+            # Construct underscore key from traded_currency + base_currency
+            # as a fallback when ticker_id is absent from the API response.
+            traded_cur = (info.get("traded_currency") or "").lower()
+            base_cur = (info.get("base_currency") or "").lower()
+            constructed_key = f"{traded_cur}_{base_cur}" if traded_cur and base_cur else ""
             try:
                 min_coin = float(info.get("trade_min_base_currency") or 0)
             except (TypeError, ValueError):
@@ -178,9 +183,14 @@ class IndodaxClient:
             except (TypeError, ValueError):
                 min_idr = 0.0
             entry = {"min_coin": min_coin, "min_idr": min_idr}
-            self._pair_min_order[pair_id] = entry
-            if ticker_id and ticker_id != pair_id:
-                self._pair_min_order[ticker_id] = entry
+            # Store under all available key formats for robust lookups.
+            all_keys = {pair_id}
+            if ticker_id:
+                all_keys.add(ticker_id)
+            if constructed_key:
+                all_keys.add(constructed_key)
+            for key in all_keys:
+                self._pair_min_order[key] = entry
 
             # Derive amount precision from trade_min_traded_currency.
             # Per Indodax API docs, trade_min_traded_currency is the minimum
@@ -195,9 +205,8 @@ class IndodaxClient:
                 min_traded = 0.0
             if min_traded > 0 and float(int(min_traded)) == min_traded:
                 amt_precision = 0
-            self._amount_precisions[pair_id] = amt_precision
-            if ticker_id and ticker_id != pair_id:
-                self._amount_precisions[ticker_id] = amt_precision
+            for key in all_keys:
+                self._amount_precisions[key] = amt_precision
             loaded += 1
         logger.info("load_pair_min_orders: cached minimum orders for %d pairs", loaded)
         ttl = getattr(self, "_pair_min_order_cache_ttl", 3600.0)
@@ -438,7 +447,13 @@ class IndodaxClient:
         If no pair info is cached, defaults to 8 decimal places — the standard
         crypto precision that works for most pairs.
         """
-        precision = self._amount_precisions.get(pair.lower(), 8)
+        key = pair.lower()
+        precision = self._amount_precisions.get(key)
+        if precision is None:
+            # Fallback: try without underscores (e.g. "dogeidr" for "doge_idr")
+            # to handle cases where ticker_id was absent from /api/pairs.
+            alt_key = key.replace("_", "")
+            precision = self._amount_precisions.get(alt_key, 8)
         if precision == 0:
             return float(round(amount)), 0
         return round(amount, precision), precision
@@ -483,9 +498,6 @@ class IndodaxClient:
         base_coin = pair.split("_", 1)[0]
         is_idr_pair = pair.endswith("_idr")
 
-        # Per-pair amount precision (integer for some low-price coins).
-        _, amt_precision = self.format_amount(pair, amount)
-
         if order_type == "buy":
             if order_kind == "market" and is_idr_pair:
                 # Market buy on IDR pair: only idr amount supported.
@@ -500,11 +512,13 @@ class IndodaxClient:
             else:
                 # Limit buy (default): coin amount only — no idr.
                 coin_amt = btc if btc is not None else amount
+                coin_amt, amt_precision = self.format_amount(pair, coin_amt)
                 amount_str = f"{coin_amt:.{amt_precision}f}"
                 payload[base_coin] = amount_str
         else:
             # Sell: always coin amount.
             coin_amt = btc if btc is not None else amount
+            coin_amt, amt_precision = self.format_amount(pair, coin_amt)
             amount_str = f"{coin_amt:.{amt_precision}f}"
             payload[base_coin] = amount_str
 
