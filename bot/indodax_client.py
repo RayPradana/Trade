@@ -549,7 +549,30 @@ class IndodaxClient:
         try:
             return self._enqueue_private("trade", payload)
         except RuntimeError as exc:
-            if "can't be in decimal" not in str(exc):
+            exc_str = str(exc)
+            if "Insufficient balance" in exc_str:
+                # Reduce order size by 0.5% and retry once to account for
+                # fee deductions that made the original amount too large.
+                _reduced = False
+                if "idr" in payload:
+                    old_val = float(payload["idr"])
+                    new_val = old_val * 0.995
+                    payload["idr"] = f"{new_val:.0f}"
+                    _reduced = True
+                elif base_coin in payload:
+                    old_val = float(payload[base_coin])
+                    new_val = old_val * 0.995
+                    coin_amt_r, amt_prec_r = self.format_amount(pair, new_val)
+                    payload[base_coin] = f"{coin_amt_r:.{amt_prec_r}f}"
+                    _reduced = True
+                if _reduced:
+                    logger.warning(
+                        "Retrying order with reduced amount for %s (Insufficient balance)",
+                        pair,
+                    )
+                    return self._enqueue_private("trade", payload)
+                raise
+            if "can't be in decimal" not in exc_str:
                 raise
             # The exchange requires integer amounts for this pair.
             # Update the precision cache and retry with integer formatting.

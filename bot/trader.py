@@ -567,6 +567,11 @@ class Trader:
     def set_journal(self, journal: TradeJournal) -> None:
         self.journal = journal
 
+    # Indodax charges a taker fee (up to 0.3%).  Reserve a small buffer
+    # so that the pre-order balance check does not pass amounts that the
+    # exchange will reject with "Insufficient balance".
+    _FEE_BUFFER = 1.003
+
     def _validate_balance(self, pair: str, action: str, amount: float, price: float) -> bool:
         if not self.config.balance_check_enabled:
             return True
@@ -574,7 +579,7 @@ class Trader:
             info = self.client.get_account_info()
             balance_dict = (info.get("return") or {}).get("balance") or {}
             if action == "buy":
-                idr_needed = amount * price
+                idr_needed = amount * price * self._FEE_BUFFER
                 available_idr = float(balance_dict.get("idr") or "0")
                 if available_idr < idr_needed:
                     logger.warning(
@@ -3041,7 +3046,7 @@ class Trader:
                 )
             else:
                 available_cash = _tracker.cash
-            max_affordable = max(0.0, available_cash / reference_price)
+            max_affordable = max(0.0, available_cash / (reference_price * self._FEE_BUFFER))
             effective_amount = min(decision.amount, max_affordable)
 
             # ── Bump up to minimum order value when possible ─────────────────
@@ -3124,7 +3129,7 @@ class Trader:
             if not self.multi_manager.has_position(_pair):
                 _tracker = self.multi_manager.allocate_capital(_pair, min_order_idr=self.config.min_order_idr)
                 # Tighten effective_amount against the newly allocated cash
-                max_affordable = max(0.0, _tracker.cash / reference_price)
+                max_affordable = max(0.0, _tracker.cash / (reference_price * self._FEE_BUFFER))
                 effective_amount = min(effective_amount, max_affordable)
                 # Re-derive staged after adjustment
                 staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))

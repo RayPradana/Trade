@@ -554,5 +554,88 @@ class FormatAmountAutoRefreshTest(unittest.TestCase):
         self.assertEqual(prec, 0)
 
 
+class CreateOrderInsufficientBalanceRetryTest(unittest.TestCase):
+    """create_order retries with reduced amount on 'Insufficient balance'."""
+
+    def test_retry_reduces_coin_amount_on_insufficient_balance(self):
+        """When the first call returns 'Insufficient balance', retry with 0.5% less."""
+        call_log = []
+
+        class _RetryClient(IndodaxClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="key",
+                    api_secret="secret",
+                    enable_queue=False,
+                    enable_request_scheduler=False,
+                )
+
+            def _enqueue_private(self, method, params=None):
+                call_log.append(dict(params or {}))
+                if len(call_log) == 1:
+                    raise RuntimeError(
+                        "API error: {'success': 0, 'error': 'Insufficient balance.'}"
+                    )
+                return params or {}
+
+        client = _RetryClient()
+        resp = client.create_order("btc_idr", "buy", 500_000_000, 0.001)
+
+        self.assertEqual(len(call_log), 2)
+        # Second call should have a smaller btc amount (reduced by ~0.5%)
+        first_amt = float(call_log[0]["btc"])
+        second_amt = float(call_log[1]["btc"])
+        self.assertLess(second_amt, first_amt)
+
+    def test_retry_reduces_idr_amount_on_market_buy(self):
+        """Market buy retry reduces idr amount on 'Insufficient balance'."""
+        call_log = []
+
+        class _RetryClient(IndodaxClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="key",
+                    api_secret="secret",
+                    enable_queue=False,
+                    enable_request_scheduler=False,
+                )
+
+            def _enqueue_private(self, method, params=None):
+                call_log.append(dict(params or {}))
+                if len(call_log) == 1:
+                    raise RuntimeError(
+                        "API error: {'success': 0, 'error': 'Insufficient balance.'}"
+                    )
+                return params or {}
+
+        client = _RetryClient()
+        resp = client.create_order(
+            "btc_idr", "buy", 500_000_000, 0.001, order_kind="market"
+        )
+
+        self.assertEqual(len(call_log), 2)
+        first_idr = float(call_log[0]["idr"])
+        second_idr = float(call_log[1]["idr"])
+        self.assertLess(second_idr, first_idr)
+
+    def test_no_retry_on_other_errors(self):
+        """Errors other than 'Insufficient balance' or 'decimal' propagate."""
+        class _FailClient(IndodaxClient):
+            def __init__(self):
+                super().__init__(
+                    api_key="key",
+                    api_secret="secret",
+                    enable_queue=False,
+                    enable_request_scheduler=False,
+                )
+
+            def _enqueue_private(self, method, params=None):
+                raise RuntimeError("API error: some other error")
+
+        client = _FailClient()
+        with self.assertRaises(RuntimeError):
+            client.create_order("btc_idr", "buy", 500_000_000, 0.001)
+
+
 if __name__ == "__main__":
     unittest.main()

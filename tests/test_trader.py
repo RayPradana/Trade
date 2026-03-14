@@ -7268,3 +7268,86 @@ class InsufficientBalanceTests(unittest.TestCase):
 
         # Initial order + 1 failed chase attempt (caught, not re-raised)
         self.assertEqual(len(created), 2)
+
+
+class FeeBufferTests(unittest.TestCase):
+    """Tests for the fee buffer applied in balance checks and max_affordable calculations."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_validate_balance_includes_fee_buffer(self):
+        """_validate_balance should reject buy when balance is barely enough (without fee)."""
+
+        class _Client:
+            def get_account_info(self):
+                # Exactly 100k IDR — buy 1 coin @ 100k would need 100k * 1.003 = 100,300
+                return {"return": {"balance": {"btc": "0", "idr": "100000"}}}
+
+        config = BotConfig(
+            api_key="test",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            balance_check_enabled=True,
+        )
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Exact match: 1 coin * 100000 = 100000 IDR
+        # With fee buffer (1.003): need 100300 IDR, have 100000 → should fail
+        result = trader._validate_balance("btc_idr", "buy", 1.0, 100_000.0)
+        self.assertFalse(result, "Should reject buy when balance doesn't cover fees")
+
+        # Smaller amount that fits within fee budget: 0.99 * 100000 = 99000, * 1.003 = 99297 < 100000
+        result = trader._validate_balance("btc_idr", "buy", 0.99, 100_000.0)
+        self.assertTrue(result, "Should allow buy when balance covers amount + fees")
+
+    def test_max_affordable_includes_fee_buffer(self):
+        """max_affordable should be reduced by fee buffer so buy doesn't exceed balance."""
+        # GuardedTrader._Client returns depth with prices at 100.
+        # Use initial_capital = 100 and price = 100 so that the fee buffer
+        # actually caps max_affordable below 1.0 coin.
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=100.0,
+            multi_position_enabled=False,
+            min_order_idr=0.0,
+        )
+        trader = GuardedTrader(config)
+
+        # With 100 IDR cash, price 100 IDR/coin:
+        # Without fee buffer: max_affordable = 100/100 = 1.0 coin
+        # With fee buffer (1.003): max_affordable = 100/(100*1.003) ≈ 0.997 coin
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=100.0,
+                amount=10.0,  # More than affordable
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+
+        # The executed amount should be less than 1.0 due to fee buffer
+        if outcome.get("status") == "simulated":
+            executed_amount = outcome.get("amount", 0)
+            self.assertLess(executed_amount, 1.0,
+                            "Executed amount should be reduced by fee buffer")
