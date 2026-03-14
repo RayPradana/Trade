@@ -7,7 +7,7 @@ from typing import Dict, Any
 
 import requests
 
-from bot.analysis import WhaleActivity, Candle, OrderbookInsight, TrendResult
+from bot.analysis import WhaleActivity, Candle, OrderbookInsight, TrendResult, MarketRegime
 from bot.config import BotConfig
 from bot.strategies import StrategyDecision
 from bot.trader import Trader
@@ -683,8 +683,8 @@ class TraderSelectionTests(unittest.TestCase):
         self.assertEqual(order_type, "sell")
         self.assertAlmostEqual(amount, 5.0)
 
-    def test_force_sell_below_minimum_keeps_position(self) -> None:
-        """When sell value is below min IDR, force_sell must keep the position instead of clearing dust."""
+    def test_force_sell_below_minimum_clears_dust(self) -> None:
+        """When sell value is below min IDR, force_sell must clear the dust position."""
 
         class _LiveClient(GuardedTrader._Client):
             cancel_called = False
@@ -728,10 +728,9 @@ class TraderSelectionTests(unittest.TestCase):
 
         outcome = trader.force_sell(snapshot)
 
-        self.assertEqual(outcome["status"], "below_minimum")
-        # Position must be preserved for monitoring
-        self.assertAlmostEqual(trader.tracker.base_position, 2.27518843, places=8)
-        self.assertFalse(_LiveClient.cancel_called)
+        self.assertEqual(outcome["status"], "dust_cleared")
+        # Position must be cleared since it's unsellable dust
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0, places=8)
         self.assertFalse(_LiveClient.order_called)
 
     def test_analyze_with_retry_succeeds_after_429(self) -> None:
@@ -2313,7 +2312,7 @@ class TickMoveFilterTest(unittest.TestCase):
         logging.disable(logging.NOTSET)
 
     def _trader(self, max_tick: float, bids: list, asks: list, price: float) -> Trader:
-        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, min_buy_price_idr=0, dry_run=True)
+        config = BotConfig(api_key=None, max_tick_move_pct=max_tick, min_buy_price_idr=0, min_coin_price_idr=0, dry_run=True)
         trader = Trader(config)
         trader.client = type("_C", (), {
             "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
@@ -2754,19 +2753,36 @@ class MinOrderIdrTest(unittest.TestCase):
         }
 
     def test_buy_below_minimum_skipped(self):
-        """An order whose total IDR value is below min_order_idr must be skipped."""
+        """An order whose total IDR value is below min_order_idr and cannot be
+        bumped up (insufficient available cash) must be skipped."""
         config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
-                           initial_capital=100_000)
+                           initial_capital=5_000)  # capital < min_order_idr → cannot bump up
         trader = Trader(config)
         trader.client = type("_C", (), {
             # bid=ask=253 so slippage guard passes
             "get_depth": lambda self, *a, **kw: {"buy": [["253", "100"]], "sell": [["253", "100"]]},
         })()
         # price=253, amount=1 → total=253 IDR < 10,000 IDR
+        # capital=5000 → max affordable=5000/253≈19.7 coins → value≈5000 < 10,000
         snap = self._snap(price=253.0)
         outcome = trader.maybe_execute(snap)
         self.assertEqual(outcome["status"], "skipped")
         self.assertIn("order_below_minimum", outcome["reason"])
+
+    def test_buy_below_minimum_bumped_up(self):
+        """When the order value is below min_order_idr but capital can cover
+        the minimum, the order amount should be bumped up instead of skipped."""
+        config = BotConfig(api_key=None, min_order_idr=10_000, dry_run=True,
+                           initial_capital=100_000)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["253", "1000"]], "sell": [["253", "1000"]]},
+        })()
+        # price=253, amount=1 → 253 IDR < 10,000, but capital can cover min
+        snap = self._snap(price=253.0)
+        outcome = trader.maybe_execute(snap)
+        # Should proceed (bumped up to minimum) instead of being skipped
+        self.assertNotEqual(outcome["status"], "skipped")
 
     def test_buy_above_minimum_proceeds(self):
         """An order whose total IDR value meets or exceeds min_order_idr must proceed."""
@@ -3141,7 +3157,8 @@ class EvaluateDynamicTpTest(unittest.TestCase):
         """After a profitable trade, effective_capital > initial_capital → larger position."""
         from bot.strategies import make_trade_decision
         from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats, MomentumIndicators
-        config = BotConfig(api_key=None, risk_per_trade=0.01, initial_capital=100_000.0)
+        config = BotConfig(api_key=None, risk_per_trade=0.01, initial_capital=100_000.0,
+                           min_order_idr=0)  # disable min-order floor for this sizing test
         tracker_base = PortfolioTracker(100_000.0, 0.2, 0.1)
         tracker_rich = PortfolioTracker(100_000.0, 0.2, 0.1)
         # Simulate rich tracker having 50k profit buffer
@@ -3478,6 +3495,8 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=15000,
+            # Use capital too small to bump amount up to minimum.
+            initial_capital=10.0,
             # disable RSI / resistance / cooldown filters so the only skip reason
             # is the min_order check
             buy_max_rsi=0.0,
@@ -3502,6 +3521,7 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=15000,
+            initial_capital=10.0,
             buy_max_rsi=0.0,
             buy_max_resistance_proximity_pct=0.0,
             pair_cooldown_seconds=0.0,
@@ -3520,6 +3540,7 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=15000,
+            initial_capital=10.0,
             buy_max_rsi=0.0,
             buy_max_resistance_proximity_pct=0.0,
             pair_cooldown_seconds=300.0,
@@ -3533,7 +3554,9 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         self.assertNotIn("cast_idr", trader._pair_last_trade)
 
     def test_all_staged_steps_individually_below_min_after_split(self):
-        """When total passes pre-check but every staged split is below min, must skip."""
+        """When total passes pre-check but individual staged splits would be
+        below min, the staging must collapse to a single step so the trade
+        executes instead of being needlessly skipped."""
         from bot.analysis import VolatilityStats
         # min_order_idr = 30000, price = 100
         # decision.amount = 400 → effective_amount capped at min(400, cash/100)
@@ -3541,6 +3564,7 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         # total IDR = 400 × 100 = 40000 > 30000 (passes pre-check)
         # staged fractions with vol=0.015, conf=0.5: [0.6, 0.4]
         # step1 = 240 × 100 = 24000 < 30000, step2 = 160 × 100 = 16000 < 30000
+        # → collapse to single step [400] → 40000 ≥ 30000 → executes
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=30000,
@@ -3577,8 +3601,89 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
             ),
         }
         outcome = trader.maybe_execute(snap)
-        self.assertEqual(outcome["status"], "skipped")
-        self.assertIn("all_steps_below_min_order", outcome["reason"])
+        # The staged entry collapses to a single step, so the trade executes.
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertEqual(len(outcome["executed_steps"]), 1,
+                         "collapsed staging should produce exactly 1 step")
+
+
+class StagedCollapseTests(unittest.TestCase):
+    """Tests for _collapse_staged_if_needed and staged entry min-order logic."""
+
+    def test_collapse_when_any_step_below_min(self):
+        """Staged amounts collapse to single step when a step is below minimum."""
+        staged = [1.5, 0.9, 0.6]  # at price 100 → [150, 90, 60] IDR
+        result = Trader._collapse_staged_if_needed(staged, 3.0, 100.0, 100.0)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], 3.0)
+
+    def test_no_collapse_when_all_above_min(self):
+        """When every step is above minimum, staging is preserved."""
+        staged = [5.0, 3.0, 2.0]  # at price 100 → [500, 300, 200] IDR
+        result = Trader._collapse_staged_if_needed(staged, 10.0, 100.0, 100.0)
+        self.assertEqual(result, staged)
+
+    def test_no_collapse_single_step(self):
+        """Single-step staging is always returned as-is."""
+        staged = [3.0]
+        result = Trader._collapse_staged_if_needed(staged, 3.0, 100.0, 100.0)
+        self.assertEqual(result, [3.0])
+
+    def test_no_collapse_min_order_zero(self):
+        """When min_order_idr is 0, no collapse occurs."""
+        staged = [0.01, 0.005, 0.003]
+        result = Trader._collapse_staged_if_needed(staged, 0.018, 100.0, 0.0)
+        self.assertEqual(result, staged)
+
+    def test_collapse_empty(self):
+        """Empty staged list returns empty."""
+        result = Trader._collapse_staged_if_needed([], 0.0, 100.0, 30000.0)
+        self.assertEqual(result, [])
+
+    def test_staged_entry_collapse_prevents_skip_dry_run(self):
+        """A borderline-sized order that would fail in multiple stages
+        should succeed as a single step after collapse (dry-run mode)."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_order_idr=30000,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            max_slippage_pct=0.05,
+        )
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": [["4999", "1"]], "sell": [["5001", "1"]]},
+        })()
+        # price=5000, amount=10 → total=50,000 IDR > 30K
+        # staged [0.5, 0.3, 0.2] = [25K, 15K, 10K] — all below 30K
+        # collapse → single step [50K] → executes
+        from bot.analysis import VolatilityStats
+        snap = {
+            "pair": "borderline_idr",
+            "price": 5000.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": VolatilityStats(volatility=0.03, avg_volume=1000.0),
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.5,
+                reason="test-borderline",
+                target_price=5000.0,
+                amount=10.0,
+                stop_loss=4500.0,
+                take_profit=5500.0,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        self.assertEqual(len(outcome["executed_steps"]), 1)
 
 
 class WhaleTrackingTests(unittest.TestCase):
@@ -3859,6 +3964,58 @@ class ForceSellDustTests(unittest.TestCase):
         outcome = trader.force_sell(snapshot)
         self.assertEqual(outcome["status"], "dust_cleared")
         self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+
+    def test_force_sell_clears_dust_idr_below_config_min_without_api_call(self) -> None:
+        """When sell IDR value is below config min_order_idr, force_sell must clear
+        dust without making an API call — even when per-pair min is not cached."""
+
+        class _LiveClient(GuardedTrader._Client):
+            order_placed = False
+
+            def get_account_info(self):
+                return {"return": {"balance": {"perp": "0.1", "idr": "1000000"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["14210", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                _LiveClient.order_placed = True
+                raise RuntimeError("Should not reach create_order")
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=500_000.0,
+            min_order_idr=30_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        # Position: 0.1 PERP @ 14,210 IDR → value ≈ Rp1421 < Rp30,000
+        trader.tracker.record_trade("buy", 14_210.0, 0.1)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="trailing_tp_triggered",
+            target_price=14_210.0,
+            amount=0.1,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "perp_idr", "price": 14_210.0, "decision": decision}
+
+        outcome = trader.force_sell(snapshot)
+        self.assertEqual(outcome["status"], "dust_cleared")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        # Must not have attempted the API call
+        self.assertFalse(_LiveClient.order_placed)
 
 
 class RiskHoldCancellationTests(unittest.TestCase):
@@ -4193,6 +4350,80 @@ class BuyPendingFillTests(unittest.TestCase):
         self.assertIsNotNone(client.cancelled)
         self.assertIsNone(outcome["executed_steps"][0].get("pending"))
 
+    def test_buy_zero_receive_retry_with_format_price_tuple(self) -> None:
+        """Retry must unpack format_price (price, precision) tuple correctly."""
+
+        class _LiveClient:
+            def __init__(self) -> None:
+                self.calls: list[float] = []
+                self.cancelled: tuple[str, str] | None = None
+
+            def get_depth(self, pair: str, count: int = 5):
+                return {"buy": [["24.5", "10"]], "sell": [["25", "10"]]}
+
+            def get_summaries(self) -> dict:
+                return {}
+
+            def get_pair_min_order(self, pair: str) -> Dict[str, float]:
+                return {"min_coin": 0.0, "min_idr": 0.0}
+
+            def load_pair_min_orders(self) -> None:
+                pass
+
+            def create_order(self, pair: str, order_type: str, price: float, amount: float):
+                self.calls.append(price)
+                coin = pair.split("_")[0]
+                if len(self.calls) == 1:
+                    return {"success": 1, "return": {f"receive_{coin}": "0", "order_id": "111"}}
+                return {"success": 1, "return": {f"receive_{coin}": str(amount), "order_id": "222"}}
+
+            def cancel_order(self, pair: str, order_id: str, order_type: str):
+                self.cancelled = (order_id, order_type)
+
+            def invalidate_account_info_cache(self) -> None:
+                pass
+
+            def format_price(self, pair: str, price: float) -> tuple[float, int]:
+                """Return (rounded_price, precision) tuple like IndodaxClient."""
+                return (round(price, 2), 2)
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            multi_position_enabled=False,
+            max_slippage_pct=1.0,
+            entry_aggressiveness_pct=0.0,
+            entry_retry_aggressiveness_pct=0.01,
+            min_order_idr=1,
+            min_buy_price_idr=0,
+            min_coin_price_idr=0,
+        )
+        client = _LiveClient()
+        trader = Trader(config, client=client)
+
+        decision = StrategyDecision(
+            mode="scalping",
+            action="buy",
+            confidence=0.9,
+            reason="entry",
+            target_price=25.0,
+            amount=100.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        depth = {"buy": [["24.5", "10"]], "sell": [["25", "10"]]}
+        snapshot = {"pair": "pixel_idr", "price": 25.0, "decision": decision, "depth": depth, "orderbook": None}
+
+        # This would raise TypeError before the fix
+        outcome = trader.maybe_execute(snapshot)
+
+        self.assertEqual(outcome["status"], "placed")
+        self.assertGreater(len(client.calls), 1)
+        # retry_price must be a float (not tuple) and higher than initial price
+        self.assertIsInstance(client.calls[1], float)
+        self.assertGreater(client.calls[1], client.calls[0])
+
 
 class RugPullFilterTests(unittest.TestCase):
     """Tests for the rug-pull / dead-coin filter in analyze_market."""
@@ -4324,6 +4555,7 @@ class PairMinOrderCacheTests(unittest.TestCase):
 
         client = IndodaxClient.__new__(IndodaxClient)
         client._pair_min_order = {}
+        client._amount_precisions = {}
 
         class _MockSession:
             def get(self, url, **kwargs):
@@ -4333,8 +4565,8 @@ class PairMinOrderCacheTests(unittest.TestCase):
                     def raise_for_status(self): pass
                     def json(self):
                         return [
-                            {"id": "btcidr", "trade_min_base_currency": "0.0001", "trade_min_traded_currency": "10000"},
-                            {"id": "wtecidr", "trade_min_base_currency": "3333.33333333", "trade_min_traded_currency": "10000"},
+                            {"id": "btcidr", "trade_min_base_currency": "10000", "trade_min_traded_currency": "0.0001"},
+                            {"id": "wtecidr", "trade_min_base_currency": "10000", "trade_min_traded_currency": "3333.33333333"},
                         ]
                 return _Resp()
 
@@ -4372,6 +4604,15 @@ class PairMinOrderCacheTests(unittest.TestCase):
 
         result = IndodaxClient.parse_minimum_order_error("Some other error")
         self.assertIsNone(result)
+
+    def test_parse_minimum_order_error_with_is(self) -> None:
+        """parse_minimum_order_error must handle 'Minimum order is X COIN' format."""
+        from bot.indodax_client import IndodaxClient
+
+        msg = "API error: {'success': 0, 'error': 'Minimum order is 37.03703703 CJL.', 'error_code': ''}"
+        result = IndodaxClient.parse_minimum_order_error(msg)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 37.03703703, places=5)
 
 
 class TimeBasedExitTest(unittest.TestCase):
@@ -4938,3 +5179,3317 @@ class MultiPositionTraderTest(unittest.TestCase):
         # Default max_loss_pct=10% → floor = 2_700_000
         self.assertLess(snap["min_equity"], initial)
         self.assertGreater(snap["min_equity"], 0.0)
+
+
+class AllocateCapitalMinOrderTests(unittest.TestCase):
+    """Tests that allocate_capital respects min_order_idr to prevent
+    per-position capital from falling below the exchange minimum."""
+
+    def _make_manager(self, capital: float, max_pos: int):
+        from bot.tracking import MultiPositionManager
+        return MultiPositionManager(
+            initial_capital=capital,
+            max_positions=max_pos,
+            target_profit_pct=0.2,
+            max_loss_pct=0.1,
+        )
+
+    def test_allocate_reduces_slots_when_capital_too_thin(self):
+        """With 1M IDR and 55 positions, per-slot = ~18K < 30K.
+        min_order_idr=30K should reduce effective slots to 33 so each gets ~30K."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        t1 = mgr.allocate_capital("ponke_idr", min_order_idr=30_000.0)
+        # max_slots = int(1_000_000 / 30_000) = 33
+        # capital = 1_000_000 / 33 ≈ 30303
+        self.assertGreaterEqual(t1.cash, 30_000.0,
+                                "Per-position capital must be >= min_order_idr")
+
+    def test_allocate_without_min_order_can_be_below_minimum(self):
+        """Without min_order_idr guard, 1M / 55 ≈ 18K which is below 30K."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        t1 = mgr.allocate_capital("ponke_idr")  # no min_order_idr
+        self.assertLess(t1.cash, 30_000.0,
+                        "Without guard, per-position capital may be below 30K")
+
+    def test_allocate_with_min_order_successive_slots(self):
+        """Successive allocations all respect the minimum when using the guard."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        for i in range(5):
+            t = mgr.allocate_capital(f"pair{i}_idr", min_order_idr=30_000.0)
+            self.assertGreaterEqual(t.cash, 30_000.0,
+                                    f"Position {i} capital must be >= 30K")
+
+    def test_allocate_small_capital_single_slot(self):
+        """When capital is only 50K and min is 30K, only 1 slot should be used."""
+        mgr = self._make_manager(50_000.0, 10)
+        t1 = mgr.allocate_capital("btc_idr", min_order_idr=30_000.0)
+        # max_slots = int(50_000/30_000) = 1 → capital = 50_000
+        self.assertAlmostEqual(t1.cash, 50_000.0)
+
+    def test_capital_per_new_position_consistent_with_allocate(self):
+        """capital_per_new_position and allocate_capital should give similar amounts
+        when both use the same min_order_idr."""
+        mgr = self._make_manager(1_000_000.0, 55)
+        suggested = mgr.capital_per_new_position(min_order_idr=30_000.0)
+        t1 = mgr.allocate_capital("btc_idr", min_order_idr=30_000.0)
+        self.assertAlmostEqual(suggested, t1.cash, delta=1.0)
+
+
+class SellRetryExitProtectionTests(unittest.TestCase):
+    """Tests for sell-side retry logic (exit protection)."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_sell_retry_at_lower_price_on_unfilled(self):
+        """When a sell order is placed but not filled, the bot should cancel
+        and retry at a lower (more aggressive) price."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                call_count = len(created)
+                if call_count == 1:
+                    # First sell order: not filled (returns order_id but spend_ponke=0)
+                    return {"success": 1, "return": {"order_id": "99", "spend_ponke": 0}}
+                else:
+                    # Second sell order: filled (returns spend_ponke > 0)
+                    return {"success": 1, "return": {"order_id": "100", "spend_ponke": amount, "receive_idr": price * amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = BotConfig(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+        )
+        trader = Trader(config)
+        trader.client = _Client()
+        # Set up a position so sell is valid
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+
+        snap = {
+            "pair": "ponke_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="sell",
+                confidence=0.9,
+                reason="exit",
+                target_price=100.0,
+                amount=500.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+        # The sell should have been retried
+        self.assertGreaterEqual(len(created), 2,
+                                "Sell order should have been retried at aggressive price")
+        # The first order should have been cancelled
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(cancelled[0], "99")
+        # The retry price should be LOWER than original (more aggressive for sell)
+        self.assertLess(created[1]["price"], created[0]["price"])
+
+
+class ChaseAlgorithmTests(unittest.TestCase):
+    """Tests for the professional order execution chase algorithm."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, action, price, amount, **extra):
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=amount,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    # ── Chase Algorithm (Buy) ─────────────────────────────────────────────
+
+    def test_buy_chase_multiple_retries(self):
+        """Buy chase should retry up to chase_max_retries times before giving up."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                # Never fill
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 3 chase retries = 4 orders total
+        self.assertEqual(len(created), 4, f"Expected 1 initial + 3 chase = 4 orders, got {len(created)}")
+        # All 4 orders should have been cancelled (3 in chase + initial has no cancel because it's inside chase)
+        self.assertGreaterEqual(len(cancelled), 3)
+        # Each retry price should be higher than the previous (aggressive)
+        for i in range(1, len(created)):
+            self.assertGreaterEqual(created[i]["price"], created[0]["price"],
+                                    f"Chase retry {i} price should be >= initial price")
+
+    def test_buy_chase_fills_on_second_retry(self):
+        """When a buy fills on the 2nd chase retry, no further retries are made."""
+        created = []
+        cancelled = []
+        _balance = [0.0]  # track simulated balance
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 2:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+                else:
+                    _balance[0] = amount  # simulate fill
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 2 chase retries (fills on 2nd retry) = 3
+        self.assertEqual(len(created), 3, f"Expected 3 orders (fill on 2nd retry), got {len(created)}")
+        self.assertEqual(outcome["status"], "placed")
+
+    def test_buy_timeout_to_market_order(self):
+        """After all chase retries fail, convert to market order if enabled."""
+        created = []
+        cancelled = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 4:
+                    # First 4: 1 initial + 3 chase retries, none fill
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+                else:
+                    # The 5th order is the market-price conversion → fill
+                    _balance[0] = amount
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=True)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.5, description="test"))
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 3 chase + 1 market = 5 orders
+        self.assertEqual(len(created), 5, f"Expected 5 orders (market fallback), got {len(created)}")
+        self.assertEqual(outcome["status"], "placed")
+        # The market order should be at the maximum allowed price
+        allowed_max = 100.0 * (1 + 0.05)  # price * (1 + max_slippage_pct)
+        self.assertAlmostEqual(created[-1]["price"], allowed_max, places=1)
+
+    # ── Chase Algorithm (Sell / Exit Protection) ──────────────────────────
+
+    def test_sell_chase_multiple_retries(self):
+        """Sell chase should retry up to chase_max_retries times."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 3:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": 0}}
+                else:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+
+        snap = self._make_snap("ponke_idr", "sell", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 3 chase retries = 4 (fills on last)
+        self.assertGreaterEqual(len(created), 4, f"Expected >= 4 sell orders, got {len(created)}")
+        # Chase retries should have LOWER prices (more aggressive sell)
+        for i in range(2, len(created)):
+            self.assertLessEqual(created[i]["price"], created[1]["price"])
+
+    def test_sell_timeout_to_market_order(self):
+        """After all sell chase retries fail, convert to market-price sell."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 4:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": 0}}
+                else:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=True)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+
+        snap = self._make_snap("ponke_idr", "sell", 100.0, 500.0,
+                               regime=MarketRegime(regime="trending_down", strength=0.5, description="test"))
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 3 chase + 1 market = 5 orders
+        self.assertEqual(len(created), 5, f"Expected 5 sell orders (market fallback), got {len(created)}")
+        # The market order should be at the minimum allowed price
+        allowed_min = 100.0 * (1 - 0.05)  # price * (1 - max_slippage_pct)
+        self.assertAlmostEqual(created[-1]["price"], allowed_min, places=1)
+
+    # ── Adaptive Limit Order (Orderbook Re-read) ─────────────────────────
+
+    def test_buy_chase_re_reads_orderbook(self):
+        """Each chase retry should re-read the orderbook for adaptive pricing."""
+        depth_calls = []
+        created = []
+        cancelled = []
+        _ask_prices = iter([101.0, 102.0, 103.0, 104.0, 105.0])
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                try:
+                    ask = next(_ask_prices)
+                except StopIteration:
+                    ask = 105.0
+                depth_calls.append(ask)
+                return {"buy": [["100.0", "1"]], "sell": [[str(ask), "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 2:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+                else:
+                    _balance[0] = amount
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # get_depth should be called multiple times (1 initial + N chase retries)
+        self.assertGreaterEqual(len(depth_calls), 2,
+                                "Chase should re-read orderbook for adaptive pricing")
+
+    # ── Smart Entry Buffer ────────────────────────────────────────────────
+
+    def test_smart_entry_buffer_skips_when_price_moved(self):
+        """Smart entry buffer should skip buy if ask moves above allowed_max."""
+        depth_calls = [0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                depth_calls[0] += 1
+                if depth_calls[0] == 1:
+                    # Initial depth read
+                    return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+                else:
+                    # Buffer re-read: ask has moved way up (beyond allowed_max)
+                    return {"buy": [["100.0", "1"]], "sell": [["200.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                return {"success": 1, "return": {"order_id": "1", "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(smart_entry_buffer_enabled=True, max_slippage_pct=0.05)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("smart_entry_buffer", outcome["reason"])
+
+    def test_smart_entry_buffer_proceeds_when_price_stable(self):
+        """Smart entry buffer proceeds normally when price hasn't moved much."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(smart_entry_buffer_enabled=True, max_slippage_pct=0.05)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(outcome["status"], "placed")
+        self.assertGreaterEqual(len(created), 1)
+
+    # ── Config validation ─────────────────────────────────────────────────
+
+    def test_chase_max_retries_config(self):
+        """chase_max_retries must be non-negative."""
+        cfg = BotConfig(api_key=None, chase_max_retries=-1)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_chase_max_retries_zero_uses_single_retry(self):
+        """chase_max_retries=0 should fall back to single retry behaviour."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=0, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 1 chase retry (min=1) = 2 orders
+        self.assertEqual(len(created), 2, "chase_max_retries=0 should still do 1 retry")
+
+    # ── Partial Fill Management ───────────────────────────────────────────
+
+    def test_buy_partial_fill_records_filled_portion(self):
+        """When a buy order is partially filled, record the filled amount
+        and chase the remaining unfilled portion."""
+        created = []
+        cancelled = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # Partial fill: 40% of requested
+                    filled = amount * 0.4
+                    _balance[0] += filled
+                    return {"success": 1, "return": {"order_id": "1", "receive_ponke": filled}}
+                else:
+                    # Subsequent orders fill completely
+                    _balance[0] += amount
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(outcome["status"], "placed")
+        # Should have the partial fill step plus chase completion
+        partial_steps = [s for s in outcome["executed_steps"] if s.get("partial")]
+        self.assertGreaterEqual(len(partial_steps), 1, "Should record partial fill step")
+
+    def test_buy_chase_skips_below_min_order_after_partial_fill(self):
+        """Chase retry should not place an order when remaining amount is below min_order_idr."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                # First call: simulate partial fill via balance bump
+                if len(created) == 1:
+                    _balance[0] = 100.0  # partial fill of 100 out of ~111
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                # Should NOT reach here — chase should skip below-min remaining
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # min_order_idr=30000, price=270 → min amount ≈ 111.11
+        # After partial fill of 100, remaining ≈ 11.11 → 11.11 * 270 = 3000 < 30000
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=30_000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        outcome = trader.maybe_execute(snap)
+
+        # Only the initial order should be placed; chase retries should be skipped
+        self.assertEqual(len(created), 1, f"Expected 1 order (chase skipped due to min), got {len(created)}")
+
+    def test_sell_chase_skips_below_min_order_after_partial_fill(self):
+        """Sell chase retry should skip when remaining amount is below min_order_idr."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # Partial fill: sell 140 out of 150, leaving remainder of 10
+                    return {"success": 1, "return": {"order_id": "1", "spend_cjl": 140.0, "receive_idr": 37800}}
+                return {"success": 1, "return": {"order_id": str(len(created)), "spend_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "10", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # price=270, amount=150 → order_value=40500 > 30000 (passes initial check)
+        # After partial fill of 140, remainder=10 → 10*270=2700 < 30000 (below min)
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=30_000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 270.0, 150.0)
+
+        snap = self._make_snap("cjl_idr", "sell", 270.0, 150.0)
+        outcome = trader.maybe_execute(snap)
+
+        # Only initial order; chase should skip due to remaining below min
+        self.assertEqual(len(created), 1, f"Expected 1 order (sell chase skipped due to min), got {len(created)}")
+
+    def test_buy_chase_market_fallback_skips_below_min(self):
+        """Market order fallback after chase exhaustion should skip when below min_order_idr."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    _balance[0] = 100.0
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=True, min_order_idr=30_000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        outcome = trader.maybe_execute(snap)
+
+        # Only initial order should be placed; chase + market fallback should skip
+        self.assertEqual(len(created), 1, f"Expected 1 order (market fallback skipped due to min), got {len(created)}")
+
+    def test_buy_chase_uses_per_pair_min_when_config_min_is_zero(self):
+        """Chase should respect per-pair exchange minimum even when config.min_order_idr is 0."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {"cjl_idr": {"min_coin": 37.0, "min_idr": 10_000.0}}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    _balance[0] = 100.0  # partial fill of 100 out of ~111
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_cjl": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # min_order_idr=0 (unconfigured), but exchange pair minimum is 10000 IDR / 37 CJL
+        # After partial fill of 100, remaining ~11.11 → below pair min of 37 CJL
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        outcome = trader.maybe_execute(snap)
+
+        # Only the initial order; chase should skip due to per-pair min
+        self.assertEqual(len(created), 1, f"Expected 1 order (chase skipped per-pair min), got {len(created)}")
+
+    def test_buy_chase_catches_runtime_minimum_order_error(self):
+        """Chase should catch RuntimeError with 'Minimum order' and break gracefully."""
+        created = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    _balance[0] = 100.0
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                # Exchange rejects the chase retry
+                raise RuntimeError("API error: {'success': 0, 'error': 'Minimum order is 37.03703703 CJL.', 'error_code': ''}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": str(_balance[0]), "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        # min_order_idr=0 (no pre-check catches it), exchange rejects at API level
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("cjl_idr", "buy", 270.0, 111.11)
+        # Should NOT raise — the chase loop catches the RuntimeError gracefully
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 1 failed chase attempt
+        self.assertEqual(len(created), 2)
+        # Cache should be updated with the parsed minimum
+        cached = trader.client._pair_min_order.get("cjl_idr", {})
+        self.assertGreater(cached.get("min_coin", 0.0), 0.0)
+
+    def test_sell_chase_catches_runtime_minimum_order_error(self):
+        """Sell chase should catch RuntimeError with 'Minimum order' and break gracefully."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    return {"success": 1, "return": {"order_id": "1", "spend_cjl": 140.0, "receive_idr": 37800}}
+                raise RuntimeError("API error: {'success': 0, 'error': 'Minimum order is 37.03703703 CJL.', 'error_code': ''}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "10", "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 270.0, 150.0)
+
+        snap = self._make_snap("cjl_idr", "sell", 270.0, 150.0)
+        # Should NOT raise
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(len(created), 2)
+        cached = trader.client._pair_min_order.get("cjl_idr", {})
+        self.assertGreater(cached.get("min_coin", 0.0), 0.0)
+
+
+class ResumePendingBuyTests(unittest.TestCase):
+    """Tests for the pending buy resume mechanism."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, price, **extra):
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    def test_chase_exhaustion_marks_pending_buy(self):
+        """When all chase retries fail, tracker.has_pending_buy must be True."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": 0, "order_id": "123"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=2, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": "ponke_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=100.0,
+                amount=500.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertTrue(trader.tracker.has_pending_buy,
+                        "Tracker must be marked as pending-buy after chase exhaustion")
+        self.assertEqual(len(trader.tracker.pending_orders), 1)
+
+    def test_resume_pending_buy_fills(self):
+        """resume_pending_buy should fill a pending order and clear the flag."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": str(amount), "order_id": "456"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "500000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Simulate pending buy state
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+        self.assertTrue(trader.tracker.has_pending_buy)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertEqual(result["action"], "buy")
+        self.assertAlmostEqual(result["amount"], 500.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 500.0)
+        self.assertFalse(trader.tracker.has_pending_buy,
+                         "Pending flag should be cleared after successful fill")
+
+    def test_resume_pending_buy_still_unfilled(self):
+        """resume_pending_buy should update price and keep pending if still unfilled."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": "0", "order_id": "789"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "pending")
+        self.assertTrue(trader.tracker.has_pending_buy,
+                        "Pending flag should remain when still unfilled")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+    def test_resume_pending_buy_no_pending(self):
+        """resume_pending_buy should return no_pending when nothing pending."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+        self.assertEqual(result["status"], "no_pending")
+
+    def test_resume_pending_buy_dry_run(self):
+        """In dry_run mode, resume_pending_buy should simulate the fill."""
+        config = self._make_config(dry_run=True)
+        trader = Trader(config)
+
+        trader.tracker.mark_pending_buy(200.0, 50.0)
+        snap = self._make_snap("ponke_idr", 55.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertAlmostEqual(trader.tracker.base_position, 200.0)
+        self.assertFalse(trader.tracker.has_pending_buy)
+
+    def test_resume_pending_buy_below_min_order_cancels(self):
+        """When amount × price < min_order_idr, cancel the pending buy."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["10.0", "1"]], "sell": [["11.0", "1"]]}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 50000.0, "min_coin": 0.0}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(min_order_idr=50000.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # amount=2, price≈11 → notional≈22 < 50000 → should cancel
+        trader.tracker.mark_pending_buy(2.0, 10.0)
+        snap = self._make_snap("ponke_idr", 11.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "cancelled_below_min")
+        self.assertFalse(trader.tracker.has_pending_buy,
+                         "Pending buy should be cancelled when below minimum")
+
+    def test_multi_position_pending_buy_appears_in_active_positions(self):
+        """In multi-position mode, a pending buy should appear in active_positions."""
+        config = self._make_config(
+            multi_position_enabled=True,
+            multi_position_max=3,
+        )
+        trader = Trader(config)
+
+        # Allocate and mark pending
+        tracker = trader.multi_manager.allocate_capital("perp_idr", min_order_idr=30000)
+        tracker.mark_pending_buy(100.0, 732.0)
+
+        active = trader.active_positions
+        self.assertIn("perp_idr", active,
+                       "Pair with pending buy should appear in active_positions")
+
+    def test_multi_position_both_filled_both_in_active(self):
+        """Both filled pairs must appear in active_positions."""
+        config = self._make_config(
+            multi_position_enabled=True,
+            multi_position_max=3,
+        )
+        trader = Trader(config)
+
+        t1 = trader.multi_manager.allocate_capital("perp_idr", min_order_idr=30000)
+        t1.record_trade("buy", 732.0, 100.0)
+
+        t2 = trader.multi_manager.allocate_capital("ponke_idr", min_order_idr=30000)
+        t2.record_trade("buy", 50.0, 1000.0)
+
+        active = trader.active_positions
+        self.assertIn("perp_idr", active, "First filled pair must be in active_positions")
+        self.assertIn("ponke_idr", active, "Second filled pair must be in active_positions")
+        self.assertEqual(len(active), 2)
+
+    def test_sell_unfilled_after_chase_does_not_record_phantom_sell(self):
+        """When a sell order is not filled after chase, base_position must remain > 0."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price, "amount": amount})
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"spend_{coin}": 0, "order_id": str(len(created))}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=2, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Pre-buy position so we can sell
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+        self.assertAlmostEqual(trader.tracker.base_position, 500.0)
+
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": "ponke_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="sell",
+                confidence=0.9,
+                reason="test",
+                target_price=100.0,
+                amount=500.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+
+        # Position must remain intact — no phantom sell
+        self.assertGreater(trader.tracker.base_position, 0.0,
+                           "Position must remain when sell was not filled on exchange")
+        # The step should be marked as pending
+        pending_steps = [s for s in outcome.get("executed_steps", []) if s.get("pending")]
+        self.assertTrue(len(pending_steps) > 0,
+                        "Unfilled sell step should be marked as pending")
+
+
+class AdaptiveLimitOrderTests(unittest.TestCase):
+    """Tests for the adaptive limit order feature."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    @staticmethod
+    def _dummy_client(bids=None, asks=None):
+        bids = bids or [["2699999", "1"]]
+        asks = asks or [["2700001", "1"]]
+        return type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
+        })()
+
+    def _make_snap(self, pair="test_idr", price=2_700_000.0, action="buy", amount=0.5):
+        return {
+            "pair": pair,
+            "price": price,
+            "trend": None, "orderbook": None, "volatility": None, "levels": None,
+            "indicators": None, "insufficient_data": False, "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action=action, confidence=0.9,
+                reason="test", target_price=price, amount=amount,
+                stop_loss=price * 0.95, take_profit=price * 1.05,
+            ),
+        }
+
+    def test_adaptive_buy_uses_bid_side(self):
+        """With adaptive_order_enabled, buy reference_price is based on best_bid."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            adaptive_order_enabled=True,
+            entry_aggressiveness_pct=0.001,
+            max_slippage_pct=0.05,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client(
+            bids=[["100000", "10"]],
+            asks=[["100100", "10"]],
+        )
+        snap = self._make_snap(price=100_050.0, amount=0.5)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        # Price should be based on best_bid (100000) * (1 + 0.001) = 100100,
+        # NOT on best_ask (100100) * (1 + 0.001) = 100200.1
+        self.assertAlmostEqual(outcome["price"], 100000 * 1.001, places=0)
+
+    def test_adaptive_disabled_uses_ask_side(self):
+        """With adaptive_order_enabled=False, buy uses best_ask."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            adaptive_order_enabled=False,
+            entry_aggressiveness_pct=0.001,
+            max_slippage_pct=0.05,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client(
+            bids=[["100000", "10"]],
+            asks=[["100100", "10"]],
+        )
+        snap = self._make_snap(price=100_050.0, amount=0.5)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        # Price should be based on best_ask (100100) * (1 + 0.001)
+        self.assertAlmostEqual(outcome["price"], 100100 * 1.001, places=0)
+
+    def test_adaptive_sell_uses_ask_side(self):
+        """With adaptive_order_enabled, sell reference_price is based on best_ask."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            adaptive_order_enabled=True,
+            entry_aggressiveness_pct=0.0,
+            max_slippage_pct=0.05,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+            multi_position_enabled=False,
+            target_profit_pct=99.0,
+            max_loss_pct=99.0,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client(
+            bids=[["100000", "10"]],
+            asks=[["100100", "10"]],
+        )
+        # Set up a sell position on the main tracker
+        trader.tracker.cash = 0
+        trader.tracker.base_position = 1.0
+        trader.tracker.avg_cost = 100000.0
+        snap = self._make_snap(price=100_050.0, action="sell", amount=0.5)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        # Sell price based on best_ask (100100) * (1 - 0) = 100100
+        self.assertAlmostEqual(outcome["price"], 100100.0, places=0)
+
+
+class LiquidityCheckTests(unittest.TestCase):
+    """Tests for the orderbook liquidity check before entry."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    @staticmethod
+    def _dummy_client(bids=None, asks=None):
+        bids = bids or [["100000", "1"]]
+        asks = asks or [["100100", "1"]]
+        return type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
+        })()
+
+    def _make_snap(self, pair="test_idr", price=100_050.0, action="buy", amount=0.5):
+        return {
+            "pair": pair,
+            "price": price,
+            "trend": None, "orderbook": None, "volatility": None, "levels": None,
+            "indicators": None, "insufficient_data": False, "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action=action, confidence=0.9,
+                reason="test", target_price=price, amount=amount,
+                stop_loss=price * 0.95, take_profit=price * 1.05,
+            ),
+        }
+
+    def test_liquidity_check_skips_thin_market(self):
+        """Trades should be skipped when orderbook volume < min_orderbook_volume_idr."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_orderbook_volume_idr=500_000.0,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        # bid: 100000 * 1 = 100000 IDR; ask: 100100 * 1 = 100100 IDR
+        # total = 200100 < 500000 → should skip
+        trader.client = self._dummy_client(
+            bids=[["100000", "1"]],
+            asks=[["100100", "1"]],
+        )
+        snap = self._make_snap()
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("liquidity_too_thin", outcome["reason"])
+
+    def test_liquidity_check_passes_with_sufficient_volume(self):
+        """Trades should proceed when orderbook volume >= min_orderbook_volume_idr."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_orderbook_volume_idr=100_000.0,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        # bid: 100000 * 1 = 100000 IDR; ask: 100100 * 1 = 100100 IDR
+        # total = 200100 >= 100000 → should proceed
+        trader.client = self._dummy_client(
+            bids=[["100000", "1"]],
+            asks=[["100100", "1"]],
+        )
+        snap = self._make_snap()
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+
+    def test_liquidity_check_disabled_by_default(self):
+        """When min_orderbook_volume_idr=0 (default), the check is disabled."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_orderbook_volume_idr=0.0,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        # Even with 1 IDR of volume, should proceed when check is disabled
+        trader.client = self._dummy_client(
+            bids=[["1", "1"]],
+            asks=[["2", "1"]],
+        )
+        snap = self._make_snap(price=1.5, amount=1.0)
+        outcome = trader.maybe_execute(snap)
+        # Should not be skipped for liquidity reasons
+        self.assertNotEqual(outcome.get("reason", ""), "liquidity_too_thin")
+
+
+class PendingSellTests(unittest.TestCase):
+    """Tests for the pending sell mechanism and resume_pending_sell."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_tracker_pending_sell_lifecycle(self):
+        """mark_pending_sell / has_pending_sell / clear_pending_sell work correctly."""
+        tracker = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        self.assertFalse(tracker.has_pending_sell)
+        tracker.mark_pending_sell(1.0, 50000.0)
+        self.assertTrue(tracker.has_pending_sell)
+        self.assertEqual(len(tracker.pending_sell_orders), 1)
+        tracker.clear_pending_sell()
+        self.assertFalse(tracker.has_pending_sell)
+
+    def test_record_trade_sell_clears_pending_sell(self):
+        """A filled sell (record_trade) must clear any pending sell markers."""
+        tracker = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        tracker.record_trade("buy", 100.0, 5.0)
+        tracker.mark_pending_sell(5.0, 105.0)
+        self.assertTrue(tracker.has_pending_sell)
+        tracker.record_trade("sell", 105.0, 5.0)
+        self.assertFalse(tracker.has_pending_sell)
+
+    def test_pending_sell_persisted_in_state(self):
+        """pending_sell_orders must survive to_state/load_state round-trip."""
+        tracker = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        tracker.record_trade("buy", 100.0, 5.0)
+        tracker.mark_pending_sell(5.0, 105.0)
+        state = tracker.to_state()
+        self.assertIn("pending_sell_orders", state)
+        self.assertEqual(len(state["pending_sell_orders"]), 1)
+
+        # Restore
+        tracker2 = PortfolioTracker(
+            initial_capital=1_000_000.0,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        tracker2.load_state(state)
+        self.assertTrue(tracker2.has_pending_sell)
+        self.assertAlmostEqual(tracker2.pending_sell_orders[0]["amount"], 5.0)
+
+    def test_active_positions_includes_pending_sell(self):
+        """active_positions must include pairs with pending sells."""
+        from bot.tracking import MultiPositionManager
+
+        mgr = MultiPositionManager(
+            initial_capital=10_000_000.0,
+            max_positions=3,
+            target_profit_pct=0.1,
+            max_loss_pct=0.1,
+        )
+        t = mgr.allocate_capital("btc_idr")
+        t.record_trade("buy", 100.0, 5.0)
+        t.record_trade("sell", 105.0, 5.0)  # fully closed
+        # No position, but mark pending sell
+        t.mark_pending_sell(5.0, 105.0)
+        self.assertIn("btc_idr", mgr.active_positions)
+        self.assertTrue(mgr.has_position("btc_idr"))
+
+    def test_force_sell_marks_pending_on_unfilled_order(self):
+        """When the sell order is placed on the book (has order_id) but not
+        filled, force_sell must mark it as pending_sell for resume."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                # Return an order_id under "return" — signaling the order was
+                # placed on the book but NOT yet filled.
+                return {"success": 1, "return": {"order_id": "999", "spend_btc": "0"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+            chase_max_retries=1,
+            order_timeout_to_market=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=105.0,
+            amount=5.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "pending_sell")
+        self.assertTrue(trader.tracker.has_pending_sell)
+
+    def test_force_sell_with_spend_confirms_fill(self):
+        """When the order response includes spend_<coin>, force_sell records
+        the trade as completed."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair: str):
+                return {"return": {"orders": []}}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                return {"success": 1, "return": {"spend_btc": str(amount)}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        decision = StrategyDecision(
+            mode="day_trading",
+            action="sell",
+            confidence=0.9,
+            reason="exit",
+            target_price=105.0,
+            amount=5.0,
+            stop_loss=None,
+            take_profit=None,
+        )
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": decision}
+        outcome = trader.force_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertFalse(trader.tracker.has_pending_sell)
+
+    def test_resume_pending_sell_dry_run(self):
+        """resume_pending_sell in dry-run mode must record the trade directly."""
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+        trader.tracker.mark_pending_sell(5.0, 105.0)
+        self.assertTrue(trader.tracker.has_pending_sell)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "resumed")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+        self.assertFalse(trader.tracker.has_pending_sell)
+
+    def test_resume_pending_sell_no_pending(self):
+        """resume_pending_sell returns no_pending when there is nothing to resume."""
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+        )
+        trader = GuardedTrader(config)
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+        self.assertEqual(outcome["status"], "no_pending")
+
+
+class InsufficientBalanceTests(unittest.TestCase):
+    """Tests for handling 'Insufficient balance' API errors."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, price, **extra):
+        from bot.strategies import StrategyDecision
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    # ── resume_pending_buy: IDR balance check ──────────────────────────────
+
+    def test_resume_pending_buy_adjusts_amount_on_low_idr(self):
+        """resume_pending_buy should reduce amount when IDR balance is low."""
+
+        created_orders = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created_orders.append({"amount": amount, "price": price})
+                coin = pair.split("_")[0]
+                return {"success": 1, "return": {f"receive_{coin}": str(amount), "order_id": "789"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                # Only 50k IDR available — not enough for 500 coins @ ~101
+                return {"return": {"balance": {"ponke": "0", "idr": "50000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        # Amount should be reduced to fit the available IDR balance
+        self.assertTrue(len(created_orders) > 0)
+        self.assertLess(created_orders[0]["amount"], 500.0,
+                        "Amount should be adjusted below original 500 to fit IDR balance")
+
+    def test_resume_pending_buy_cancels_when_no_idr(self):
+        """resume_pending_buy should cancel when IDR balance is zero."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "cancelled_zero")
+        self.assertFalse(trader.tracker.has_pending_buy)
+
+    # ── resume_pending_buy: API error ──────────────────────────────────────
+
+    def test_resume_pending_buy_handles_insufficient_balance_error(self):
+        """resume_pending_buy should catch 'Insufficient balance' and cancel."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                return None
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.mark_pending_buy(500.0, 100.0)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "cancelled_insufficient")
+        self.assertFalse(trader.tracker.has_pending_buy)
+
+    # ── resume_pending_sell: API error ─────────────────────────────────────
+
+    def test_resume_pending_sell_handles_insufficient_balance_error(self):
+        """resume_pending_sell should catch 'Insufficient balance' and cancel."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "100000"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                return None
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+        trader.tracker.mark_pending_sell(500.0, 105.0)
+
+        snap = self._make_snap("ponke_idr", 105.0)
+        result = trader.resume_pending_sell(snap)
+
+        self.assertEqual(result["status"], "cancelled_insufficient")
+        self.assertFalse(trader.tracker.has_pending_sell)
+
+    # ── Chase loop: insufficient balance ───────────────────────────────────
+
+    def test_buy_chase_handles_insufficient_balance(self):
+        """Buy chase loop should catch 'Insufficient balance' and accept partial fill."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # First order placed but not filled
+                    return {"success": 1, "return": {"order_id": "1", "receive_cjl": 0}}
+                # Chase retry: insufficient balance
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "0", "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = {
+            "pair": "cjl_idr",
+            "price": 270.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=270.0,
+                amount=111.11,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        # Should NOT raise — the chase loop catches 'Insufficient balance' gracefully
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 1 failed chase attempt (caught, not re-raised)
+        self.assertEqual(len(created), 2)
+
+    def test_sell_chase_handles_insufficient_balance(self):
+        """Sell chase loop should catch 'Insufficient balance' and accept partial fill."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["270.0", "1"]], "sell": [["270.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # First order placed but not filled
+                    return {"success": 1, "return": {"order_id": "1", "spend_cjl": 0}}
+                # Chase retry: insufficient balance
+                raise RuntimeError("API error: {'success': 0, 'error': 'Insufficient balance.'}")
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"cjl": "111", "idr": "1000000"}}}
+
+            def get_pair_min_order(self, pair):
+                return self._pair_min_order.get(pair.lower(), {"min_coin": 0.0, "min_idr": 0.0})
+
+            @staticmethod
+            def parse_minimum_order_error(msg):
+                import re
+                m = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", msg, re.IGNORECASE)
+                return float(m.group(1)) if m else None
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False, min_order_idr=0.0)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Pre-establish a position so we can sell
+        trader.tracker.record_trade("buy", 200.0, 111.11)
+
+        snap = {
+            "pair": "cjl_idr",
+            "price": 270.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="sell",
+                confidence=0.9,
+                reason="test",
+                target_price=270.0,
+                amount=111.11,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        # Should NOT raise — the chase loop catches 'Insufficient balance' gracefully
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 1 failed chase attempt (caught, not re-raised)
+        self.assertEqual(len(created), 2)
+
+
+class FeeBufferTests(unittest.TestCase):
+    """Tests for the fee buffer applied in balance checks and max_affordable calculations."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_validate_balance_includes_fee_buffer(self):
+        """_validate_balance should reject buy when balance is barely enough (without fee)."""
+
+        class _Client:
+            def get_account_info(self):
+                # Exactly 100k IDR — buy 1 coin @ 100k would need 100k * 1.003 = 100,300
+                return {"return": {"balance": {"btc": "0", "idr": "100000"}}}
+
+        config = BotConfig(
+            api_key="test",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            balance_check_enabled=True,
+        )
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Exact match: 1 coin * 100000 = 100000 IDR
+        # With fee buffer (1.003): need 100300 IDR, have 100000 → should fail
+        result = trader._validate_balance("btc_idr", "buy", 1.0, 100_000.0)
+        self.assertFalse(result, "Should reject buy when balance doesn't cover fees")
+
+        # Smaller amount that fits within fee budget: 0.99 * 100000 = 99000, * 1.003 = 99297 < 100000
+        result = trader._validate_balance("btc_idr", "buy", 0.99, 100_000.0)
+        self.assertTrue(result, "Should allow buy when balance covers amount + fees")
+
+    def test_max_affordable_includes_fee_buffer(self):
+        """max_affordable should be reduced by fee buffer so buy doesn't exceed balance."""
+        # GuardedTrader._Client returns depth with prices at 100.
+        # Use initial_capital = 100 and price = 100 so that the fee buffer
+        # actually caps max_affordable below 1.0 coin.
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            initial_capital=100.0,
+            multi_position_enabled=False,
+            min_order_idr=0.0,
+        )
+        trader = GuardedTrader(config)
+
+        # With 100 IDR cash, price 100 IDR/coin:
+        # Without fee buffer: max_affordable = 100/100 = 1.0 coin
+        # With fee buffer (1.003): max_affordable = 100/(100*1.003) ≈ 0.997 coin
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="buy",
+                confidence=0.9,
+                reason="test",
+                target_price=100.0,
+                amount=10.0,  # More than affordable
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        outcome = trader.maybe_execute(snap)
+
+        # The executed amount should be less than 1.0 due to fee buffer
+        if outcome.get("status") == "simulated":
+            executed_amount = outcome.get("amount", 0)
+            self.assertLess(executed_amount, 1.0,
+                            "Executed amount should be reduced by fee buffer")
+
+
+# ── Smart Market Fallback / Dynamic Sizing / Liquidity / Re-entry ──────────
+
+class SmartMarketFallbackTests(unittest.TestCase):
+    """Tests for regime-aware market order fallback."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=2,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, action, price, amount, **extra):
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=amount,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    # -- _should_use_market_fallback tests --
+
+    def test_buy_market_allowed_trending_up(self):
+        """Market fallback should be allowed for buy when trending up."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.5, description="test"))
+        self.assertTrue(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_buy_market_blocked_ranging(self):
+        """Market fallback should be blocked for buy when ranging."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="ranging", strength=0.5, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_buy_market_blocked_trending_down(self):
+        """Market fallback should be blocked for buy when trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_down", strength=0.6, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_buy_market_blocked_no_regime(self):
+        """Market fallback should be blocked when no regime data."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0)
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    def test_sell_market_allowed_trending_down(self):
+        """Market fallback should be allowed for sell when trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_down", strength=0.5, description="test"))
+        self.assertTrue(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_sell_market_allowed_volatile(self):
+        """Market fallback should be allowed for sell when volatile."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="volatile", strength=0.5, description="test"))
+        self.assertTrue(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_sell_market_blocked_trending_up(self):
+        """Market fallback should be blocked for sell when trending up."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.5, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_sell_market_blocked_ranging(self):
+        """Market fallback should be blocked for sell when ranging."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "sell", 100.0, 1.0,
+                               regime=MarketRegime(regime="ranging", strength=0.5, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "sell"))
+
+    def test_buy_market_weak_trending_up_blocked(self):
+        """Weak trending up (strength < 0.3) should block market buy."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = self._make_snap("btc_idr", "buy", 100.0, 1.0,
+                               regime=MarketRegime(regime="trending_up", strength=0.2, description="test"))
+        self.assertFalse(trader._should_use_market_fallback(snap, "buy"))
+
+    # -- Buy chase: no market fallback when regime is not trending up --
+
+    def test_buy_chase_no_market_when_ranging(self):
+        """Buy chase should NOT fall back to market order when regime is ranging."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+            def create_order(self, pair, action, price, amount):
+                created.append({"action": action, "price": price})
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+            def invalidate_account_info_cache(self):
+                pass
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=2, order_timeout_to_market=True)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0,
+                               regime=MarketRegime(regime="ranging", strength=0.5, description="test"))
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 2 chase = 3 orders (no market fallback)
+        self.assertEqual(len(created), 3,
+                         f"Expected 3 orders (no market fallback), got {len(created)}")
+
+
+class DynamicPositionSizingTests(unittest.TestCase):
+    """Tests for regime-adjusted position sizing."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key=None,
+            dry_run=True,
+            initial_capital=1_000_000.0,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def test_trending_up_boosts_size(self):
+        """Trending up regime should boost position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="trending_up", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertGreater(result, 100.0)
+        self.assertLessEqual(result, 120.0)  # max +20%
+
+    def test_volatile_reduces_size(self):
+        """Volatile regime should reduce position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="volatile", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertLess(result, 100.0)
+        self.assertGreaterEqual(result, 70.0)  # max -30%
+
+    def test_trending_down_reduces_size(self):
+        """Trending down regime should reduce position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="trending_down", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertLess(result, 100.0)
+        self.assertGreaterEqual(result, 70.0)
+
+    def test_ranging_no_change(self):
+        """Ranging regime should not change position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="ranging", strength=0.5, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertEqual(result, 100.0)
+
+    def test_no_regime_no_change(self):
+        """Missing regime should not change position size."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(100.0, snap)
+        self.assertEqual(result, 100.0)
+
+    def test_zero_amount_unchanged(self):
+        """Zero amount should remain zero."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": MarketRegime(regime="trending_up", strength=1.0, description="test"),
+                "raw_depth": None, "decision": None, "price": 100.0}
+        result = trader._regime_adjusted_position_size(0.0, snap)
+        self.assertEqual(result, 0.0)
+
+
+class LiquidityAwareExecutionTests(unittest.TestCase):
+    """Tests for liquidity-adjusted order amount."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(api_key=None, dry_run=True, initial_capital=1_000_000.0)
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def test_amount_capped_at_40pct_of_depth(self):
+        """Order amount should be capped at 40% of visible depth."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "raw_depth": {"sell": [["100", "10"], ["101", "10"]], "buy": [["99", "5"]]},
+            "price": 100.0,
+            "decision": StrategyDecision(
+                mode="day_trading", action="buy", confidence=0.9, reason="test",
+                target_price=100.0, amount=100.0, stop_loss=None, take_profit=None,
+            ),
+        }
+        # Total ask depth = 10 + 10 = 20 coins; 40% = 8.0
+        result = trader._liquidity_adjusted_amount(100.0, snap)
+        self.assertAlmostEqual(result, 8.0, places=1)
+
+    def test_amount_not_capped_when_within_depth(self):
+        """Order amount should not be changed when within 40% of depth."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "raw_depth": {"sell": [["100", "1000"]], "buy": [["99", "500"]]},
+            "price": 100.0,
+            "decision": StrategyDecision(
+                mode="day_trading", action="buy", confidence=0.9, reason="test",
+                target_price=100.0, amount=5.0, stop_loss=None, take_profit=None,
+            ),
+        }
+        # Total ask depth = 1000 coins; 40% = 400; 5 < 400 → no cap
+        result = trader._liquidity_adjusted_amount(5.0, snap)
+        self.assertEqual(result, 5.0)
+
+    def test_no_depth_data_unchanged(self):
+        """Missing depth data should not change amount."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"raw_depth": None, "price": 100.0, "decision": None}
+        result = trader._liquidity_adjusted_amount(100.0, snap)
+        self.assertEqual(result, 100.0)
+
+    def test_sell_uses_bid_side_depth(self):
+        """Sell orders should check bid-side depth."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "raw_depth": {"sell": [["100", "1000"]], "buy": [["99", "5"]]},
+            "price": 100.0,
+            "decision": StrategyDecision(
+                mode="day_trading", action="sell", confidence=0.9, reason="test",
+                target_price=100.0, amount=100.0, stop_loss=None, take_profit=None,
+            ),
+        }
+        # Total bid depth = 5 coins; 40% = 2.0
+        result = trader._liquidity_adjusted_amount(100.0, snap)
+        self.assertAlmostEqual(result, 2.0, places=1)
+
+
+class ReentryAnalysisTests(unittest.TestCase):
+    """Tests for analyze_reentry_opportunity."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(api_key=None, dry_run=True, initial_capital=1_000_000.0)
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def test_reentry_suggested_when_not_trending_down(self):
+        """Re-entry should be suggested when regime is not trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="ranging", strength=0.3, description="test"),
+            "trend": TrendResult(direction="neutral", strength=0.01, fast_ma=100.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=1000.0, ask_volume=800.0,
+                imbalance=0.1, spread_pct=0.02,
+            ),
+            "levels": type("SR", (), {"support": [95.0, 90.0], "resistance": [110.0]})(),
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["reentry"])
+        self.assertLess(result["target_price"], 100.0)
+
+    def test_no_reentry_when_trending_down(self):
+        """Re-entry should be skipped when strongly trending down."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="trending_down", strength=0.6, description="test"),
+            "trend": TrendResult(direction="down", strength=0.05, fast_ma=95.0, slow_ma=100.0),
+            "orderbook": None,
+            "levels": None,
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNone(result)
+
+    def test_no_reentry_when_heavy_sell_pressure(self):
+        """Re-entry should be skipped when orderbook shows heavy sell pressure."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="ranging", strength=0.3, description="test"),
+            "trend": TrendResult(direction="neutral", strength=0.005, fast_ma=100.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=100.0, ask_volume=800.0,
+                imbalance=-0.5, spread_pct=0.02,
+            ),
+            "levels": None,
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNone(result)
+
+    def test_reentry_uses_support_level(self):
+        """Re-entry target should use nearest support level below current price."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="trending_up", strength=0.3, description="test"),
+            "trend": TrendResult(direction="up", strength=0.02, fast_ma=102.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=1000.0, ask_volume=500.0,
+                imbalance=0.3, spread_pct=0.02,
+            ),
+            "levels": type("SR", (), {"support": [98.0, 95.0], "resistance": [110.0]})(),
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["target_price"], 98.0)
+
+    def test_reentry_fallback_1pct_dip(self):
+        """Without support levels, target should be 1% below current price."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {
+            "regime": MarketRegime(regime="ranging", strength=0.3, description="test"),
+            "trend": TrendResult(direction="neutral", strength=0.005, fast_ma=100.0, slow_ma=100.0),
+            "orderbook": OrderbookInsight(
+                bid_volume=500.0, ask_volume=500.0,
+                imbalance=0.0, spread_pct=0.02,
+            ),
+            "levels": type("SR", (), {"support": [], "resistance": []})(),
+            "price": 100.0,
+        }
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["target_price"], 99.0, places=1)
+
+    def test_no_reentry_zero_price(self):
+        """Re-entry should be skipped when price is zero."""
+        config = self._make_config()
+        trader = Trader(config)
+        snap = {"regime": None, "trend": None, "orderbook": None, "levels": None, "price": 0}
+        result = trader.analyze_reentry_opportunity(snap)
+        self.assertIsNone(result)
+
+
+# ── Tests for partial-fill resume and entry quality scoring ───────────────
+
+
+class ResumePendingBuyPartialFillTests(unittest.TestCase):
+    """Tests for partial-fill handling in resume_pending_buy."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, price, **extra):
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    def test_partial_buy_fill_remarked_pending(self):
+        """When resume_pending_buy gets a partial fill, the remainder should
+        be re-marked as pending so it is retried."""
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                coin = pair.split("_")[0]
+                # Partial fill: only receive half the requested amount
+                return {"success": 1, "return": {f"receive_{coin}": str(amount * 0.5), "order_id": "456"}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "5000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 30000.0, "min_coin": 0.0}
+
+        config = self._make_config()
+        trader = Trader(config)
+        trader.client = _Client()
+
+        # Mark 1000 coins as pending buy (1000 * 101 = 101_000 IDR total,
+        # so remainder of 500 * 101 = 50_500 > 30_000 min)
+        trader.tracker.mark_pending_buy(1000.0, 100.0)
+        self.assertTrue(trader.tracker.has_pending_buy)
+
+        snap = self._make_snap("ponke_idr", 101.0)
+        result = trader.resume_pending_buy(snap)
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertAlmostEqual(result["amount"], 500.0)
+        # 500 filled
+        self.assertAlmostEqual(trader.tracker.base_position, 500.0)
+        # Remainder should still be pending
+        self.assertTrue(trader.tracker.has_pending_buy,
+                        "Remainder should be re-marked as pending_buy")
+        self.assertAlmostEqual(trader.tracker.pending_orders[0]["amount"], 500.0,
+                               msg="Remaining 500 should be marked pending")
+
+
+class ResumePendingSellPartialFillTests(unittest.TestCase):
+    """Tests for partial-fill handling in resume_pending_sell."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_partial_sell_fill_remarked_pending(self):
+        """When resume_pending_sell gets a partial fill, the remainder
+        should be re-marked as pending_sell."""
+
+        class _LiveClient(GuardedTrader._Client):
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                # Partial fill: only sell 3 out of 5
+                return {"success": 1, "return": {"spend_btc": "3.0", "order_id": "888"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+            chase_max_retries=1,
+            order_timeout_to_market=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+        trader.tracker.mark_pending_sell(5.0, 105.0)
+        self.assertTrue(trader.tracker.has_pending_sell)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "partial")
+        self.assertAlmostEqual(outcome["amount"], 3.0)
+        self.assertAlmostEqual(outcome["remaining"], 2.0)
+        # 3 sold, 2 remaining as position
+        self.assertAlmostEqual(trader.tracker.base_position, 2.0)
+        # Remainder should be marked as pending sell
+        self.assertTrue(trader.tracker.has_pending_sell,
+                        "Remaining 2 BTC should be re-marked as pending_sell")
+        self.assertAlmostEqual(trader.tracker.pending_sell_orders[0]["amount"], 2.0)
+
+
+class ForceSellPartialFillTests(unittest.TestCase):
+    """Tests for partial-fill handling in force_sell chase loop."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_force_sell_partial_marks_remainder_pending(self):
+        """When force_sell chase sells partially, the remainder should be
+        marked as pending_sell."""
+
+        class _LiveClient(GuardedTrader._Client):
+            _call_count = 0
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                self._call_count += 1
+                if self._call_count == 1:
+                    # First order: placed on book, not filled
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "999"}}
+                elif self._call_count == 2:
+                    # Chase retry: partial fill of 3 BTC
+                    return {"success": 1, "return": {"spend_btc": "3.0", "order_id": "1000"}}
+                else:
+                    # Subsequent chase: no fill
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "1001"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def invalidate_open_orders_cache(self, pair):
+                pass
+
+        config = BotConfig(
+            api_key="key",
+            api_secret="secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            multi_position_enabled=False,
+            chase_max_retries=2,
+            order_timeout_to_market=False,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": None}
+        outcome = trader.force_sell(snapshot)
+
+        # Should have partial fill recorded (3 BTC sold)
+        self.assertEqual(outcome["status"], "pending_sell")
+        self.assertAlmostEqual(outcome["amount"], 3.0)
+        self.assertAlmostEqual(outcome.get("remaining", 0), 2.0)
+        # Remaining 2 BTC should still be in position and marked pending sell
+        self.assertAlmostEqual(trader.tracker.base_position, 2.0)
+        self.assertTrue(trader.tracker.has_pending_sell,
+                        "Remaining 2 BTC should be marked as pending_sell")
+
+
+class EntryQualityScoringTests(unittest.TestCase):
+    """Tests for the entry quality scoring mechanism."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_trader(self, min_score=0.35):
+        config = BotConfig(
+            api_key=None,
+            dry_run=True,
+            entry_quality_min_score=min_score,
+            min_confidence=0.0,
+        )
+        trader = Trader(config)
+        # Stub client so maybe_execute doesn't make real API calls
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        return trader
+
+    def test_high_quality_entry_allowed(self):
+        """Strong trending_up regime + up trend should pass quality check."""
+        trader = self._make_trader(min_score=0.35)
+        regime = MarketRegime(regime="trending_up", strength=0.7, description="test")
+        trend = TrendResult(direction="up", strength=0.05, fast_ma=101.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9, trend=trend)
+        snap["regime"] = regime
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be blocked by entry quality (may succeed or hit other guards)
+        self.assertNotIn("entry_quality_low", outcome.get("reason", ""))
+
+    def test_low_quality_entry_blocked(self):
+        """Trending_down regime + down trend should fail quality check."""
+        trader = self._make_trader(min_score=0.35)
+        regime = MarketRegime(regime="trending_down", strength=0.7, description="test")
+        trend = TrendResult(direction="down", strength=0.05, fast_ma=99.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9, trend=trend)
+        snap["regime"] = regime
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("entry_quality_low", outcome["reason"])
+
+    def test_quality_check_disabled_when_zero(self):
+        """When entry_quality_min_score=0, the check is disabled."""
+        trader = self._make_trader(min_score=0.0)
+        regime = MarketRegime(regime="trending_down", strength=0.7, description="test")
+        trend = TrendResult(direction="down", strength=0.05, fast_ma=99.0, slow_ma=100.0)
+        snap = _make_buy_snap(price=100.0, confidence=0.9, trend=trend)
+        snap["regime"] = regime
+        outcome = trader.maybe_execute(snap)
+        # Should NOT be blocked by entry quality (min_score=0 disables the check)
+        self.assertNotIn("entry_quality_low", outcome.get("reason", ""))
+
+    def test_score_neutral_when_no_signals(self):
+        """When no signals available, score should be neutral (0.5)."""
+        trader = self._make_trader(min_score=0.35)
+        snap = {"pair": "btc_idr", "price": 100.0}
+        score = trader._entry_quality_score(snap)
+        self.assertAlmostEqual(score, 0.5,
+                               msg="No-signal score should be neutral 0.5")
+
+    def test_score_high_for_strong_uptrend(self):
+        """Strong uptrend with all signals bullish should give high score."""
+        trader = self._make_trader()
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "regime": MarketRegime(regime="trending_up", strength=0.8, description="test"),
+            "trend": TrendResult(direction="up", strength=0.06, fast_ma=102.0, slow_ma=100.0),
+            "volume_accel": type("VA", (), {"detected": True, "acceleration_ratio": 2.5})(),
+            "micro_trend": type("MT", (), {"direction": "up", "strength": 0.05})(),
+            "ob_pressure": type("OP", (), {"signal": "buy", "pressure": 0.6})(),
+        }
+        score = trader._entry_quality_score(snap)
+        self.assertGreater(score, 0.6,
+                           f"Score should be high for bullish signals, got {score}")
+
+    def test_score_low_for_downtrend(self):
+        """Downtrend signals should produce a low score."""
+        trader = self._make_trader()
+        snap = {
+            "pair": "btc_idr",
+            "price": 100.0,
+            "regime": MarketRegime(regime="trending_down", strength=0.8, description="test"),
+            "trend": TrendResult(direction="down", strength=0.06, fast_ma=98.0, slow_ma=100.0),
+            "volume_accel": type("VA", (), {"detected": False, "acceleration_ratio": 0.5})(),
+            "micro_trend": type("MT", (), {"direction": "down", "strength": 0.05})(),
+            "ob_pressure": type("OP", (), {"signal": "sell", "pressure": 0.6})(),
+        }
+        score = trader._entry_quality_score(snap)
+        self.assertLess(score, 0.2,
+                        f"Score should be low for bearish signals, got {score}")
+
+
+# ── Trailing TP committed sell (trader integration) tests ─────────────────────
+class TrailingTPCommittedTraderTests(unittest.TestCase):
+    """Tests that evaluate_dynamic_tp respects the tp_sell_committed flag."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _snap(self, price=110.0, trend_strength=0.5, imbalance=0.2, rsi=60.0):
+        from bot.analysis import TrendResult, OrderbookInsight, VolatilityStats, MomentumIndicators
+        trend = TrendResult(direction="up", strength=trend_strength, fast_ma=100.0, slow_ma=95.0)
+        ob = OrderbookInsight(spread_pct=0.001, bid_volume=10.0, ask_volume=8.0, imbalance=imbalance)
+        indicators = MomentumIndicators(rsi=rsi, macd=1.0, macd_signal=0.5, macd_hist=0.5, bb_upper=115.0, bb_mid=105.0, bb_lower=95.0)
+        return {
+            "pair": "btc_idr",
+            "price": price,
+            "trend": trend,
+            "orderbook": ob,
+            "volatility": VolatilityStats(volatility=0.01, avg_volume=100.0),
+            "indicators": indicators,
+        }
+
+    def test_committed_sell_stays_after_price_bounce(self):
+        """Once trailing TP fires a sell, bouncing price should NOT revert to hold."""
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02, multi_position_enabled=False)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        trader.tracker.activate_trailing_tp(120.0, 0.02)  # floor = 117.6
+
+        # Price falls below floor → triggers sell
+        result = trader.evaluate_dynamic_tp(self._snap(price=116.0))
+        self.assertEqual(result, "trailing_tp_triggered")
+        self.assertTrue(trader.tracker.tp_sell_committed)
+
+        # Price bounces back above floor → should STILL return sell (committed)
+        result2 = trader.evaluate_dynamic_tp(self._snap(price=125.0))
+        self.assertEqual(result2, "trailing_tp_triggered")
+
+    def test_committed_cleared_on_position_close(self):
+        """The committed flag is cleared when the position is fully closed."""
+        config = BotConfig(api_key=None, trailing_tp_pct=0.02, multi_position_enabled=False)
+        trader = Trader(config)
+        trader.tracker.record_trade("buy", 100.0, 1.0)
+        trader.tracker.commit_tp_sell()
+
+        # Close position
+        trader.tracker.record_trade("sell", 120.0, 1.0)
+        self.assertFalse(trader.tracker.tp_sell_committed)
+
+    def test_conditional_tp_also_commits(self):
+        """When conditions fail, the sell should also be committed."""
+        config = BotConfig(
+            api_key=None,
+            conditional_tp_min_trend_strength=0.5,
+            multi_position_enabled=False,
+        )
+        trader = Trader(config)
+        # Trend strength 0.2 < 0.5 → close and commit
+        result = trader.evaluate_dynamic_tp(self._snap(trend_strength=0.2))
+        self.assertEqual(result, "target_profit_reached")
+        self.assertTrue(trader.tracker.tp_sell_committed)
+
+        # Next call should stay committed
+        result2 = trader.evaluate_dynamic_tp(self._snap(trend_strength=0.8))
+        self.assertEqual(result2, "trailing_tp_triggered")
+
+
+# ── Global volume filter tests ────────────────────────────────────────────────
+class GlobalVolumeFilterTests(unittest.TestCase):
+    """Tests for the global 24h volume filter in maybe_execute."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_low_volume_skips_buy(self):
+        """When 24h volume < min_volume_idr, buy should be skipped."""
+        config = BotConfig(api_key=None, min_volume_idr=1_000_000.0, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        snap["volume_24h_idr"] = 500_000.0  # below threshold
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("low_24h_volume", outcome["reason"])
+
+    def test_adequate_volume_passes(self):
+        """When 24h volume >= min_volume_idr, buy should NOT be blocked by volume filter."""
+        config = BotConfig(api_key=None, min_volume_idr=1_000_000.0, dry_run=True)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        snap["volume_24h_idr"] = 5_000_000.0  # above threshold
+        outcome = trader.maybe_execute(snap)
+        self.assertNotEqual(outcome.get("reason", ""), "low_24h_volume")
+
+
+# ── Depth data unavailable tests ──────────────────────────────────────────────
+class DepthUnavailableTests(unittest.TestCase):
+    """Tests that buy is skipped when depth data is unavailable and
+    min_liquidity_depth_idr is configured."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_depth_unavailable_skips_buy(self):
+        """When depth data returns None and min_liquidity_depth_idr > 0, skip buy."""
+        config = BotConfig(api_key=None, min_liquidity_depth_idr=100_000.0, dry_run=True)
+        trader = Trader(config)
+        # Depth returns None values (simulating API error)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "10"]], "sell": [["100.05", "10"]],
+            },
+        })()
+        # Monkey-patch _liquidity_depth_idr to return None
+        trader._liquidity_depth_idr = lambda depth, price: None
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("depth_data_unavailable", outcome["reason"])
+
+
+# ── Config defaults tests ─────────────────────────────────────────────────────
+class ConfigDefaultsTests(unittest.TestCase):
+    """Tests for new config defaults."""
+
+    def test_chase_max_retries_default(self):
+        config = BotConfig(api_key=None)
+        self.assertEqual(config.chase_max_retries, 5)
+
+    def test_resume_buy_wait_seconds_default(self):
+        config = BotConfig(api_key=None)
+        self.assertEqual(config.resume_buy_wait_seconds, 20)
+
+    def test_resume_buy_wait_seconds_validation(self):
+        config = BotConfig(api_key=None, resume_buy_wait_seconds=-1)
+        with self.assertRaises(ValueError):
+            config._validate()
+
+
+# ── Tests for force_sell market fallback on partial fill ──────────────────
+class ForceSellMarketFallbackOnPartialTests(unittest.TestCase):
+    """force_sell market fallback must fire even when chase had a partial fill."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_market_fallback_fires_on_partial_fill(self):
+        """After partial fill in chase, market fallback should sell the remainder."""
+
+        class _LiveClient(GuardedTrader._Client):
+            _call_count = 0
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                self._call_count += 1
+                if self._call_count == 1:
+                    # Initial sell: not filled (sits on book)
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "101"}}
+                elif self._call_count == 2:
+                    # Chase retry 1: partial fill 3 BTC
+                    return {"success": 1, "return": {"spend_btc": "3.0", "order_id": "102"}}
+                elif self._call_count == 3:
+                    # Chase retry 2: no fill
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "103"}}
+                else:
+                    # Market fallback: fills the remaining 2 BTC
+                    return {"success": 1, "return": {"spend_btc": "2.0", "order_id": "104"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def invalidate_open_orders_cache(self, pair):
+                pass
+
+        config = BotConfig(
+            api_key="key", api_secret="secret", dry_run=False,
+            initial_capital=1_000_000.0, min_order_idr=0.0,
+            multi_position_enabled=False, chase_max_retries=2,
+            order_timeout_to_market=True,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0, "decision": None}
+        outcome = trader.force_sell(snapshot)
+
+        # All 5 BTC should be sold (3 from chase + 2 from market fallback)
+        self.assertEqual(outcome["status"], "force_sold")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+
+# ── Tests for resume_pending_sell market fallback ─────────────────────────
+class ResumePendingSellMarketFallbackTests(unittest.TestCase):
+    """resume_pending_sell should use market fallback when initial order unfilled."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_market_fallback_on_unfilled_resume_sell(self):
+        """When initial resume sell is unfilled, market fallback should fire."""
+
+        class _LiveClient(GuardedTrader._Client):
+            _call_count = 0
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "5.0", "idr": "0"}}}
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+            def cancel_order(self, pair, oid, ot=None):
+                return {"success": 1}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["105", "1"]]}
+
+            def create_order(self, pair, order_type, price, amount):
+                self._call_count += 1
+                if self._call_count == 1:
+                    # First order: not filled
+                    return {"success": 1, "return": {"spend_btc": "0", "order_id": "200"}}
+                else:
+                    # Market fallback: fills all 5 BTC
+                    return {"success": 1, "return": {"spend_btc": "5.0", "order_id": "201"}}
+
+            def get_pair_min_order(self, pair):
+                return {"min_idr": 0.0, "min_coin": 0.0}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+        config = BotConfig(
+            api_key="key", api_secret="secret", dry_run=False,
+            initial_capital=1_000_000.0, min_order_idr=0.0,
+            multi_position_enabled=False, order_timeout_to_market=True,
+        )
+        trader = GuardedTrader(config)
+        trader.client = _LiveClient()
+        trader.tracker.record_trade("buy", 100.0, 5.0)
+        trader.tracker.mark_pending_sell(5.0, 105.0)
+
+        snapshot = {"pair": "btc_idr", "price": 105.0}
+        outcome = trader.resume_pending_sell(snapshot)
+
+        self.assertEqual(outcome["status"], "resumed")
+        self.assertAlmostEqual(trader.tracker.base_position, 0.0)
+
+
+# ── Tests for koin sepi global guard ──────────────────────────────────────
+class KoinSepiGlobalGuardTests(unittest.TestCase):
+    """Test global orderbook quality guard for koin sepi (illiquid coins)."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_thin_raw_depth_blocks_buy(self):
+        """Coins with < 3 raw bid levels AND thin depth should be blocked."""
+        config = BotConfig(api_key=None, dry_run=True, small_coin_min_depth_idr=50_000.0)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "1"], ["99", "1"]], "sell": [["101", "1"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        # Set raw_depth with only 2 bid levels, thin depth
+        snap["raw_depth"] = {"buy": [["100", "1"], ["99", "1"]], "sell": [["101", "1"]]}
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("koin_sepi", outcome.get("reason", ""))
+
+    def test_deep_raw_depth_allows_buy(self):
+        """Coins with enough raw bid levels should pass the guard."""
+        config = BotConfig(api_key=None, dry_run=True, small_coin_min_depth_idr=50_000.0)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["1000", "100"], ["999", "100"], ["998", "100"]],
+                "sell": [["1001", "100"]],
+            },
+        })()
+        snap = _make_buy_snap(price=1000.0, confidence=0.9)
+        # 3+ bid levels
+        snap["raw_depth"] = {
+            "buy": [["1000", "100"], ["999", "100"], ["998", "100"]],
+            "sell": [["1001", "100"]],
+        }
+        outcome = trader.maybe_execute(snap)
+        self.assertNotIn("koin_sepi", outcome.get("reason", ""))
+
+    def test_no_raw_depth_skips_guard(self):
+        """When raw_depth is not in snapshot, the guard should not trigger."""
+        config = BotConfig(api_key=None, dry_run=True, small_coin_min_depth_idr=50_000.0)
+        trader = Trader(config)
+        trader.client = type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {
+                "buy": [["100", "1"]], "sell": [["100.05", "1"]],
+            },
+        })()
+        snap = _make_buy_snap(price=100.0, confidence=0.9)
+        # No raw_depth key - guard should not fire
+        snap.pop("raw_depth", None)
+        outcome = trader.maybe_execute(snap)
+        self.assertNotIn("koin_sepi", outcome.get("reason", ""))
+
+
+# ── Tests for from_env defaults ───────────────────────────────────────────
+class FromEnvProtectiveDefaultsTests(unittest.TestCase):
+    """from_env() should set protective defaults for koin sepi filtering."""
+
+    def test_min_volume_idr_default_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_volume_idr, 500_000.0)
+
+    def test_min_liquidity_depth_idr_default_from_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_liquidity_depth_idr, 100_000.0)
+
+    def test_overridable_via_env(self):
+        from unittest.mock import patch
+        with patch.dict(__import__("os").environ, {"MIN_VOLUME_IDR": "0", "MIN_LIQUIDITY_DEPTH_IDR": "0"}, clear=True):
+            cfg = BotConfig.from_env()
+            self.assertEqual(cfg.min_volume_idr, 0.0)
+            self.assertEqual(cfg.min_liquidity_depth_idr, 0.0)

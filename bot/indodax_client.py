@@ -63,14 +63,19 @@ class IndodaxClient:
         self._last_public_request: float = 0.0
         # Per-pair minimum order cache:
         #   keys are pair names (e.g. "btc_idr")
-        #   values are dicts with "min_coin" (min base currency amount)
-        #   and "min_idr" (min IDR value).
+        #   values are dicts with "min_coin" (min traded/coin amount)
+        #   and "min_idr" (min base/IDR value).
         self._pair_min_order: Dict[str, Dict[str, float]] = {}
         # TTL for the pair-minimum-order cache.  Defaults to 3600 s (1 hour).
         # Indodax rarely changes minimum order requirements, but a TTL ensures
         # the cache is eventually refreshed when the bot runs for multiple days.
         self._pair_min_order_cache_ttl: float = 3600.0
         self._pair_min_order_expires: float = 0.0
+        # Per-pair amount precision cache.  Derived from ``trade_min_traded_currency``
+        # in ``/api/pairs``.  Coins whose minimum is an integer (e.g. 1, 100) require
+        # integer amounts (precision 0), while fractional minimums (e.g. 0.0001)
+        # imply 8-decimal precision.  Used by :meth:`format_amount`.
+        self._amount_precisions: Dict[str, int] = {}
         # Price increment cache (tick size per pair) from /api/price_increments.
         # keys are pair names (e.g. "btc_idr"), values are Decimal-compatible strings.
         self._price_increments: Dict[str, str] = {}
@@ -126,10 +131,16 @@ class IndodaxClient:
         """Fetch exchange pair list and cache per-pair minimum order sizes.
 
         The Indodax ``/api/pairs`` endpoint returns a list of pair objects,
-        each containing ``trade_min_base_currency`` (minimum coin amount) and
-        ``trade_min_traded_currency`` (minimum IDR amount).  This method
+        each containing ``trade_min_base_currency`` (minimum IDR/base amount) and
+        ``trade_min_traded_currency`` (minimum coin amount).  This method
         populates :attr:`_pair_min_order` for quick lookup before order
         placement so that "Minimum order" errors are prevented proactively.
+
+        Also derives per-pair **amount precision** from
+        ``trade_min_traded_currency``: coins whose minimum is an integer
+        (e.g. ``1``, ``100``) require integer amounts (precision ``0``),
+        while fractional minimums (e.g. ``0.0001``) allow up to 8 decimals.
+        This prevents the Indodax API error *"amount can't be in decimal."*
 
         :param pairs_info: Optional pre-fetched ``/api/pairs`` response data.
             When provided the cache is populated from this list *without*
@@ -155,15 +166,52 @@ class IndodaxClient:
             pair_id = (info.get("id") or info.get("pair_id") or "").lower().replace("/", "_")
             if not pair_id:
                 continue
+            # Also store under the ticker_id key (e.g. "btc_idr") so that
+            # lookups from the trade API (which uses underscore format) work.
+            ticker_id = (info.get("ticker_id") or "").lower()
+            # Construct underscore key from traded_currency + base_currency
+            # as a fallback when ticker_id is absent from the API response.
+            traded_cur = (info.get("traded_currency") or "").lower()
+            base_cur = (info.get("base_currency") or "").lower()
+            constructed_key = f"{traded_cur}_{base_cur}" if traded_cur and base_cur else ""
             try:
-                min_coin = float(info.get("trade_min_base_currency") or 0)
+                min_coin = float(info.get("trade_min_traded_currency") or 0)
             except (TypeError, ValueError):
                 min_coin = 0.0
             try:
-                min_idr = float(info.get("trade_min_traded_currency") or 0)
+                min_idr = float(info.get("trade_min_base_currency") or 0)
             except (TypeError, ValueError):
                 min_idr = 0.0
-            self._pair_min_order[pair_id] = {"min_coin": min_coin, "min_idr": min_idr}
+            entry = {"min_coin": min_coin, "min_idr": min_idr}
+            # Store under all available key formats for robust lookups.
+            all_keys = {pair_id}
+            if ticker_id:
+                all_keys.add(ticker_id)
+            if constructed_key:
+                all_keys.add(constructed_key)
+            for key in all_keys:
+                self._pair_min_order[key] = entry
+
+            # Derive amount precision from trade_min_traded_currency.
+            # Per Indodax API docs, trade_min_traded_currency is the minimum
+            # quantity of the *coin* (e.g. 0.0001 BTC, 100 DOGE).
+            # If this minimum is a whole number the exchange rejects fractional
+            # amounts ("amount can't be in decimal.") → precision 0.
+            # Otherwise default to 8 decimals (standard crypto precision).
+            # Use Decimal for accurate decimal-place counting, avoiding
+            # float-comparison edge cases.
+            amt_precision = 8  # default for fractional coins (BTC, ETH, etc.)
+            raw_min = info.get("trade_min_traded_currency")
+            if raw_min is not None:
+                try:
+                    d = Decimal(str(raw_min)).normalize()
+                    if d > 0 and d.as_tuple().exponent >= 0:
+                        # No decimal places — integer coin (e.g. 1, 100, 50000)
+                        amt_precision = 0
+                except (InvalidOperation, ValueError, TypeError):
+                    pass
+            for key in all_keys:
+                self._amount_precisions[key] = amt_precision
             loaded += 1
         logger.info("load_pair_min_orders: cached minimum orders for %d pairs", loaded)
         ttl = getattr(self, "_pair_min_order_cache_ttl", 3600.0)
@@ -219,8 +267,22 @@ class IndodaxClient:
     def get_summaries(self) -> Dict[str, Any]:
         return self._get("/api/summaries")
 
+    def get_server_time(self) -> Dict[str, Any]:
+        """Return the Indodax server time from ``/api/server_time``.
+
+        :returns: ``{"server_time": <unix_timestamp>}``
+        """
+        return self._get("/api/server_time")
+
     def get_ticker(self, pair: str) -> Dict[str, Any]:
         return self._get(f"/api/ticker/{pair}")
+
+    def get_ticker_all(self) -> Dict[str, Any]:
+        """Return tickers for all pairs from ``/api/ticker_all``.
+
+        :returns: ``{"tickers": {"btc_idr": {...}, ...}}``
+        """
+        return self._get("/api/ticker_all")
 
     def get_depth(self, pair: str, count: int = 50) -> Dict[str, Any]:
         return self._get(f"/api/depth/{pair}", params={"count": count})
@@ -338,6 +400,11 @@ class IndodaxClient:
             raise RuntimeError(f"Failed to obtain private WS token: {data}")
         return {"connToken": ret["connToken"], "channel": ret["channel"]}
 
+    def _maybe_refresh_pair_min_orders(self) -> None:
+        """Auto-refresh pair minimum-order and amount-precision caches when stale."""
+        if not self._amount_precisions or self.is_pair_min_order_cache_stale():
+            self.load_pair_min_orders()
+
     def _maybe_refresh_price_increments(self) -> None:
         if not self._price_increments or self.is_price_increment_cache_stale():
             self.load_price_increments()
@@ -379,6 +446,35 @@ class IndodaxClient:
 
         return quantized_price, precision
 
+    def format_amount(self, pair: str, amount: float) -> Tuple[float, int]:
+        """Round *amount* to the precision expected by the exchange for *pair*.
+
+        Some Indodax coins (typically low-price tokens) only accept integer
+        amounts.  The precision is derived from the ``trade_min_traded_currency``
+        field cached by :meth:`load_pair_min_orders`.  Returns the (possibly
+        rounded) amount plus the decimal precision for string formatting.
+
+        If no pair info is cached, attempts to auto-refresh from the API.
+        Falls back to 8 decimal places when the pair is still unknown.
+        """
+        key = pair.lower()
+        precision = self._amount_precisions.get(key)
+        if precision is None:
+            alt_key = key.replace("_", "")
+            precision = self._amount_precisions.get(alt_key)
+        if precision is None:
+            # Cache miss — try refreshing pair data from the API.
+            try:
+                self._maybe_refresh_pair_min_orders()
+            except Exception:
+                pass
+            precision = self._amount_precisions.get(key)
+            if precision is None:
+                precision = self._amount_precisions.get(key.replace("_", ""), 8)
+        if precision == 0:
+            return float(round(amount)), 0
+        return round(amount, precision), precision
+
     def create_order(
         self,
         pair: str,
@@ -392,13 +488,26 @@ class IndodaxClient:
         idr: Optional[float] = None,
         btc: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Place a trade order according to Indodax Private REST API docs.
+        """Place a trade order per `Indodax Private REST API docs`_.
 
-        Supports documented optional parameters:
-        - order_type (``order_kind``) : ``limit`` / ``market`` (default ``limit``)
-        - client_order_id            : user-supplied id (<= 36 chars, [A-Za-z0-9_-])
-        - time_in_force              : currently ``GTC`` or ``MOC`` for limit
-        - idr / btc                  : explicit amount fields per API docs
+        Follows the documented trade endpoint parameters:
+
+        - **Limit buy**: sends coin amount (e.g. ``btc=0.001``), *not* ``idr``.
+          Per API docs: *"Request will be rejected if you send BUY order
+          request with both idr set & order_type set to LIMIT."*
+          Recommendation (Sept 2022): *"send btc instead idr and use
+          order_type: limit"* to avoid under-filled orders.
+        - **Market buy**: sends ``idr`` amount only.  Per API docs:
+          *"Currently MARKET BUY order only support amount in idr."*
+        - **Sell**: sends coin amount.
+
+        Amount formatting respects per-pair precision derived from
+        ``/api/pairs`` ``trade_min_traded_currency`` field.  Coins whose
+        minimum is an integer (e.g. ``1``) are sent without decimals to
+        avoid the Indodax API error *"amount can't be in decimal."*
+
+        .. _Indodax Private REST API docs:
+           https://github.com/btcid/indodax-official-api-docs/blob/master/Private-RestAPI.md
         """
         price, precision = self.format_price(pair, price)
         price_str = f"{price:.{precision}f}"
@@ -407,25 +516,28 @@ class IndodaxClient:
         is_idr_pair = pair.endswith("_idr")
 
         if order_type == "buy":
-            if idr is not None:
+            if order_kind == "market" and is_idr_pair:
+                # Market buy on IDR pair: only idr amount supported.
+                if idr is not None:
+                    payload["idr"] = f"{float(idr):.0f}"
+                else:
+                    idr_total = round(price * amount)
+                    payload["idr"] = f"{idr_total:.0f}"
+            elif idr is not None:
+                # Explicit idr override (backwards compatibility).
                 payload["idr"] = f"{float(idr):.0f}"
-            elif is_idr_pair:
-                idr_total = round(price * amount)
-                payload["idr"] = f"{idr_total:.0f}"
-                coin_amt = amount
-                amount_str = f"{coin_amt:.8f}"
-                payload[base_coin] = amount_str
-                payload["amount"] = amount_str
             else:
+                # Limit buy (default): coin amount only — no idr.
                 coin_amt = btc if btc is not None else amount
-                amount_str = f"{coin_amt:.8f}"
+                coin_amt, amt_precision = self.format_amount(pair, coin_amt)
+                amount_str = f"{coin_amt:.{amt_precision}f}"
                 payload[base_coin] = amount_str
-                payload["amount"] = amount_str
         else:
+            # Sell: always coin amount.
             coin_amt = btc if btc is not None else amount
-            amount_str = f"{coin_amt:.8f}"
+            coin_amt, amt_precision = self.format_amount(pair, coin_amt)
+            amount_str = f"{coin_amt:.{amt_precision}f}"
             payload[base_coin] = amount_str
-            payload["amount"] = amount_str
 
         if client_order_id:
             if len(client_order_id) > 36:
@@ -434,7 +546,47 @@ class IndodaxClient:
         if time_in_force:
             payload["time_in_force"] = time_in_force
 
-        return self._enqueue_private("trade", payload)
+        try:
+            return self._enqueue_private("trade", payload)
+        except RuntimeError as exc:
+            exc_str = str(exc)
+            if "Insufficient balance" in exc_str:
+                # Reduce order size by 0.5% and retry once to account for
+                # fee deductions that made the original amount too large.
+                _reduced = False
+                if "idr" in payload:
+                    old_val = float(payload["idr"])
+                    new_val = old_val * 0.995
+                    payload["idr"] = f"{new_val:.0f}"
+                    _reduced = True
+                elif base_coin in payload:
+                    old_val = float(payload[base_coin])
+                    new_val = old_val * 0.995
+                    coin_amt_r, amt_prec_r = self.format_amount(pair, new_val)
+                    payload[base_coin] = f"{coin_amt_r:.{amt_prec_r}f}"
+                    _reduced = True
+                if _reduced:
+                    logger.warning(
+                        "Retrying order with reduced amount for %s (Insufficient balance)",
+                        pair,
+                    )
+                    return self._enqueue_private("trade", payload)
+                raise
+            if "can't be in decimal" not in exc_str:
+                raise
+            # The exchange requires integer amounts for this pair.
+            # Update the precision cache and retry with integer formatting.
+            pair_key = pair.lower()
+            for k in (pair_key, pair_key.replace("_", "")):
+                self._amount_precisions[k] = 0
+            logger.warning(
+                "Retrying order with integer amount for %s (was: %s)",
+                pair, payload.get(base_coin, payload.get("idr")),
+            )
+            if base_coin in payload:
+                coin_val = btc if btc is not None else amount
+                payload[base_coin] = str(int(round(coin_val)))
+            return self._enqueue_private("trade", payload)
 
     def cancel_order(self, pair: str, order_id: str, order_type: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"pair": pair, "order_id": order_id}
@@ -442,11 +594,190 @@ class IndodaxClient:
             payload["type"] = order_type
         return self._enqueue_private("cancelOrder", payload)
 
+    def cancel_by_client_order_id(self, client_order_id: str) -> Dict[str, Any]:
+        """Cancel an open order by its ``client_order_id``.
+
+        Rate-limited to 30 requests/second on the Indodax side.
+
+        :param client_order_id: The client-supplied order ID.
+        :returns: Response dict with ``order_id``, ``client_order_id``, ``type``, ``pair``, ``balance``.
+        """
+        return self._enqueue_private("cancelByClientOrderId", {"client_order_id": client_order_id})
+
+    def get_order(self, pair: str, order_id: str) -> Dict[str, Any]:
+        """Get specific order details using ``getOrder``.
+
+        :param pair: Trading pair (e.g. ``btc_idr``).
+        :param order_id: The exchange-assigned order ID.
+        :returns: Response dict containing order details.
+        """
+        return self._post_private("getOrder", {"pair": pair, "order_id": order_id})
+
+    def get_order_by_client_id(self, client_order_id: str) -> Dict[str, Any]:
+        """Get specific order details by ``client_order_id`` using ``getOrderByClientOrderId``.
+
+        :param client_order_id: The client-supplied order ID.
+        :returns: Response dict containing order details.
+        """
+        return self._post_private("getOrderByClientOrderId", {"client_order_id": client_order_id})
+
+    def order_history(self, pair: str, count: int = 1000, from_id: Optional[int] = None) -> Dict[str, Any]:
+        """Get order history (buy and sell) via the legacy ``orderHistory`` TAPI method.
+
+        .. note:: This endpoint is scheduled for decommission on April 7, 2026.
+           Use :meth:`get_order_history_v2` for the replacement endpoint.
+
+        :param pair: Trading pair (e.g. ``btc_idr``).
+        :param count: Number of orders to return (default 1000).
+        :param from_id: Starting order ID for pagination.
+        """
+        payload: Dict[str, Any] = {"pair": pair, "count": count}
+        if from_id is not None:
+            payload["from"] = from_id
+        return self._post_private("orderHistory", payload)
+
+    def withdraw_fee(self, currency: str, network: Optional[str] = None) -> Dict[str, Any]:
+        """Check withdrawal fee for a currency.
+
+        Requires withdraw permission on the API key.
+
+        :param currency: Currency code (e.g. ``btc``, ``eth``).
+        :param network: Optional network (e.g. ``erc20``, ``trc20``, ``bep20``).
+        :returns: ``{"server_time": ..., "withdraw_fee": ..., "currency": ...}``
+        """
+        payload: Dict[str, Any] = {"currency": currency}
+        if network:
+            payload["network"] = network
+        return self._post_private("withdrawFee", payload)
+
+    def withdraw_coin(
+        self,
+        currency: str,
+        withdraw_address: str,
+        withdraw_amount: float,
+        request_id: str,
+        *,
+        network: Optional[str] = None,
+        withdraw_memo: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Withdraw cryptocurrency assets.
+
+        Requires withdraw permission on the API key and a configured Callback URL.
+
+        :param currency: Currency to withdraw (e.g. ``btc``, ``eth``).
+        :param withdraw_address: Receiver address.
+        :param withdraw_amount: Amount to send.
+        :param request_id: Unique alphanumeric ID to identify this request (max 255 chars).
+        :param network: Network if required (e.g. ``erc20``, ``trc20``).
+        :param withdraw_memo: Optional memo/destination tag.
+        """
+        payload: Dict[str, Any] = {
+            "currency": currency,
+            "withdraw_address": withdraw_address,
+            "withdraw_amount": f"{withdraw_amount:.8f}",
+            "request_id": request_id,
+        }
+        if network:
+            payload["network"] = network
+        if withdraw_memo:
+            payload["withdraw_memo"] = withdraw_memo
+        return self._post_private("withdrawCoin", payload)
+
+    def trans_history(self) -> Dict[str, Any]:
+        """Retrieve full deposit and withdrawal history via ``transHistory``.
+
+        :returns: Response dict containing withdrawal and deposit records.
+        """
+        return self._post_private("transHistory")
+
+    def check_server_time_drift(self) -> float:
+        """Compare local time against the Indodax server clock.
+
+        :returns: Drift in seconds (positive = local is ahead of server).
+        :raises RuntimeError: when the server-time endpoint fails.
+        """
+        local_before = time.time()
+        data = self.get_server_time()
+        local_after = time.time()
+        server_ts = data.get("server_time", 0)
+        if not server_ts:
+            raise RuntimeError("server_time not found in response")
+        local_mid = (local_before + local_after) / 2.0
+        drift = local_mid - float(server_ts)
+        if abs(drift) > 5.0:
+            logger.warning(
+                "Significant clock drift detected: %.2fs (local %s server)",
+                drift,
+                "ahead of" if drift > 0 else "behind",
+            )
+        return drift
+
+    # -------------------- Trade API v2 (signed GET) -------------------- #
+    def get_order_history_v2(
+        self,
+        symbol: str,
+        *,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 100,
+        sort: str = "desc",
+    ) -> Dict[str, Any]:
+        """Retrieve order history via the new ``GET /api/v2/order/histories`` endpoint.
+
+        This replaces the legacy ``orderHistory`` TAPI method with improved
+        stability and reliability.
+
+        :param symbol: Trading pair symbol without underscore (e.g. ``btcidr``).
+        :param start_time: Start of range (Unix ms). Default: last 24h.
+        :param end_time: End of range (Unix ms). Default: last 24h.
+        :param limit: Number of orders (10–1000, default 100).
+        :param sort: ``asc`` or ``desc`` (default ``desc``).
+        :returns: ``{"data": [{"orderId": ..., "symbol": ..., ...}, ...]}``
+        """
+        params: Dict[str, Any] = {"symbol": symbol, "limit": limit, "sort": sort}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        return self._get_signed("/api/v2/order/histories", params)
+
+    def get_trade_history_v2(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 500,
+        sort: str = "desc",
+    ) -> Dict[str, Any]:
+        """Retrieve trade execution history via ``GET /api/v2/myTrades``.
+
+        This replaces the legacy ``tradeHistory`` TAPI method.
+
+        :param symbol: Trading pair symbol without underscore (e.g. ``btcidr``).
+        :param order_id: Optional filter by order ID.
+        :param start_time: Start of range (Unix ms). Default: last 24h.
+        :param end_time: End of range (Unix ms). Default: last 24h.
+        :param limit: Number of trades (10–1000, default 500).
+        :param sort: ``asc`` or ``desc`` (default ``desc``).
+        :returns: ``{"data": [{"tradeId": ..., "orderId": ..., ...}, ...]}``
+        """
+        params: Dict[str, Any] = {"symbol": symbol, "limit": limit, "sort": sort}
+        if order_id is not None:
+            params["orderId"] = order_id
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        return self._get_signed("/api/v2/myTrades", params)
+
     @staticmethod
     def parse_minimum_order_error(error_message: str) -> Optional[float]:
         """Extract the minimum required coin amount from a 'Minimum order' error.
 
         Indodax returns messages like ``"Minimum order 3333.33333333 WTEC"``
+        or ``"Minimum order is 37.03703703 CJL."``
         when a sell/buy amount is below the exchange floor.  This helper parses
         that message and returns the minimum amount as a float, or ``None`` if
         the message does not match the expected pattern.
@@ -455,7 +786,7 @@ class IndodaxClient:
                               dict, or the full ``str(exc)`` text.
         :returns: Minimum coin amount (float) or ``None``.
         """
-        match = re.search(r"Minimum order\s+([\d.]+)", error_message, re.IGNORECASE)
+        match = re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", error_message, re.IGNORECASE)
         if match:
             try:
                 return float(match.group(1))
@@ -465,9 +796,50 @@ class IndodaxClient:
 
     # -------------------- helpers -------------------- #
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        if self._request_scheduler is not None:
-            return self._request_scheduler.submit(self._perform_get, path, params).result()
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None:
+            return scheduler.submit(self._perform_get, path, params).result()
         return self._perform_get(path, params)
+
+    def _get_signed(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Perform a signed GET request for Trade API v2 endpoints.
+
+        Trade API v2 (``/api/v2/...``) uses ``X-APIKEY`` and ``Sign`` headers
+        with HMAC-SHA512 over the query string, as described in the Indodax
+        Trade API v2 documentation.
+        """
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None:
+            return scheduler.submit(self._perform_get_signed, path, params).result()
+        return self._perform_get_signed(path, params)
+
+    def _perform_get_signed(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        if not self.api_key:
+            raise ValueError("API key is required for signed endpoints")
+        if not self.api_secret:
+            raise ValueError("API secret is required for signed endpoints")
+
+        if params is None:
+            params = {}
+        # Add nonce and timestamp for replay protection
+        params.setdefault("timestamp", int(time.time() * 1000))
+        query_string = urlencode(params)
+        sign = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha512,
+        ).hexdigest()
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-APIKEY": self.api_key,
+            "Sign": sign,
+        }
+        url = f"{self.base_url}{path}"
+        response = self.session.get(
+            url, params=params, headers=headers, timeout=self.timeout
+        )
+        return self._handle_v2_response(response)
 
     def _perform_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         # Serialize public REST calls to avoid hitting Indodax per-IP limits
@@ -493,8 +865,9 @@ class IndodaxClient:
         return self._handle_response(response)
 
     def _post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if self._request_scheduler is not None:
-            return self._request_scheduler.submit(self._perform_post_private, method, params).result()
+        scheduler = getattr(self, "_request_scheduler", None)
+        if scheduler is not None:
+            return scheduler.submit(self._perform_post_private, method, params).result()
         return self._perform_post_private(method, params)
 
     def _perform_post_private(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -543,4 +916,33 @@ class IndodaxClient:
         # Private API success flag
         if isinstance(data, dict) and ("success" in data) and not data.get("success"):
             raise RuntimeError(f"API error: {data}")
+        return data
+
+    @staticmethod
+    def _handle_v2_response(response: requests.Response) -> Any:
+        """Handle responses from Trade API v2 endpoints.
+
+        V2 endpoints use a different error format: ``{"code": <int>, "error": "..."}``
+        instead of the TAPI ``{"success": 0, "error": "..."}``.
+        """
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            # Try to extract structured error from the body
+            try:
+                data = response.json()
+                code = data.get("code", response.status_code)
+                error = data.get("error", str(exc))
+                raise RuntimeError(f"API v2 error ({code}): {error}") from exc
+            except (ValueError, AttributeError):
+                raise RuntimeError(f"HTTP error: {exc}") from exc
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Failed to parse JSON response") from exc
+
+        # V2 error responses include a "code" key
+        if isinstance(data, dict) and "code" in data and "error" in data:
+            raise RuntimeError(f"API v2 error ({data['code']}): {data['error']}")
         return data

@@ -15,6 +15,47 @@ import requests
 from bot.config import BotConfig
 from bot.trader import Trader
 from bot.journal import TradeJournal
+from bot.risk_management import (
+    check_circuit_breaker as rm_check_circuit_breaker,
+    check_max_drawdown,
+    adjust_risk_dynamically,
+    check_anomaly_shutdown,
+)
+from bot.portfolio_management import (
+    evaluate_multi_asset_portfolio,
+    plan_rebalance,
+    assess_diversification,
+    compute_correlation_matrix,
+)
+from bot.ml_models import (
+    detect_regime,
+    optimize_strategy,
+    detect_anomalies as ml_detect_anomalies,
+)
+from bot.scanning import (
+    scan_momentum,
+    scan_trends,
+)
+from bot.execution import (
+    monitor_execution_quality,
+)
+from bot.autonomous import (
+    AutonomousTradingState,
+    run_autonomous_cycle,
+    check_autonomous_health,
+    rotate_pairs,
+    auto_switch_strategy,
+    CrashEvent,
+    decide_restart,
+    ComponentHealth,
+    evaluate_failover,
+    ScheduledTask,
+    schedule_tasks,
+    update_task_after_run,
+    PollingConfig,
+    adjust_polling_interval,
+    diagnose_and_recover,
+)
 
 # ── ANSI codes — disabled when stdout is not a terminal ─────────────────
 _USE_COLOR = sys.stdout.isatty()
@@ -714,6 +755,48 @@ def main() -> None:
         else trader.tracker.base_position > 0
     )
 
+    # ── Autonomous trading state ─────────────────────────────────────────────
+    _autonomous_state = AutonomousTradingState(
+        is_running=True,
+        health_status="running",
+        max_errors_before_pause=10,
+        pause_duration_seconds=60.0,
+    )
+    _start_time = time.time()
+    _crash_history: list = []
+    _error_log: list = []
+
+    # ── Task scheduling ──────────────────────────────────────────────────────
+    _now_ms = lambda: int(time.time() * 1000)
+    _tasks = [
+        ScheduledTask(name="health_check", interval_seconds=120.0, priority=1, enabled=True),
+        ScheduledTask(name="pair_rotation", interval_seconds=300.0, priority=2, enabled=True),
+        ScheduledTask(name="strategy_review", interval_seconds=600.0, priority=3, enabled=True),
+        ScheduledTask(name="risk_monitoring", interval_seconds=180.0, priority=2, enabled=True),
+        ScheduledTask(name="portfolio_analysis", interval_seconds=600.0, priority=3, enabled=True),
+        ScheduledTask(name="ml_regime_check", interval_seconds=300.0, priority=3, enabled=True),
+        ScheduledTask(name="cleanup", interval_seconds=900.0, priority=5, enabled=True),
+    ]
+
+    # ── Dynamic polling ──────────────────────────────────────────────────────
+    _polling_config = PollingConfig(
+        base_interval_ms=config.interval_seconds * 1000,
+        min_interval_ms=max(1000, getattr(config, "adaptive_interval_min_seconds", 3) * 1000),
+        max_interval_ms=60000,
+        current_interval_ms=config.interval_seconds * 1000,
+        mode="adaptive" if config.adaptive_interval_enabled else "fixed",
+    )
+
+    # ── Component health tracking ────────────────────────────────────────────
+    _components = [
+        ComponentHealth(name="exchange_api", is_healthy=True, last_heartbeat=_now_ms(), priority=0),
+        ComponentHealth(name="market_data", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+        ComponentHealth(name="order_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+        ComponentHealth(name="risk_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=1),
+        ComponentHealth(name="ml_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=2),
+        ComponentHealth(name="portfolio_engine", is_healthy=True, last_heartbeat=_now_ms(), priority=2),
+    ]
+
     # ── Auto-resume: use the pair from saved state if we're resuming ────────
     if trader.restored_pair:
         pair = trader.restored_pair
@@ -729,6 +812,128 @@ def main() -> None:
         logging.info(_separator(f"Cycle #{cycle}"))
 
         try:
+            # ── Autonomous state tracking ────────────────────────────────────
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles,
+                successful_cycles=_autonomous_state.successful_cycles,
+                failed_cycles=_autonomous_state.failed_cycles,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status=_autonomous_state.health_status,
+                error_count=consecutive_errors,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+
+            # ── Failover check ───────────────────────────────────────────────
+            for _comp in _components:
+                _comp.last_heartbeat = _now_ms()
+            _failover = evaluate_failover(_components)
+            if _failover.failover_triggered:
+                logging.warning(
+                    "⚠️  Failover triggered: %s (status=%s)",
+                    _failover.failed_components,
+                    _failover.system_status,
+                )
+                _recovery = diagnose_and_recover(
+                    _error_log,
+                    component_health=_components,
+                )
+                if _recovery.needs_recovery and not _recovery.can_auto_recover:
+                    logging.error(
+                        "🛑 Manual intervention needed: %s", _recovery.diagnosis,
+                    )
+
+            # ── Task scheduling ──────────────────────────────────────────────
+            _schedule_result = schedule_tasks(_tasks, current_time=_now_ms())
+            for _task_name in _schedule_result.tasks_due:
+                _task_idx = next(
+                    (i for i, t in enumerate(_tasks) if t.name == _task_name), None,
+                )
+                if _task_idx is None:
+                    continue
+                _task = _tasks[_task_idx]
+                _task_success = True
+                try:
+                    if _task_name == "health_check":
+                        _health = check_autonomous_health(_autonomous_state)
+                        if _health.get("needs_restart"):
+                            logging.warning(
+                                "🔄 Health check: needs restart (errors=%d)",
+                                _health["error_count"],
+                            )
+                    elif _task_name == "risk_monitoring":
+                        # ── Risk management monitoring via risk_management module ──
+                        try:
+                            _rm_cb = rm_check_circuit_breaker(
+                                consecutive_losses=_autonomous_state.failed_cycles,
+                                api_errors=consecutive_errors,
+                            )
+                            if _rm_cb.is_tripped:
+                                logging.warning(
+                                    "🛑 Risk monitoring: circuit breaker tripped (%s, severity=%s)",
+                                    _rm_cb.triggers, _rm_cb.severity,
+                                )
+                                for _comp in _components:
+                                    if _comp.name == "risk_engine":
+                                        _comp.is_healthy = False
+                            else:
+                                for _comp in _components:
+                                    if _comp.name == "risk_engine":
+                                        _comp.is_healthy = True
+                                        _comp.consecutive_failures = 0
+                        except Exception as _rm_exc:
+                            logging.debug("Risk monitoring check failed: %s", _rm_exc)
+                    elif _task_name == "portfolio_analysis":
+                        # ── Portfolio management analysis ─────────────────────────
+                        try:
+                            _pa = trader._get_portfolio_analysis()
+                            if _pa.get("portfolio_eval"):
+                                _pe = _pa["portfolio_eval"]
+                                logging.info(
+                                    "📊 Portfolio: %d assets, concentration=%.2f, value=%.2f",
+                                    _pe.num_assets, _pe.concentration_score, _pe.total_value,
+                                )
+                            if _pa.get("diversification"):
+                                _div = _pa["diversification"]
+                                logging.info(
+                                    "📊 Diversification: score=%.2f, effective_assets=%.1f",
+                                    _div.score, _div.effective_assets,
+                                )
+                                for _comp in _components:
+                                    if _comp.name == "portfolio_engine":
+                                        _comp.is_healthy = True
+                                        _comp.consecutive_failures = 0
+                        except Exception as _pa_exc:
+                            logging.debug("Portfolio analysis failed: %s", _pa_exc)
+                    elif _task_name == "ml_regime_check":
+                        # ── ML regime detection for strategy optimization ────────
+                        try:
+                            if snapshot and snapshot.get("candles"):
+                                _candles = snapshot["candles"]
+                                if len(_candles) >= 10:
+                                    _regime = detect_regime(_candles, lookback=min(30, len(_candles)))
+                                    logging.info(
+                                        "🤖 ML regime: %s (confidence=%.2f)",
+                                        _regime.regime, _regime.confidence,
+                                    )
+                                    for _comp in _components:
+                                        if _comp.name == "ml_engine":
+                                            _comp.is_healthy = True
+                                            _comp.consecutive_failures = 0
+                        except Exception as _ml_exc:
+                            logging.debug("ML regime check failed: %s", _ml_exc)
+                    elif _task_name == "cleanup":
+                        trader.cleanup_stale_data()
+                except Exception:
+                    _task_success = False
+                _tasks[_task_idx] = update_task_after_run(
+                    _task, success=_task_success, current_time=_now_ms(),
+                )
+
             # ── Position monitoring ──────────────────────────────────────────
             # When the bot is holding one or more positions (from this run or
             # restored via auto-resume) analyse each held pair first.
@@ -738,6 +943,7 @@ def main() -> None:
             # conditions on shared tracker state.
             _active = list(trader.active_positions.items())
             _still_holding = False
+            _has_pending_order = False  # shorter sleep when orders await fill
 
             # Fetch market snapshots for all held pairs in parallel.
             _held_snapshots: dict = {}
@@ -758,6 +964,124 @@ def main() -> None:
             for held_pair, held_tracker in _active:
                 held_snapshot = _held_snapshots.get(held_pair) or trader.analyze_market(held_pair)
                 held_price = held_snapshot["price"]
+
+                # ── Resume pending (unfilled) buy orders ──────────────────
+                # When a buy was placed but never filled, keep adjusting the
+                # price until it IS filled so no order is left hanging.
+                # NOTE: We also resume when base_position > 0 — this handles
+                # multi-stage buys where stage 1 filled but stage 2 did not.
+                if held_tracker.has_pending_buy:
+                    # ── Re-analysis gate: check market conditions before resume ──
+                    # If market conditions changed significantly (sell signal or
+                    # strongly unfavorable regime), cancel the pending buy to
+                    # avoid entering a losing position blindly.
+                    _resume_decision = held_snapshot.get("decision")
+                    _resume_regime = held_snapshot.get("regime")
+                    _should_cancel_resume = False
+                    _cancel_reason = ""
+                    if _resume_decision is not None and _resume_decision.action == "sell":
+                        _should_cancel_resume = True
+                        _cancel_reason = f"sell signal ({getattr(_resume_decision, 'reason', '?')[:60]})"
+                    elif (
+                        _resume_regime is not None
+                        and getattr(_resume_regime, "regime", "") == "trending_down"
+                        and getattr(_resume_regime, "strength", 0) >= 0.5
+                    ):
+                        _should_cancel_resume = True
+                        _cancel_reason = f"regime trending_down strength={getattr(_resume_regime, 'strength', 0):.2f}"
+
+                    if _should_cancel_resume and held_tracker.base_position <= 0:
+                        logging.info(
+                            "⚠️ %sRESUME CANCELLED%s  %s%s%s  ·  re-analysis: %s",
+                            _BOLD, _RESET,
+                            _BOLD, held_pair, _RESET,
+                            _cancel_reason,
+                        )
+                        held_tracker.cancel_pending_buy()
+                        if hasattr(trader, 'multi_manager') and trader.multi_manager is not None:
+                            trader.multi_manager.return_position_cash(held_pair)
+                        trader._persist_after_trade(held_pair)
+                        consecutive_errors = 0
+                        continue
+
+                    logging.info(
+                        "🔄 %sRESUME%s  %s%s%s  ·  re-attempting pending buy @ Rp %s",
+                        _BOLD, _RESET,
+                        _BOLD, held_pair, _RESET,
+                        f"{held_price:15,.2f}",
+                    )
+                    resume_out = trader.resume_pending_buy(held_snapshot)
+                    if resume_out.get("status") == "resumed":
+                        _entered_position = True
+                        portfolio = trader.portfolio_snapshot(held_pair, held_price)
+                        _log_portfolio(
+                            portfolio,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                        _notify(
+                            config,
+                            f"🔄 PENDING BUY FILLED {held_pair} @ Rp {held_price:,.0f}\n"
+                            f"Amount: {resume_out.get('amount', 0):.8f}",
+                        )
+                    elif resume_out.get("status") in ("cancelled_below_min", "cancelled_zero"):
+                        logging.info(
+                            "❌ Pending buy cancelled for %s: %s",
+                            held_pair, resume_out.get("status"),
+                        )
+                    else:
+                        _still_holding = True
+                        _has_pending_order = True
+                    consecutive_errors = 0
+                    continue  # next held pair
+
+                # ── Resume pending (unfilled) sell orders ─────────────────
+                # When a sell was placed but never filled, keep adjusting the
+                # price until it IS filled so no order is left hanging.
+                if getattr(held_tracker, "has_pending_sell", False):
+                    logging.info(
+                        "🔄 %sRESUME SELL%s  %s%s%s  ·  re-attempting pending sell @ Rp %s",
+                        _BOLD, _RESET,
+                        _BOLD, held_pair, _RESET,
+                        f"{held_price:15,.2f}",
+                    )
+                    resume_sell_out = trader.resume_pending_sell(held_snapshot)
+                    if resume_sell_out.get("status") in ("resumed", "partial"):
+                        portfolio = held_tracker.as_dict(held_price)
+                        _is_partial = resume_sell_out.get("status") == "partial"
+                        logging.info(
+                            "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s%s",
+                            _DIM, _RESET,
+                            _BOLD, resume_sell_out.get("amount", 0), _RESET,
+                            f"{held_price:15,.2f}",
+                            f"  (partial, {resume_sell_out.get('remaining', 0):.8f} remaining)" if _is_partial else "",
+                        )
+                        _log_portfolio(
+                            portfolio,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                        _status_label = "PARTIAL SELL" if _is_partial else "PENDING SELL FILLED"
+                        _notify(
+                            config,
+                            f"🔄 {_status_label} {held_pair} @ Rp {held_price:,.0f}\n"
+                            f"Amount: {resume_sell_out.get('amount', 0):.8f}\n"
+                            f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
+                        )
+                        if _is_partial:
+                            _still_holding = True
+                    elif resume_sell_out.get("status") in ("cancelled_below_min", "cancelled_zero", "no_position"):
+                        logging.info(
+                            "❌ Pending sell cancelled for %s: %s",
+                            held_pair, resume_sell_out.get("status"),
+                        )
+                    else:
+                        _still_holding = True
+                        _has_pending_order = True
+                    consecutive_errors = 0
+                    continue  # next held pair
 
                 if config.trailing_stop_pct > 0:
                     held_tracker.update_trailing_stop(held_price, config.trailing_stop_pct)
@@ -918,6 +1242,19 @@ def main() -> None:
                         exit_reason,
                     )
                     force_outcome = trader.force_sell(held_snapshot)
+
+                    # When force_sell returns pending_sell, the order was not
+                    # filled — keep the position active for resume on next cycle.
+                    if force_outcome.get("status") == "pending_sell":
+                        logging.info(
+                            "🔄 %sPENDING SELL%s  %s%s%s  ·  sell not filled — will retry next cycle",
+                            _BOLD, _RESET,
+                            _BOLD, held_pair, _RESET,
+                        )
+                        _still_holding = True
+                        consecutive_errors = 0
+                        continue
+
                     portfolio = held_tracker.as_dict(held_price)
                     logging.info(
                         "   %s├─%s amount   : %s%.8f%s coin  ·  price Rp %s",
@@ -938,6 +1275,42 @@ def main() -> None:
                         f"Amount: {force_outcome.get('amount', 0):.8f}\n"
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
+
+                    # ── Re-entry analysis after trail/stop sell ──────────────
+                    # When the exit was triggered by a trailing stop or stop
+                    # loss, analyse whether the coin still has upside potential.
+                    # If so, mark a pending buy at a lower target price so the
+                    # bot can re-enter instead of staying flat.
+                    if stop_reason in (
+                        "trailing_stop", "stop_loss", "trailing_tp_triggered",
+                        "momentum_exit", "post_entry_dump",
+                    ):
+                        try:
+                            _reentry = trader.analyze_reentry_opportunity(held_snapshot)
+                            if _reentry and _reentry.get("reentry"):
+                                _tgt = _reentry["target_price"]
+                                logging.info(
+                                    "🔄 %sRE-ENTRY OPPORTUNITY%s  %s%s%s  ·  target Rp %s  regime=%s  imbalance=%.2f",
+                                    _BOLD, _RESET,
+                                    _BOLD, held_pair, _RESET,
+                                    f"{_tgt:,.2f}",
+                                    _reentry.get("regime", "?"),
+                                    _reentry.get("imbalance", 0),
+                                )
+                                _notify(
+                                    config,
+                                    f"🔄 RE-ENTRY OPPORTUNITY {held_pair}\n"
+                                    f"Target: Rp {_tgt:,.2f}\n"
+                                    f"Regime: {_reentry.get('regime', '?')}",
+                                )
+                            else:
+                                logging.info(
+                                    "📊 No re-entry opportunity for %s — staying flat",
+                                    held_pair,
+                                )
+                        except Exception as _re_exc:
+                            logging.debug("Re-entry analysis failed for %s: %s", held_pair, _re_exc)
+
                     consecutive_errors = 0
                     if config.trade_mode == "single" and _entered_position:
                         logging.info("✅ %sSingle-trade cycle complete — stopping.%s", _BOLD, _RESET)
@@ -965,7 +1338,13 @@ def main() -> None:
                 if not config.multi_position_enabled or trader.at_max_positions():
                     if config.run_once:
                         break
-                    time.sleep(config.position_check_interval_seconds)
+                    # Use shorter sleep when orders are pending fill to retry faster
+                    _sleep = (
+                        config.resume_buy_wait_seconds
+                        if _has_pending_order
+                        else config.position_check_interval_seconds
+                    )
+                    time.sleep(_sleep)
                     continue
                 # Multi-position with free slots: scan for additional pairs now.
                 logging.info(
@@ -982,6 +1361,31 @@ def main() -> None:
                 continue
             pair, snapshot = trader.scan_and_choose()
             _log_signal(snapshot)
+            # ── Log ML & strategy signals if available ────────────────────────
+            if snapshot.get("ml_regime"):
+                logging.debug(
+                    "🤖 ML regime: %s (conf=%.2f)",
+                    snapshot["ml_regime"].regime,
+                    snapshot["ml_regime"].confidence,
+                )
+            if snapshot.get("ml_prediction"):
+                logging.debug(
+                    "🤖 ML prediction: %s (agreement=%.2f)",
+                    snapshot["ml_prediction"].predicted_direction,
+                    snapshot["ml_prediction"].model_agreement,
+                )
+            if snapshot.get("adv_trend"):
+                logging.debug(
+                    "📈 Adv trend: %s (strength=%.2f)",
+                    snapshot["adv_trend"].action,
+                    snapshot["adv_trend"].strength,
+                )
+            if snapshot.get("ob_pressure"):
+                logging.debug(
+                    "📊 OB pressure: %s (pressure=%.2f)",
+                    snapshot["ob_pressure"].signal,
+                    snapshot["ob_pressure"].pressure,
+                )
             outcome = trader.maybe_execute(snapshot)
             _log_outcome(outcome)
             # Immediately compute trailing stops after a buy so the portfolio
@@ -1005,6 +1409,23 @@ def main() -> None:
             _out_action = outcome.get("action", "hold")
             _out_status = outcome.get("status", "")
             if _out_action in ("buy", "sell") and _out_status in ("simulated", "placed"):
+                # ── Execution quality monitoring ────────────────────────────
+                try:
+                    _eq = monitor_execution_quality(
+                        order_price=snapshot["price"],
+                        fill_price=outcome.get("price", snapshot["price"]),
+                        quantity=outcome.get("amount", 0),
+                        side=_out_action,
+                        latency_ms=outcome.get("latency_ms", 0),
+                    )
+                    logging.debug(
+                        "📊 Execution quality: slippage=%.4f%%, score=%.2f",
+                        _eq.slippage_pct * 100,
+                        _eq.quality_score,
+                    )
+                except Exception as _eq_exc:
+                    logging.debug("Execution quality monitoring failed: %s", _eq_exc)
+
                 _notify(
                     config,
                     f"{'📈 BUY' if _out_action == 'buy' else '📉 SELL'} "
@@ -1016,6 +1437,24 @@ def main() -> None:
 
             consecutive_errors = 0
             scan_cycles += 1
+
+            # ── Update autonomous state on successful cycle ──────────────────
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles + 1,
+                successful_cycles=_autonomous_state.successful_cycles + 1,
+                failed_cycles=_autonomous_state.failed_cycles,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status="running",
+                error_count=0,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+            # Reset error log on successful cycle
+            _error_log.clear()
 
             # Mark that we've entered a position (for single-trade mode)
             if outcome.get("action") == "buy" and trader._active_tracker(snapshot["pair"]).base_position > 0:
@@ -1030,11 +1469,17 @@ def main() -> None:
                 _stop_pair = snapshot["pair"]
                 if trader._active_tracker(_stop_pair).base_position > 0:
                     force_outcome = trader.force_sell(snapshot)
-                    logging.info(
-                        "   📤 Force-sold : %s%.8f%s coin  ·  Rp %s",
-                        _BOLD, force_outcome.get("amount", 0), _RESET,
-                        f"{force_outcome.get('price', 0):15,.2f}",
-                    )
+                    if force_outcome.get("status") == "pending_sell":
+                        logging.info(
+                            "🔄 %sPENDING SELL%s  %s  — sell not filled, will retry next cycle",
+                            _BOLD, _RESET, _stop_pair,
+                        )
+                    else:
+                        logging.info(
+                            "   📤 Force-sold : %s%.8f%s coin  ·  Rp %s",
+                            _BOLD, force_outcome.get("amount", 0), _RESET,
+                            f"{force_outcome.get('price', 0):15,.2f}",
+                        )
                 # Re-compute portfolio after any liquidation
                 portfolio = trader._active_tracker(_stop_pair).as_dict(snapshot["price"])
                 logging.info(
@@ -1055,14 +1500,50 @@ def main() -> None:
                 time.sleep(config.interval_seconds)
                 continue  # find next opportunity instead of halting
 
-        except (requests.RequestException, RuntimeError, ValueError):
+        except (requests.RequestException, RuntimeError, ValueError) as _err:
             consecutive_errors += 1
-            # Cap the exponent so the computed delay doesn't grow beyond _max_backoff.
-            # Without this cap the multiplication could produce a very large intermediate
-            # value even though min() would ultimately clamp it.
-            # 2^_MAX_BACKOFF_EXPONENT = 1024 s, which is well above the _max_backoff ceiling of 300 s.
-            exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
-            backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
+            # ── Classify error for autonomous recovery ───────────────────────
+            _etype = "connection" if isinstance(_err, requests.RequestException) else "runtime"
+            _error_log.append({"type": _etype, "message": str(_err), "timestamp": _now_ms()})
+            _crash_history.append(CrashEvent(
+                timestamp=_now_ms(),
+                error_type=_etype,
+                error_message=str(_err)[:200],
+                component="trading_loop",
+                recoverable=True,
+            ))
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles + 1,
+                successful_cycles=_autonomous_state.successful_cycles,
+                failed_cycles=_autonomous_state.failed_cycles + 1,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status="degraded",
+                error_count=consecutive_errors,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+            # Mark exchange_api as unhealthy on connection errors
+            if isinstance(_err, requests.RequestException):
+                for _comp in _components:
+                    if _comp.name == "exchange_api":
+                        _comp.consecutive_failures += 1
+                        if _comp.consecutive_failures >= _comp.max_failures:
+                            _comp.is_healthy = False
+            # ── Dynamic backoff via autonomous restart logic ──────────────────
+            _restart_decision = decide_restart(
+                _crash_history,
+                max_restarts=_autonomous_state.max_errors_before_pause,
+                base_delay=float(config.interval_seconds),
+            )
+            if _restart_decision.should_restart:
+                backoff = min(_restart_decision.delay_seconds, _max_backoff)
+            else:
+                exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
+                backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
                 "⚠️  %sError #%d%s  pair=%s  backing off %.0fs …",
                 _BOLD, consecutive_errors, _RESET, pair, backoff,
@@ -1072,14 +1553,44 @@ def main() -> None:
                 break
             time.sleep(backoff)
             continue
-        except Exception:  # noqa: BLE001 — broad catch prevents unexpected crash
+        except Exception as _err:  # noqa: BLE001 — broad catch prevents unexpected crash
             # Catch any unexpected exception type (KeyError, AttributeError, TypeError,
             # IndexError, etc.) that is not explicitly in the tuple above.  Without this
             # handler such errors would propagate all the way out of main() and crash the
             # bot process entirely instead of retrying with back-off.
             consecutive_errors += 1
-            exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
-            backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
+            _error_log.append({"type": "unexpected", "message": str(_err), "timestamp": _now_ms()})
+            _crash_history.append(CrashEvent(
+                timestamp=_now_ms(),
+                error_type=type(_err).__name__,
+                error_message=str(_err)[:200],
+                component="trading_loop",
+                recoverable=True,
+            ))
+            _autonomous_state = AutonomousTradingState(
+                is_running=True,
+                uptime_seconds=time.time() - _start_time,
+                total_cycles=_autonomous_state.total_cycles + 1,
+                successful_cycles=_autonomous_state.successful_cycles,
+                failed_cycles=_autonomous_state.failed_cycles + 1,
+                last_cycle_timestamp=_now_ms(),
+                current_pair=pair,
+                current_strategy=_autonomous_state.current_strategy,
+                health_status="degraded",
+                error_count=consecutive_errors,
+                max_errors_before_pause=_autonomous_state.max_errors_before_pause,
+                pause_duration_seconds=_autonomous_state.pause_duration_seconds,
+            )
+            _restart_decision = decide_restart(
+                _crash_history,
+                max_restarts=_autonomous_state.max_errors_before_pause,
+                base_delay=float(config.interval_seconds),
+            )
+            if _restart_decision.should_restart:
+                backoff = min(_restart_decision.delay_seconds, _max_backoff)
+            else:
+                exponent = min(consecutive_errors - 1, _MAX_BACKOFF_EXPONENT)
+                backoff = min(config.interval_seconds * (2 ** exponent), _max_backoff)
             logging.exception(
                 "⚠️  Unexpected error #%d  pair=%s  backing off %.0fs …",
                 consecutive_errors, pair, backoff,
@@ -1122,15 +1633,37 @@ def main() -> None:
             trader.persistence.backup(_backup_path)
 
         logging.info(_separator())
-        _sleep_secs = trader._effective_interval(snapshot)
+        # ── Dynamic polling interval ─────────────────────────────────────────
+        _vol_snapshot = 0.0
+        if snapshot:
+            _vol_obj = snapshot.get("volatility")
+            if _vol_obj:
+                _vol_snapshot = getattr(_vol_obj, "volatility", 0.0)
+        _has_open = len(trader.active_positions) > 0
+        _polling_config, _polling_adj = adjust_polling_interval(
+            _polling_config,
+            recent_volatility=_vol_snapshot,
+            recent_errors=consecutive_errors,
+            has_open_orders=_has_open,
+        )
+        # Use the shorter of the two adaptive systems (trader's built-in
+        # adaptive interval vs autonomous dynamic polling) so the bot reacts
+        # to the most responsive signal.
+        _sleep_secs = min(
+            trader._effective_interval(snapshot),
+            max(1, _polling_config.current_interval_ms // 1000),
+        )
         if _sleep_secs != config.interval_seconds:
-            logging.debug("⚡ Adaptive interval: sleeping %ds (normal=%ds)", _sleep_secs, config.interval_seconds)
+            logging.debug(
+                "⚡ Adaptive interval: sleeping %ds (normal=%ds, reason=%s)",
+                _sleep_secs, config.interval_seconds, _polling_adj.adjustment_reason,
+            )
         time.sleep(_sleep_secs)
 
 
 if __name__ == "__main__":
     _MAX_RESTARTS = 10
-    _RESTART_BACKOFF = [5, 10, 30, 60, 120]
+    _process_crash_history: list = []
     _restart_count = 0
     while _restart_count <= _MAX_RESTARTS:
         try:
@@ -1140,9 +1673,28 @@ if __name__ == "__main__":
             break
         except Exception as _exc:
             _restart_count += 1
-            _wait = _RESTART_BACKOFF[min(_restart_count - 1, len(_RESTART_BACKOFF) - 1)]
+            _process_crash_history.append(CrashEvent(
+                timestamp=int(time.time() * 1000),
+                error_type=type(_exc).__name__,
+                error_message=str(_exc)[:200],
+                component="main_process",
+                recoverable=True,
+            ))
+            _restart_decision = decide_restart(
+                _process_crash_history,
+                max_restarts=_MAX_RESTARTS,
+                base_delay=5.0,
+                backoff_factor=2.0,
+            )
+            if _restart_decision.should_restart:
+                _wait = _restart_decision.delay_seconds
+            else:
+                logging.getLogger(__name__).error(
+                    "Bot crashed — max restarts reached, stopping.",
+                )
+                break
             logging.getLogger(__name__).error(
-                "Bot crashed (attempt %d): %s — restarting in %ds",
-                _restart_count, _exc, _wait,
+                "Bot crashed (attempt %d): %s — restarting in %.0fs (%s)",
+                _restart_count, _exc, _wait, _restart_decision.reason,
             )
             time.sleep(_wait)

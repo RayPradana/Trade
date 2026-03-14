@@ -27,7 +27,7 @@ from .analysis import (
 )
 from .config import BotConfig
 
-SCALP_SPREAD_THRESHOLD = 0.0015
+SCALP_SPREAD_THRESHOLD = 0.003
 ORDERBOOK_SPREAD_BONUS = 0.002
 ORDERBOOK_IMBALANCE_WEIGHT = 50
 VOLATILITY_PENALTY_CAP = 0.8
@@ -172,20 +172,22 @@ def score_strategies(
         "swing_trading": 0.0,
         "position_trading": 0.0,
     }
-    # Scalping: tight spread, strong imbalance, low volatility
+    # Scalping: tight spread, strong imbalance, low-to-moderate volatility
     if orderbook.spread_pct < SCALP_SPREAD_THRESHOLD:
-        scores["scalping"] += 0.5
-    if abs(orderbook.imbalance) > 0.25:
+        scores["scalping"] += 0.4
+    if orderbook.spread_pct < SCALP_SPREAD_THRESHOLD * 0.5:
+        scores["scalping"] += 0.1  # extra bonus for very tight spreads
+    if abs(orderbook.imbalance) > 0.20:
         scores["scalping"] += 0.3
-    if vol.volatility < 0.01:
+    if vol.volatility < 0.015:
         scores["scalping"] += 0.2
 
     # Day trading: trending with moderate volatility
     if trend.direction != "flat":
         scores["day_trading"] += 0.4
-    if 0.01 <= vol.volatility <= 0.03:
+    if 0.005 <= vol.volatility <= 0.03:
         scores["day_trading"] += 0.4
-    if trend.strength > 0.01:
+    if trend.strength > 0.008:
         scores["day_trading"] += 0.2
 
     # Swing trading: strong trend with higher volatility
@@ -203,8 +205,8 @@ def score_strategies(
     if regime is not None:
         if regime.regime == "volatile":
             scores["position_trading"] += 0.4
-            scores["scalping"] *= 0.3
-            scores["day_trading"] *= 0.5
+            scores["scalping"] *= 0.5  # Scalping penalized in volatile markets
+            scores["day_trading"] *= 0.6
         elif regime.regime == "ranging":
             scores["scalping"] += 0.3
             scores["position_trading"] *= 0.7
@@ -229,11 +231,11 @@ def select_strategy(
             return "scalping"
     if (
         orderbook.spread_pct < SCALP_SPREAD_THRESHOLD
-        and abs(orderbook.imbalance) > 0.25
-        and vol.volatility < 0.01
+        and abs(orderbook.imbalance) > 0.20
+        and vol.volatility < 0.015
     ):
         return "scalping"
-    if trend.direction != "flat" and vol.volatility >= 0.01 and vol.volatility <= 0.03:
+    if trend.direction != "flat" and vol.volatility >= 0.005 and vol.volatility <= 0.03:
         return "day_trading"
     if trend.direction != "flat" and trend.strength > 0.01 and vol.volatility > 0.015:
         return "swing_trading"
@@ -283,16 +285,21 @@ def confidence_position_pct(confidence: float, config: BotConfig) -> float:
     """Return the position size as a fraction of capital for the given confidence level.
 
     Used when ``config.confidence_position_sizing_enabled`` is True.
-    Returns 0.0 when confidence is below ``config.confidence_tier_skip`` (skip trade).
+    Returns 0.0 when confidence is below the effective skip threshold.
+
+    The effective skip threshold is ``min(confidence_tier_skip, min_confidence)``
+    so that signals which already passed the bot's confidence gate are never
+    silently zeroed out by a higher tier-skip value.
 
     Tier mapping (defaults):
-      < 0.40  → 0.0   (skip)
-      0.40–0.50 → 10 %
+      < effective_skip → 0.0   (skip)
+      effective_skip–0.50 → 10 %  (low tier)
       0.50–0.65 → 15 %
       0.65–0.80 → 20 %
       > 0.80  → 25 %
     """
-    if confidence < config.confidence_tier_skip:
+    effective_skip = min(config.confidence_tier_skip, config.min_confidence)
+    if confidence < effective_skip:
         return 0.0
     if confidence < config.confidence_tier_low:
         return config.confidence_tier_low_pct
@@ -312,6 +319,7 @@ def _position_size(
     vol: VolatilityStats,
     effective_capital: Optional[float] = None,
     ob_imbalance: float = 0.0,
+    effective_min_confidence: Optional[float] = None,
 ) -> float:
     """Dynamic position sizing: base size = risk_per_trade * capital / price.
 
@@ -332,34 +340,68 @@ def _position_size(
     :param ob_imbalance: Current order-book imbalance
         ``(bid_vol − ask_vol) / (bid_vol + ask_vol)``, range ``−1 … +1``.
         Used for the OB imbalance size boost when the feature is enabled.
+    :param effective_min_confidence: When provided, overrides
+        ``config.min_confidence`` for the fallback sizing gate.  Pass the
+        value from ``_min_confidence_threshold()`` so that adaptive
+        thresholds are honoured consistently.
     """
     if current_price <= 0:
         return 0.0
     # Use compounding capital when available, otherwise fall back to initial_capital
     capital = effective_capital if (effective_capital is not None and effective_capital > 0) else config.initial_capital
 
+    # Resolve the confidence gate: prefer the caller-supplied adaptive value
+    # over the static config default so that signals which already passed the
+    # adaptive gate in maybe_execute are not silently zeroed out here.
+    _min_conf = effective_min_confidence if effective_min_confidence is not None else config.min_confidence
+
     # ── Confidence-tier-based sizing ─────────────────────────────────────────
     if config.confidence_position_sizing_enabled:
         pct = confidence_position_pct(confidence, config)
         if pct <= 0.0:
-            return 0.0
-        size = (pct * capital) / current_price
+            # Fallback: when primary confidence sizing yields 0 but the signal
+            # already passed the bot's confidence gate (confidence ≥ min_confidence)
+            # and capital can cover the exchange minimum, use the minimum order
+            # value so that valid signals are not silently discarded.
+            min_order_idr = getattr(config, "min_order_idr", 0.0)
+            if (
+                confidence >= _min_conf
+                and min_order_idr > 0
+                and capital >= min_order_idr * 1.003
+            ):
+                size = min_order_idr / current_price * (1 + 1e-9)
+            else:
+                return 0.0
+        else:
+            size = (pct * capital) / current_price
     else:
         # ── Original risk/stop-distance-based sizing ──────────────────────────
         if stop_loss is None or risk_per_unit < MIN_STOP_DISTANCE:
-            return 0.0
-        # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
-        risk = adaptive_risk_per_trade(capital, config)
-        # Compute how many units of the base asset represent one "risk unit" of capital
-        dynamic_base = (risk * capital) / current_price
-        desired_risk_value = capital * risk
-        base_order_risk = risk_per_unit * dynamic_base
-        dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
-        scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
-        confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
-        volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
-        size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
-        size = max(size, dynamic_base * 0.25)
+            # Fallback: when stop-loss data is unavailable but the signal
+            # passed the confidence gate and capital can cover the exchange
+            # minimum, use the minimum order value.
+            min_order_idr = getattr(config, "min_order_idr", 0.0)
+            if (
+                confidence >= _min_conf
+                and min_order_idr > 0
+                and capital >= min_order_idr * 1.003
+            ):
+                size = min_order_idr / current_price * (1 + 1e-9)
+            else:
+                return 0.0
+        else:
+            # Adaptive risk: pick tier-based risk_per_trade when adaptive sizing is on
+            risk = adaptive_risk_per_trade(capital, config)
+            # Compute how many units of the base asset represent one "risk unit" of capital
+            dynamic_base = (risk * capital) / current_price
+            desired_risk_value = capital * risk
+            base_order_risk = risk_per_unit * dynamic_base
+            dynamic_min_stop = max(MIN_STOP_DISTANCE, current_price * 1e-6)
+            scale = min(2.0, desired_risk_value / max(dynamic_min_stop, base_order_risk))
+            confidence_multiplier = max(0.5, min(1.5, confidence + 0.5))
+            volatility_multiplier = max(0.4, 1 - min(vol.volatility, 0.05) * 5)
+            size = dynamic_base * scale * confidence_multiplier * volatility_multiplier
+            size = max(size, dynamic_base * 0.25)
 
     # ── Orderbook imbalance size boost ───────────────────────────────────────
     if (
@@ -367,6 +409,23 @@ def _position_size(
         and ob_imbalance >= config.ob_imbalance_boost_threshold
     ):
         size *= config.ob_imbalance_size_multiplier
+
+    # ── Enforce minimum order value ──────────────────────────────────────────
+    # Ensure the computed size meets the exchange minimum order value so that
+    # orders are not skipped downstream.  When the available capital can cover
+    # the minimum, bump size up; otherwise leave it as-is (the downstream
+    # guard will skip gracefully).
+    min_order_idr = getattr(config, "min_order_idr", 0.0)
+    if min_order_idr > 0 and current_price > 0:
+        order_value = size * current_price
+        if 0 < order_value < min_order_idr:
+            # Tiny 1e-9 buffer prevents floating-point rounding from landing
+            # exactly at the threshold where (size * price) < min_order_idr.
+            min_size = min_order_idr / current_price * (1 + 1e-9)
+            # Only bump up if the capital can afford it
+            max_size_from_capital = capital / current_price
+            if min_size <= max_size_from_capital:
+                size = min_size
 
     return size
 

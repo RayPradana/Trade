@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -14,8 +15,11 @@ except ImportError:  # pragma: no cover - fallback path
 logger = logging.getLogger(__name__)
 
 # Reconnection back-off constants
-_WS_BACKOFF_INITIAL = 2.0   # seconds before first retry
+_WS_BACKOFF_INITIAL = 5.0   # seconds before first retry
 _WS_BACKOFF_MAX = 60.0      # ceiling for exponential back-off
+_WS_STABLE_SECONDS = 60.0   # connection must stay up this long before backoff resets
+_WS_PING_INTERVAL = 25      # seconds between client pings
+_WS_PING_TIMEOUT = 20       # seconds to wait for pong before timeout
 
 # Official Indodax market-data WebSocket endpoint and public static token.
 # These are published in the official API docs:
@@ -272,10 +276,11 @@ class RealtimeFeed:
 
         while not self._stop.is_set():
             _authenticated = threading.Event()
+            _connect_time: float = 0.0
 
             def _on_open(ws: Any) -> None:
-                nonlocal backoff
-                backoff = _WS_BACKOFF_INITIAL
+                nonlocal _connect_time
+                _connect_time = time.monotonic()
                 logger.info("RealtimeFeed WS connected for %s", self.pair)
                 try:
                     if self.subscribe_message:
@@ -354,23 +359,42 @@ class RealtimeFeed:
             # 403 Forbidden when an Origin header is present.
             wst = threading.Thread(
                 target=ws_app.run_forever,
-                kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
+                kwargs={
+                    "ping_interval": _WS_PING_INTERVAL,
+                    "ping_timeout": _WS_PING_TIMEOUT,
+                    "suppress_origin": True,
+                },
                 daemon=True,
             )
             wst.start()
-            wst.join(timeout=30.0)
+            # Block until the WS thread finishes (connection closed) or
+            # stop is requested.  The old 30-second timeout could expire
+            # while the connection was still healthy, causing the loop to
+            # open *another* connection and accumulate zombie sockets.
+            while wst.is_alive() and not self._stop.is_set():
+                wst.join(timeout=5.0)
+            # If stop was requested while WS is still connected, force-close.
             if wst.is_alive():
-                logger.debug("RealtimeFeed WS thread did not finish within timeout")
+                try:
+                    ws_app.close()
+                except Exception:
+                    pass
+                wst.join(timeout=5.0)
 
             if self._stop.is_set():
                 break
 
+            # Only reset backoff if the connection was stable long enough.
+            if _connect_time > 0 and (time.monotonic() - _connect_time) >= _WS_STABLE_SECONDS:
+                backoff = _WS_BACKOFF_INITIAL
+            # Add jitter (0–25 %) to avoid thundering-herd reconnections.
+            jittered = backoff * (1 + random.random() * 0.25)
             logger.warning(
                 "RealtimeFeed WS disconnected for %s; reconnecting in %.0fs …",
                 self.pair,
-                backoff,
+                jittered,
             )
-            self._stop.wait(backoff)
+            self._stop.wait(jittered)
             backoff = min(backoff * 2, _WS_BACKOFF_MAX)
 
 
@@ -695,10 +719,11 @@ class MultiPairFeed:
 
         while not self._stop.is_set():
             _authenticated = threading.Event()
+            _connect_time: float = 0.0
 
             def _on_open(ws: Any) -> None:
-                nonlocal backoff
-                backoff = _WS_BACKOFF_INITIAL
+                nonlocal _connect_time
+                _connect_time = time.monotonic()
                 logger.info("MultiPairFeed WS connected to %s", self._websocket_url)
                 with self._ws_active_lock:
                     self._ws_active = ws
@@ -782,21 +807,40 @@ class MultiPairFeed:
             # returns 403 Forbidden due to Origin header mismatch.
             wst = threading.Thread(
                 target=ws_app.run_forever,
-                kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
+                kwargs={
+                    "ping_interval": _WS_PING_INTERVAL,
+                    "ping_timeout": _WS_PING_TIMEOUT,
+                    "suppress_origin": True,
+                },
                 daemon=True,
             )
             wst.start()
-            wst.join(timeout=30.0)
+            # Block until the WS thread finishes (connection closed) or
+            # stop is requested.  The old 30-second timeout could expire
+            # while the connection was still healthy, causing the loop to
+            # open *another* connection and accumulate zombie sockets.
+            while wst.is_alive() and not self._stop.is_set():
+                wst.join(timeout=5.0)
+            # If stop was requested while WS is still connected, force-close.
             if wst.is_alive():
-                logger.debug("MultiPairFeed WS thread did not finish within timeout")
+                try:
+                    ws_app.close()
+                except Exception:
+                    pass
+                wst.join(timeout=5.0)
 
             if self._stop.is_set():
                 break
 
+            # Only reset backoff if the connection was stable long enough.
+            if _connect_time > 0 and (time.monotonic() - _connect_time) >= _WS_STABLE_SECONDS:
+                backoff = _WS_BACKOFF_INITIAL
+            # Add jitter (0–25 %) to avoid thundering-herd reconnections.
+            jittered = backoff * (1 + random.random() * 0.25)
             logger.warning(
-                "MultiPairFeed WS disconnected; reconnecting in %.0fs …", backoff
+                "MultiPairFeed WS disconnected; reconnecting in %.0fs …", jittered
             )
-            self._stop.wait(backoff)
+            self._stop.wait(jittered)
             backoff = min(backoff * 2, _WS_BACKOFF_MAX)
 
     def _apply_summary_rows(self, rows: List[Any]) -> None:
@@ -1003,19 +1047,25 @@ class PrivateFeed:
                 channel = token_info["channel"]
             except Exception as exc:
                 logger.warning("PrivateFeed: could not obtain WS token: %s", exc)
-                self._stop.wait(backoff)
+                jittered = backoff * (1 + random.random() * 0.25)
+                self._stop.wait(jittered)
                 backoff = min(backoff * 2, _WS_BACKOFF_MAX)
                 continue
 
             backoff = _WS_BACKOFF_INITIAL  # reset on successful token fetch
+            _conn_start = time.monotonic()
             self._connect_once(conn_token, channel)
 
             if self._stop.is_set():
                 break
+            # Only reset backoff if the connection was stable long enough.
+            if (time.monotonic() - _conn_start) >= _WS_STABLE_SECONDS:
+                backoff = _WS_BACKOFF_INITIAL
+            jittered = backoff * (1 + random.random() * 0.25)
             logger.warning(
-                "PrivateFeed: disconnected; reconnecting in %.0fs …", backoff
+                "PrivateFeed: disconnected; reconnecting in %.0fs …", jittered
             )
-            self._stop.wait(backoff)
+            self._stop.wait(jittered)
             backoff = min(backoff * 2, _WS_BACKOFF_MAX)
 
     def _connect_once(self, conn_token: str, channel: str) -> None:
@@ -1084,10 +1134,20 @@ class PrivateFeed:
         )
         wst = threading.Thread(
             target=ws_app.run_forever,
-            kwargs={"ping_interval": 20, "ping_timeout": 10, "suppress_origin": True},
+            kwargs={"ping_interval": _WS_PING_INTERVAL, "ping_timeout": _WS_PING_TIMEOUT, "suppress_origin": True},
             daemon=True,
         )
         wst.start()
-        wst.join(timeout=30.0)
+        # Block until the WS thread finishes (connection closed) or
+        # stop is requested.  The old 30-second timeout could expire
+        # while the connection was still healthy, causing the loop to
+        # open *another* connection and accumulate zombie sockets.
+        while wst.is_alive() and not self._stop.is_set():
+            wst.join(timeout=5.0)
+        # If stop was requested while WS is still connected, force-close.
         if wst.is_alive():
-            logger.debug("PrivateFeed: WS thread did not finish within timeout")
+            try:
+                ws_app.close()
+            except Exception:
+                pass
+            wst.join(timeout=5.0)

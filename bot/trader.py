@@ -16,20 +16,37 @@ from .analysis import (
     candles_from_ohlc,
     derive_indicators,
     detect_flash_dump,
+    detect_liquidity_sweep,
+    detect_liquidity_trap,
+    detect_liquidity_vacuum,
+    detect_micro_trend,
+    detect_orderbook_absorption,
     detect_rug_pull_risk,
+    detect_smart_money_footprint,
     detect_spread_anomaly,
+    detect_spread_expansion,
     detect_spoofing,
+    detect_volume_acceleration,
     detect_whale_activity,
     detect_market_regime,
+    MarketRegime,
     interval_to_ohlc_tf,
     multi_timeframe_confirm,
     smart_entry_filter,
+    LiquiditySweep,
+    LiquidityTrap,
+    LiquidityVacuum,
+    MicroTrend,
     MomentumIndicators,
     MultiTimeframeResult,
+    OrderbookAbsorption,
     RugPullRisk,
     SmartEntryResult,
+    SmartMoneyFootprint,
+    SpreadExpansion,
     SpoofingResult,
     TradeFlowResult,
+    VolumeAcceleration,
     WhaleActivity,
     support_resistance,
 )
@@ -42,6 +59,56 @@ from .indodax_client import IndodaxClient
 from .strategies import StrategyDecision, adaptive_max_positions, adaptive_risk_per_trade, make_trade_decision
 from .tracking import MultiPositionManager, PortfolioTracker
 from .journal import TradeJournal
+from .market_data import MarketDataFeed
+from .scanning import (
+    scan_multiple_markets,
+    scan_momentum,
+    scan_trends,
+    filter_by_volume,
+    filter_by_volatility,
+)
+from .execution import (
+    analyze_slippage,
+    plan_market_order,
+    monitor_execution_quality,
+    plan_order_retry,
+)
+from .risk_management import (
+    check_circuit_breaker as rm_check_circuit_breaker,
+    check_daily_loss_limit,
+    check_max_drawdown,
+    adjust_risk_dynamically,
+    check_anomaly_shutdown,
+    calculate_position_size,
+    size_by_volatility,
+)
+from .portfolio_management import (
+    evaluate_multi_asset_portfolio,
+    plan_rebalance,
+    assess_diversification,
+)
+from .ml_models import (
+    detect_regime,
+    predict_market,
+    recognize_patterns_ai,
+    detect_anomalies as ml_detect_anomalies,
+    engineer_features,
+)
+from .advanced_strategies import (
+    trend_following_signal,
+    mean_reversion_signal,
+    momentum_signal as adv_momentum_signal,
+    breakout_signal,
+    hybrid_signal,
+)
+from .orderbook import (
+    analyze_spread as ob_analyze_spread,
+    detect_imbalance as ob_detect_imbalance,
+    detect_whale_orders as ob_detect_whale_orders,
+    predict_slippage as ob_predict_slippage,
+    analyze_pressure as ob_analyze_pressure,
+    detect_spoofing_enhanced,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +206,8 @@ class Trader:
         self._volatility_cooldown_until: float = 0.0
         self.journal: Optional[TradeJournal] = None
         self._spread_history: Dict[str, List[float]] = {}
+        # Previous depth snapshot per pair for orderbook absorption detection
+        self._prev_depth: Dict[str, Dict[str, list]] = {}
         # Per-pair cooldown: maps pair → unix timestamp of last executed trade
         self._pair_last_trade: Dict[str, float] = {}
         # ── Per-pair minimum order cache ─────────────────────────────────────
@@ -151,6 +220,11 @@ class Trader:
         # saturate the REST rate limit.  Entries are reused until
         # config.scan_candle_cache_seconds have elapsed.
         self._candle_cache: Dict[str, Tuple[float, List[Any]]] = {}
+
+        # ── Market Data Feed ──────────────────────────────────────────────────
+        self.market_data_feed: Optional[MarketDataFeed] = None
+        if config.market_data_enabled:
+            self.market_data_feed = MarketDataFeed.from_config(config)
 
     def _min_confidence_threshold(self, snapshot: Dict[str, Any]) -> float:
         """Return the effective minimum confidence threshold for a snapshot.
@@ -174,6 +248,80 @@ class Trader:
             )
             base_min = min(base_min, adaptive_min)
         return base_min
+
+    def _entry_quality_score(self, snapshot: Dict[str, Any]) -> float:
+        """Compute a 0–1 entry quality score from available market signals.
+
+        Aggregates regime, trend, orderbook pressure, volume acceleration, and
+        micro-trend signals into a single score.  Higher values indicate a more
+        favourable entry environment.  Called by :meth:`maybe_execute` to skip
+        buys when conditions are marginal.
+        """
+        score = 0.0
+        weights = 0.0
+
+        # 1. Market regime (weight 0.30)
+        regime = snapshot.get("regime")
+        if regime is not None:
+            weights += 0.30
+            if regime.regime == "trending_up":
+                score += 0.30 * min(1.0, 0.5 + regime.strength)
+            elif regime.regime == "ranging":
+                score += 0.30 * 0.4
+            elif regime.regime == "volatile":
+                score += 0.30 * max(0.0, 0.3 - regime.strength * 0.3)
+            # trending_down → 0
+
+        # 2. Trend direction + strength (weight 0.25)
+        trend = snapshot.get("trend")
+        if trend is not None:
+            weights += 0.25
+            direction = getattr(trend, "direction", "flat")
+            strength = getattr(trend, "strength", 0.0)
+            if direction == "up":
+                score += 0.25 * min(1.0, 0.5 + strength)
+            elif direction == "flat":
+                score += 0.25 * 0.3
+            # down → 0
+
+        # 3. Orderbook pressure (weight 0.20)
+        ob_pressure = snapshot.get("ob_pressure")
+        if ob_pressure is not None:
+            weights += 0.20
+            signal = getattr(ob_pressure, "signal", "neutral")
+            pressure = getattr(ob_pressure, "pressure", 0.0)
+            if signal == "buy":
+                score += 0.20 * min(1.0, 0.5 + pressure)
+            elif signal == "neutral":
+                score += 0.20 * 0.3
+            # sell → 0
+
+        # 4. Volume acceleration (weight 0.15)
+        vol_accel = snapshot.get("volume_accel")
+        if vol_accel is not None:
+            weights += 0.15
+            if getattr(vol_accel, "detected", False):
+                ratio = getattr(vol_accel, "acceleration_ratio", 1.0)
+                score += 0.15 * min(1.0, ratio / 3.0)
+            else:
+                score += 0.15 * 0.2  # baseline for no acceleration
+
+        # 5. Micro trend (weight 0.10)
+        micro = snapshot.get("micro_trend")
+        if micro is not None:
+            weights += 0.10
+            m_dir = getattr(micro, "direction", "flat")
+            m_str = getattr(micro, "strength", 0.0)
+            if m_dir == "up":
+                score += 0.10 * min(1.0, 0.5 + m_str * 10)
+            elif m_dir == "flat":
+                score += 0.10 * 0.2
+            # down → 0
+
+        # Normalise when only a subset of signals are available
+        if weights > 0:
+            return score / weights
+        return 0.5  # no data → neutral
 
     # ── Multi-position helpers ─────────────────────────────────────────────
 
@@ -250,7 +398,11 @@ class Trader:
         """
         if self.multi_manager is not None:
             return self.multi_manager.active_positions
-        if self.tracker.base_position > 0 or getattr(self.tracker, "has_pending_buy", False):
+        if (
+            self.tracker.base_position > 0
+            or getattr(self.tracker, "has_pending_buy", False)
+            or getattr(self.tracker, "has_pending_sell", False)
+        ):
             return {self.config.pair: self.tracker}
         return {}
 
@@ -263,7 +415,11 @@ class Trader:
         """
         if self.multi_manager is not None:
             return not self.multi_manager.can_open_position()
-        return self.tracker.base_position > 0 or getattr(self.tracker, "has_pending_buy", False)
+        return (
+            self.tracker.base_position > 0
+            or getattr(self.tracker, "has_pending_buy", False)
+            or getattr(self.tracker, "has_pending_sell", False)
+        )
 
     def portfolio_snapshot(self, pair: str, price: float) -> Dict[str, object]:
         """Return a portfolio dict suitable for logging and display.
@@ -486,6 +642,11 @@ class Trader:
     def set_journal(self, journal: TradeJournal) -> None:
         self.journal = journal
 
+    # Indodax charges a taker fee (up to 0.3%).  Reserve a small buffer
+    # so that the pre-order balance check does not pass amounts that the
+    # exchange will reject with "Insufficient balance".
+    _FEE_BUFFER = 1.003
+
     def _validate_balance(self, pair: str, action: str, amount: float, price: float) -> bool:
         if not self.config.balance_check_enabled:
             return True
@@ -493,7 +654,7 @@ class Trader:
             info = self.client.get_account_info()
             balance_dict = (info.get("return") or {}).get("balance") or {}
             if action == "buy":
-                idr_needed = amount * price
+                idr_needed = amount * price * self._FEE_BUFFER
                 available_idr = float(balance_dict.get("idr") or "0")
                 if available_idr < idr_needed:
                     logger.warning(
@@ -636,6 +797,53 @@ class Trader:
                 self._clear_state()
             else:
                 self._save_state(pair)
+
+    def cleanup_stale_data(self) -> None:
+        """Remove stale entries from per-pair caches to prevent memory leaks.
+
+        Called periodically by the autonomous task scheduler to prune:
+        - Price history entries for pairs no longer in the watchlist
+        - Spread history entries for inactive pairs
+        - Previous depth snapshots for inactive pairs
+        - Expired candle cache entries
+        """
+        active_pairs = set()
+        if self._all_pairs:
+            active_pairs.update(self._all_pairs)
+        # Always keep pairs with open positions
+        active_pairs.update(self.active_positions.keys())
+        active_pairs.add(self.config.pair)
+
+        # Prune price history for pairs no longer in watchlist
+        stale_price = [p for p in self._price_history if p not in active_pairs]
+        for p in stale_price:
+            del self._price_history[p]
+
+        # Prune spread history for inactive pairs
+        stale_spread = [p for p in self._spread_history if p not in active_pairs]
+        for p in stale_spread:
+            del self._spread_history[p]
+
+        # Prune previous depth snapshots
+        stale_depth = [p for p in self._prev_depth if p not in active_pairs]
+        for p in stale_depth:
+            del self._prev_depth[p]
+
+        # Prune expired candle cache entries (older than 2× the configured TTL)
+        now = time.time()
+        cache_ttl = getattr(self.config, "scan_candle_cache_seconds", 120)
+        stale_candles = [
+            p for p, (ts, _) in self._candle_cache.items()
+            if now - ts > cache_ttl * 2
+        ]
+        for p in stale_candles:
+            del self._candle_cache[p]
+
+        if stale_price or stale_spread or stale_depth or stale_candles:
+            logger.debug(
+                "Cleanup: removed price=%d spread=%d depth=%d candle=%d stale entries",
+                len(stale_price), len(stale_spread), len(stale_depth), len(stale_candles),
+            )
 
     def _extract_price(self, ticker: Dict[str, Any]) -> float:
         if "ticker" in ticker:
@@ -785,6 +993,346 @@ class Trader:
             spread_bonus = max(0.0, 0.001 - orderbook.spread_pct) * 50
             score += spread_bonus
         return max(0.0, min(1.5, score))
+
+    def _enhanced_score_snapshot(self, snapshot: Dict[str, Any]) -> float:
+        """Enhanced scoring using ML models and advanced strategies.
+
+        Augments the base score from ``_score_snapshot`` with signals from the
+        ML prediction engine, advanced strategy module, and enhanced orderbook
+        analysis.  The extra signals contribute up to ±0.15 to the base score
+        so they **refine** pair selection without dominating it.
+        """
+        score = self._score_snapshot(snapshot)
+        candles = snapshot.get("candles", [])
+        depth = snapshot.get("raw_depth")
+
+        # ── ML regime detection ──────────────────────────────────────────────
+        if candles and len(candles) >= 10:
+            try:
+                regime = detect_regime(candles, lookback=min(30, len(candles)))
+                if regime.regime == "trending_up" and regime.confidence > 0.5:
+                    score += 0.05
+                elif regime.regime == "trending_down" and regime.confidence > 0.5:
+                    score -= 0.05
+            except Exception:
+                pass
+
+        # ── ML market prediction ─────────────────────────────────────────────
+        if candles and len(candles) >= 20:
+            try:
+                prediction = predict_market(candles)
+                if prediction.predicted_direction == "up" and prediction.model_agreement > 0.6:
+                    score += 0.05
+                elif prediction.predicted_direction == "down" and prediction.model_agreement > 0.6:
+                    score -= 0.05
+            except Exception:
+                pass
+
+        # ── Advanced strategy hybrid signal ──────────────────────────────────
+        if candles and len(candles) >= 30:
+            try:
+                votes = []
+                tf_signal = trend_following_signal(candles)
+                votes.append({
+                    "strategy": "trend_following",
+                    "action": tf_signal.action,
+                    "confidence": tf_signal.strength,
+                    "weight": 1.0,
+                })
+                mr_signal = mean_reversion_signal(candles)
+                votes.append({
+                    "strategy": "mean_reversion",
+                    "action": mr_signal.action,
+                    "confidence": abs(mr_signal.z_score) / 3.0,
+                    "weight": 0.8,
+                })
+                mom_signal = adv_momentum_signal(candles)
+                votes.append({
+                    "strategy": "momentum",
+                    "action": mom_signal.action,
+                    "confidence": mom_signal.strength,
+                    "weight": 0.9,
+                })
+                hybrid = hybrid_signal(votes)
+                if hybrid.action == "buy" and hybrid.consensus_score > 0.3:
+                    score += 0.05
+                elif hybrid.action == "sell" and hybrid.consensus_score > 0.3:
+                    score -= 0.05
+            except Exception:
+                pass
+
+        # ── Enhanced orderbook analysis ──────────────────────────────────────
+        if depth:
+            try:
+                pressure = ob_analyze_pressure(depth, snapshot.get("raw_trades", []))
+                if pressure.signal == "buy" and pressure.pressure > 0.3:
+                    score += 0.03
+                elif pressure.signal == "sell" and pressure.pressure > 0.3:
+                    score -= 0.03
+            except Exception:
+                pass
+
+        return max(0.0, min(1.5, score))
+
+    def _check_risk_management(self, snapshot: Dict[str, Any], tracker: "PortfolioTracker") -> Optional[Dict[str, Any]]:
+        """Run comprehensive risk management checks before trade execution.
+
+        Returns a skip/block dict when a risk check fails, or ``None`` when
+        all checks pass and trading may proceed.
+        """
+        price = snapshot["price"]
+        decision: StrategyDecision = snapshot["decision"]
+
+        if decision.action != "buy":
+            return None
+
+        # ── Circuit breaker (risk_management module) ─────────────────────────
+        try:
+            daily_loss = tracker.daily_loss_pct(price) * 100
+            equity_history = tracker.equity_history if hasattr(tracker, "equity_history") else []
+            drawdown_pct = 0.0
+            if equity_history and len(equity_history) >= 2:
+                peak = max(equity_history)
+                current = equity_history[-1]
+                drawdown_pct = ((peak - current) / peak * 100) if peak > 0 else 0.0
+
+            cb = rm_check_circuit_breaker(
+                daily_loss_pct=daily_loss,
+                drawdown_pct=drawdown_pct,
+                consecutive_losses=tracker.loss_streak,
+                api_errors=self._consecutive_errors,
+            )
+            if cb.is_tripped:
+                logger.warning(
+                    "🛑 Risk management circuit breaker tripped: %s (severity=%s, cooldown=%.0fs)",
+                    cb.triggers, cb.severity, cb.cooldown_seconds,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"rm_circuit_breaker: {cb.triggers}",
+                    "portfolio": tracker.as_dict(price),
+                }
+        except Exception as exc:
+            logger.debug("Risk management circuit breaker check failed: %s", exc)
+
+        # ── Anomaly detection ────────────────────────────────────────────────
+        candles = snapshot.get("candles", [])
+        if candles and len(candles) >= 10:
+            try:
+                anomaly = check_anomaly_shutdown(
+                    recent_returns=[
+                        (candles[i].close - candles[i - 1].close) / candles[i - 1].close
+                        for i in range(1, len(candles))
+                        if candles[i - 1].close > 0
+                    ],
+                )
+                if anomaly.should_shutdown:
+                    logger.warning(
+                        "🛑 Anomaly detected — blocking trade (score=%.2f, action=%s)",
+                        anomaly.anomaly_score, anomaly.recommended_action,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": f"anomaly_shutdown: score={anomaly.anomaly_score:.2f}",
+                        "portfolio": tracker.as_dict(price),
+                    }
+            except Exception as exc:
+                logger.debug("Anomaly shutdown check failed: %s", exc)
+
+        return None
+
+    def _analyze_orderbook_enhanced(self, depth: Optional[Dict], trades: Optional[list]) -> Dict[str, Any]:
+        """Run enhanced orderbook analysis using the orderbook module.
+
+        Returns a dict of additional insights that can be merged into the
+        market snapshot.
+        """
+        result: Dict[str, Any] = {}
+        if not depth:
+            return result
+
+        try:
+            spread = ob_analyze_spread(depth)
+            result["ob_spread"] = spread
+        except Exception:
+            pass
+
+        try:
+            imbalance = ob_detect_imbalance(depth)
+            result["ob_imbalance"] = imbalance
+        except Exception:
+            pass
+
+        try:
+            whales = ob_detect_whale_orders(depth)
+            result["ob_whales"] = whales
+        except Exception:
+            pass
+
+        try:
+            spoofing = detect_spoofing_enhanced(depth)
+            result["ob_spoofing"] = spoofing
+        except Exception:
+            pass
+
+        if trades:
+            try:
+                pressure = ob_analyze_pressure(depth, trades)
+                result["ob_pressure"] = pressure
+            except Exception:
+                pass
+
+        return result
+
+    def _get_ml_signals(self, candles: list) -> Dict[str, Any]:
+        """Run ML model analysis on candle data.
+
+        Returns a dict of ML signals to be included in the market snapshot.
+        """
+        result: Dict[str, Any] = {}
+        if not candles or len(candles) < 10:
+            return result
+
+        try:
+            regime = detect_regime(candles, lookback=min(30, len(candles)))
+            result["ml_regime"] = regime
+        except Exception:
+            pass
+
+        if len(candles) >= 20:
+            try:
+                prediction = predict_market(candles)
+                result["ml_prediction"] = prediction
+            except Exception:
+                pass
+
+            try:
+                patterns = recognize_patterns_ai(candles)
+                result["ml_patterns"] = patterns
+            except Exception:
+                pass
+
+            try:
+                anomalies = ml_detect_anomalies(candles)
+                result["ml_anomalies"] = anomalies
+            except Exception:
+                pass
+
+            try:
+                features = engineer_features(candles)
+                result["ml_features"] = features
+            except Exception:
+                pass
+
+        return result
+
+    def _get_advanced_strategy_signals(self, candles: list) -> Dict[str, Any]:
+        """Run advanced strategy analysis on candle data.
+
+        Returns a dict of strategy signals for the market snapshot.
+        """
+        result: Dict[str, Any] = {}
+        if not candles or len(candles) < 10:
+            return result
+
+        try:
+            result["adv_trend"] = trend_following_signal(candles)
+        except Exception:
+            pass
+
+        if len(candles) >= 20:
+            try:
+                result["adv_mean_reversion"] = mean_reversion_signal(candles)
+            except Exception:
+                pass
+
+            try:
+                result["adv_momentum"] = adv_momentum_signal(candles)
+            except Exception:
+                pass
+
+            try:
+                result["adv_breakout"] = breakout_signal(candles)
+            except Exception:
+                pass
+
+        return result
+
+    def _check_execution_quality(self, snapshot: Dict[str, Any], side: str, quantity: float) -> Dict[str, Any]:
+        """Analyze execution quality before placing an order.
+
+        Uses the execution module to predict slippage and assess execution risk.
+        Returns analysis results dict.
+        """
+        result: Dict[str, Any] = {}
+        depth = snapshot.get("raw_depth")
+        if not depth:
+            return result
+
+        try:
+            bids = [(float(b[0]), float(b[1])) for b in (depth.get("buy") or [])[:50]]
+            asks = [(float(a[0]), float(a[1])) for a in (depth.get("sell") or [])[:50]]
+            slippage = analyze_slippage(
+                side=side,
+                quantity=quantity,
+                orderbook_bids=bids,
+                orderbook_asks=asks,
+            )
+            result["slippage_analysis"] = slippage
+            if not slippage.is_safe:
+                result["slippage_warning"] = True
+                logger.warning(
+                    "⚠️ Slippage warning: estimated %.3f%% > max %.3f%% (recommended: %s)",
+                    slippage.estimated_slippage_pct * 100,
+                    slippage.max_acceptable_pct * 100,
+                    slippage.recommended_order_type,
+                )
+        except Exception as exc:
+            logger.debug("Slippage analysis failed: %s", exc)
+
+        # ── Orderbook slippage prediction ────────────────────────────────────
+        if depth:
+            try:
+                ob_slip = ob_predict_slippage(depth, quantity, side=side)
+                result["ob_slippage"] = ob_slip
+            except Exception:
+                pass
+
+        return result
+
+    def _get_portfolio_analysis(self) -> Dict[str, Any]:
+        """Run portfolio management analysis on current holdings.
+
+        Returns portfolio analysis results dict.
+        """
+        result: Dict[str, Any] = {}
+        positions = self.active_positions
+        if not positions:
+            return result
+
+        try:
+            holdings = {}
+            for pair, tracker in positions.items():
+                holdings[pair] = tracker.base_position
+            if holdings:
+                portfolio = evaluate_multi_asset_portfolio(holdings)
+                result["portfolio_eval"] = portfolio
+        except Exception:
+            pass
+
+        try:
+            if len(positions) >= 2:
+                weights = {}
+                total_value = sum(t.base_position for t in positions.values())
+                if total_value > 0:
+                    for pair, tracker in positions.items():
+                        weights[pair] = tracker.base_position / total_value
+                    diversification = assess_diversification(weights)
+                    result["diversification"] = diversification
+        except Exception:
+            pass
+
+        return result
 
     def _pair_volume(self, pair: str) -> float:
         """Return the cached 24-h IDR trading volume for *pair*, or 0.0.
@@ -1223,7 +1771,7 @@ class Trader:
         # individual staged tranches don't fall below the exchange minimum
         # order size and cause the entire trade to be skipped.
         min_eq = self.config.staged_entry_min_equity
-        if min_eq > 0 and self.tracker.cash < min_eq:
+        if min_eq > 0 and self.tracker.cash <= min_eq:
             max_steps = 1
 
         if volatility < 0.01 and confidence >= 0.75:
@@ -1254,6 +1802,27 @@ class Trader:
         scale = effective_amount / decision_amount
         return [max(0.0, amt * scale) for amt in staged]
 
+    @staticmethod
+    def _collapse_staged_if_needed(
+        staged: List[float],
+        effective_amount: float,
+        price: float,
+        min_order_idr: float,
+    ) -> List[float]:
+        """Collapse staged entry to a single step when any step falls below
+        the exchange minimum order value.
+
+        This prevents the situation where a borderline-size order is split
+        into multiple stages that each individually fall below the minimum,
+        causing every stage to be skipped even though the *total* order would
+        have been accepted.
+        """
+        if len(staged) <= 1 or price <= 0 or min_order_idr <= 0:
+            return staged
+        if any(s * price < min_order_idr for s in staged if s > 0):
+            return [effective_amount] if effective_amount > 0 else []
+        return staged
+
     def analyze_market(
         self,
         pair: Optional[str] = None,
@@ -1276,6 +1845,15 @@ class Trader:
         # an empty list.  analyze_trade_flow will return a neutral result, and
         # _fetch_candles will use the OHLC cache instead.
         _empty_depth: Dict[str, Any] = {"buy": [], "sell": []}
+
+        def _is_usable_depth(d: Optional[Dict[str, Any]]) -> bool:
+            """Return True when the depth dict has actual orderbook data."""
+            if not d:
+                return False
+            buys = d.get("buy") or []
+            sells = d.get("sell") or []
+            return bool(buys or sells)
+
         # Determine the best available realtime snapshot for this pair:
         # 1. Per-pair position feed (started when a position on this pair is opened)
         # 2. Primary realtime feed (only covers self.config.pair)
@@ -1301,11 +1879,18 @@ class Trader:
                 # Prefer real-time WS orderbook from MultiPairFeed; empty only as
                 # last resort so OB signals are never silently neutral.
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
-                depth = _ws_depth or _rt_snap.get("depth") or _empty_depth
+                depth = (
+                    (_ws_depth if _is_usable_depth(_ws_depth) else None)
+                    or (_rt_snap.get("depth") if _is_usable_depth(_rt_snap.get("depth")) else None)
+                    or _empty_depth
+                )
             else:
                 snap_depth = _rt_snap.get("depth")
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
-                depth = snap_depth or _ws_depth
+                depth = (
+                    (snap_depth if _is_usable_depth(snap_depth) else None)
+                    or (_ws_depth if _is_usable_depth(_ws_depth) else None)
+                )
                 if not depth:
                     try:
                         depth = self.client.get_depth(pair, count=200)
@@ -1329,11 +1914,12 @@ class Trader:
             ticker = prefetched_ticker or _multi_ticker or self.client.get_ticker(pair)
             if skip_depth:
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
-                depth = _ws_depth or _empty_depth
+                depth = (_ws_depth if _is_usable_depth(_ws_depth) else None) or _empty_depth
             else:
                 _ws_depth = self._multi_feed.get_depth(pair) if self._multi_feed else None
+                _usable_ws = _ws_depth if _is_usable_depth(_ws_depth) else None
                 try:
-                    depth = _ws_depth or self.client.get_depth(pair, count=200)
+                    depth = _usable_ws or self.client.get_depth(pair, count=200)
                 except RuntimeError as exc:
                     if "429" in str(exc):
                         logger.warning(
@@ -1527,6 +2113,93 @@ class Trader:
                 pair, trade_flow.buy_ratio, trade_flow.sell_volume,
             )
 
+        # ── Liquidity sweep detection ─────────────────────────────────────────
+        liquidity_sweep: Optional[LiquiditySweep] = None
+        if self.config.liquidity_sweep_enabled and candles:
+            liquidity_sweep = detect_liquidity_sweep(
+                candles,
+                lookback=self.config.liquidity_sweep_lookback,
+                min_sweep_pct=self.config.liquidity_sweep_min_pct,
+                reversal_pct=self.config.liquidity_sweep_reversal_pct,
+            )
+            if liquidity_sweep.detected:
+                logger.debug(
+                    "Liquidity sweep on %s: dir=%s sweep=%.2f%% rev=%.2f%%",
+                    pair, liquidity_sweep.direction,
+                    liquidity_sweep.sweep_pct * 100, liquidity_sweep.reversal_pct * 100,
+                )
+
+        # ── Liquidity trap detection ──────────────────────────────────────────
+        liquidity_trap: Optional[LiquidityTrap] = None
+        if self.config.liquidity_trap_enabled and candles:
+            liquidity_trap = detect_liquidity_trap(
+                candles,
+                lookback=self.config.liquidity_sweep_lookback,
+                breakout_pct=self.config.liquidity_trap_breakout_pct,
+                reversal_pct=self.config.liquidity_trap_reversal_pct,
+            )
+            if liquidity_trap.detected:
+                logger.debug(
+                    "Liquidity trap on %s: dir=%s breakout=%.2f%% rev=%.2f%%",
+                    pair, liquidity_trap.direction,
+                    liquidity_trap.breakout_pct * 100, liquidity_trap.reversal_pct * 100,
+                )
+
+        # ── Liquidity vacuum detection ────────────────────────────────────────
+        liquidity_vacuum: Optional[LiquidityVacuum] = None
+        if self.config.liquidity_vacuum_min_gap_pct > 0 and depth:
+            liquidity_vacuum = detect_liquidity_vacuum(
+                depth,
+                min_gap_pct=self.config.liquidity_vacuum_min_gap_pct,
+                depth_levels=self.config.liquidity_vacuum_depth_levels,
+            )
+            if liquidity_vacuum.detected:
+                logger.debug(
+                    "Liquidity vacuum on %s: gap=%.2f%% at price=%.2f",
+                    pair, liquidity_vacuum.gap_pct * 100, liquidity_vacuum.gap_price,
+                )
+
+        # ── Smart money footprint detection ───────────────────────────────────
+        smart_money: Optional[SmartMoneyFootprint] = None
+        if self.config.smart_money_enabled and candles:
+            smart_money = detect_smart_money_footprint(
+                candles,
+                volume_factor=self.config.smart_money_volume_factor,
+                divergence_lookback=self.config.smart_money_divergence_lookback,
+            )
+            if smart_money.detected:
+                logger.debug(
+                    "Smart money on %s: bias=%s vol_ratio=%.2f",
+                    pair, smart_money.bias, smart_money.volume_ratio,
+                )
+
+        # ── Volume acceleration detection ─────────────────────────────────────
+        volume_accel: Optional[VolumeAcceleration] = None
+        if self.config.volume_accel_enabled and candles:
+            volume_accel = detect_volume_acceleration(
+                candles,
+                window=self.config.volume_accel_window,
+                min_ratio=self.config.volume_accel_min_ratio,
+            )
+            if volume_accel.detected:
+                logger.debug(
+                    "Volume acceleration on %s: ratio=%.2f",
+                    pair, volume_accel.acceleration_ratio,
+                )
+
+        # ── Micro trend detection ─────────────────────────────────────────────
+        micro_trend: Optional[MicroTrend] = None
+        if self.config.micro_trend_enabled and candles:
+            micro_trend = detect_micro_trend(
+                candles,
+                window=self.config.micro_trend_window,
+            )
+            if micro_trend.direction != "flat":
+                logger.debug(
+                    "Micro trend on %s: dir=%s strength=%.4f",
+                    pair, micro_trend.direction, micro_trend.strength,
+                )
+
         grid_plan: Optional[GridPlan] = None
         decision: StrategyDecision
         if self.config.grid_enabled:
@@ -1549,6 +2222,12 @@ class Trader:
                 effective_capital=self.tracker.effective_capital(),
                 smart_entry=smart_entry,
                 trade_flow=trade_flow,
+                liquidity_sweep=liquidity_sweep,
+                liquidity_trap=liquidity_trap,
+                liquidity_vacuum=liquidity_vacuum,
+                smart_money=smart_money,
+                volume_accel=volume_accel,
+                micro_trend=micro_trend,
                 regime=regime,
             )
             # Apply correlated-pair confidence boost when reference trend aligns
@@ -1558,7 +2237,7 @@ class Trader:
                     **{**decision.__dict__, "confidence": round(boosted_conf, 3),
                        "reason": decision.reason + " corr_confirm"}
                 )
-        return {
+        _snapshot_base = {
             "pair": pair,
             "price": price,
             "trend": trend,
@@ -1577,9 +2256,21 @@ class Trader:
             "reference_trend": reference_trend,
             "smart_entry": smart_entry,
             "trade_flow": trade_flow,
+            "liquidity_sweep": liquidity_sweep,
+            "liquidity_trap": liquidity_trap,
+            "liquidity_vacuum": liquidity_vacuum,
+            "smart_money": smart_money,
+            "volume_accel": volume_accel,
+            "micro_trend": micro_trend,
             "volume_24h_idr": self._extract_volume_idr(ticker),
             "trades_24h": trades_24h,
+            "raw_depth": depth,
+            "raw_trades": trades,
         }
+        _snapshot_base.update(self._get_ml_signals(candles))
+        _snapshot_base.update(self._get_advanced_strategy_signals(candles))
+        _snapshot_base.update(self._analyze_orderbook_enhanced(depth, trades))
+        return _snapshot_base
 
     def _check_small_coin_ob_quality(
         self,
@@ -1714,6 +2405,58 @@ class Trader:
                     self.multi_manager.return_position_cash(pair)
         return cancelled
 
+    def _cancel_stale_orders(self, pair: str) -> int:
+        """Cancel open orders older than ``config.stale_order_seconds``.
+
+        Returns the number of cancelled orders.  Skipped when
+        ``stale_order_seconds`` is 0 (disabled), in dry-run mode, or when
+        API credentials are not configured.
+        """
+        if self.config.stale_order_seconds <= 0:
+            return 0
+        if self.config.dry_run or self.config.api_key is None:
+            return 0
+        try:
+            open_resp = self.client.open_orders(pair)
+            orders = (open_resp.get("return") or {}).get("orders") or []
+        except Exception as exc:
+            logger.warning("Unable to fetch open orders for stale check on %s: %s", pair, exc)
+            return 0
+
+        now = time.time()
+        cancelled = 0
+        for order in orders if isinstance(orders, list) else []:
+            submit_time = 0.0
+            for ts_key in ("submit_time", "order_time", "time"):
+                raw = order.get(ts_key)
+                if raw is not None:
+                    try:
+                        submit_time = float(raw)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            if submit_time <= 0:
+                continue
+            age = now - submit_time
+            if age >= self.config.stale_order_seconds:
+                order_id = str(order.get("order_id"))
+                order_type = str(order.get("type", "")).lower()
+                try:
+                    self.client.cancel_order(pair, order_id, order_type)
+                    cancelled += 1
+                    logger.info(
+                        "Cancelled stale %s order %s for %s (age=%.0fs ≥ %.0fs)",
+                        order_type, order_id, pair, age, self.config.stale_order_seconds,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to cancel stale %s order %s for %s: %s",
+                        order_type, order_id, pair, exc,
+                    )
+        if cancelled:
+            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
+        return cancelled
+
     def maybe_execute(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         _pair = snapshot["pair"]
         decision: StrategyDecision = snapshot["decision"]
@@ -1721,6 +2464,10 @@ class Trader:
         # Route to the per-pair tracker in multi-position mode; otherwise use
         # self.tracker (classic single-position behaviour).
         _tracker = self._active_tracker(_pair)
+
+        # ── Stale order cancellation ─────────────────────────────────────────
+        # Cancel open orders that have been sitting unfilled for too long.
+        self._cancel_stale_orders(_pair)
 
         # Circuit breaker
         if self.config.circuit_breaker_max_errors > 0 and time.time() < self._circuit_breaker_until:
@@ -1873,6 +2620,11 @@ class Trader:
             if _tracker.loss_streak >= self.config.max_consecutive_losses:
                 return {"status": "skipped", "reason": "max_consecutive_losses", "portfolio": _tracker.as_dict(price)}
 
+        # ── Enhanced risk management (risk_management module) ────────────────
+        _rm_block = self._check_risk_management(snapshot, _tracker)
+        if _rm_block is not None:
+            return _rm_block
+
         # ── Per-pair trade cooldown ───────────────────────────────────────────
         if self.config.pair_cooldown_seconds > 0 and decision.action == "buy":
             last_trade = self._pair_last_trade.get(_pair, 0.0)
@@ -1959,6 +2711,29 @@ class Trader:
             }
             return outcome
 
+        # ── Entry quality scoring ─────────────────────────────────────────────
+        # Multi-signal quality check that aggregates regime, trend, orderbook
+        # pressure, volume acceleration, and micro-trend into a single 0–1
+        # score.  Buys are skipped when the score is below the configured
+        # threshold, preventing entries in marginal conditions.
+        if self.config.entry_quality_min_score > 0 and decision.action == "buy":
+            eq_score = self._entry_quality_score(snapshot)
+            if eq_score < self.config.entry_quality_min_score:
+                logger.info(
+                    "Entry quality too low on %s: %.3f < %.3f — skipping buy",
+                    snapshot["pair"],
+                    eq_score,
+                    self.config.entry_quality_min_score,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"entry_quality_low score={eq_score:.3f}"
+                        f" < min={self.config.entry_quality_min_score:.3f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
+
         # simple slippage guard using top of book
         depth = self.client.get_depth(snapshot["pair"], count=_EXECUTION_DEPTH_LEVELS)
         bids = depth.get("buy") or []
@@ -1972,17 +2747,55 @@ class Trader:
         except (ValueError, TypeError):
             top_ask = price
         reference_price = top_ask if decision.action == "buy" else top_bid
-        # Make entries slightly more aggressive (within slippage guard) to
-        # improve the likelihood of an immediate fill instead of sitting at the
-        # back of the queue at the same best price.
+        # ── Adaptive Limit Order ──────────────────────────────────────────────
+        # When enabled, the first buy order is placed slightly above best_bid
+        # (passive) instead of at best_ask (aggressive).  This gives a better
+        # fill price in a range-bound market.  If the order is not filled, the
+        # chase algorithm progressively moves the price toward best_ask.
+        # For sell, place slightly below best_ask for a similar passive edge.
         entry_aggr = max(0.0, self.config.entry_aggressiveness_pct)
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
-        if entry_aggr > 0:
+        if self.config.adaptive_order_enabled:
+            if decision.action == "buy" and top_bid > 0:
+                reference_price = min(top_bid * (1 + entry_aggr), allowed_max)
+            elif decision.action == "sell" and top_ask > 0:
+                reference_price = max(top_ask * (1 - entry_aggr), allowed_min)
+        elif entry_aggr > 0:
+            # Aggressive limit order: cross the spread to get an immediate fill.
             if decision.action == "buy" and top_ask > 0:
                 reference_price = min(top_ask * (1 + entry_aggr), allowed_max)
             elif decision.action == "sell" and top_bid > 0:
                 reference_price = max(top_bid * (1 - entry_aggr), allowed_min)
+
+        # ── Liquidity Check ───────────────────────────────────────────────────
+        # Before entering, sum the volume (IDR) in the top orderbook levels.
+        # If total volume is below the configured threshold, skip the trade
+        # because the market is too thin for reliable execution.
+        if self.config.min_orderbook_volume_idr > 0:
+            _bid_vol_idr = sum(
+                float(b[0]) * float(b[1]) for b in bids[:5]
+            ) if bids else 0.0
+            _ask_vol_idr = sum(
+                float(a[0]) * float(a[1]) for a in asks[:5]
+            ) if asks else 0.0
+            _total_vol_idr = _bid_vol_idr + _ask_vol_idr
+            if _total_vol_idr < self.config.min_orderbook_volume_idr:
+                logger.info(
+                    "Orderbook volume too thin on %s: Rp%.0f < min Rp%.0f — skipping %s",
+                    snapshot["pair"],
+                    _total_vol_idr,
+                    self.config.min_orderbook_volume_idr,
+                    decision.action,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"liquidity_too_thin volume=Rp{_total_vol_idr:.0f}"
+                        f" < min=Rp{self.config.min_orderbook_volume_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
 
         # ── Spread filter ─────────────────────────────────────────────────────
         # Skip any trade (buy or sell) when the bid-ask spread is too wide.
@@ -2119,6 +2932,60 @@ class Trader:
                     "portfolio": _tracker.as_dict(price),
                 }
 
+        # ── Global 24-h volume guard (all coins) ─────────────────────────────
+        # Regardless of price, skip buys on pairs with very low daily trading
+        # volume.  "Koin sepi" (dead/illiquid pairs) often show healthy spreads
+        # but fills are unreliable and exits can be impossible.
+        if decision.action == "buy" and self.config.min_volume_idr > 0:
+            _vol_24h = float(snapshot.get("volume_24h_idr") or 0.0)
+            if _vol_24h < self.config.min_volume_idr:
+                logger.info(
+                    "Low 24h volume on %s: Rp%.0f < min Rp%.0f — skipping buy",
+                    snapshot["pair"], _vol_24h, self.config.min_volume_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"low_24h_volume {_vol_24h:.0f}"
+                        f" < min {self.config.min_volume_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Global orderbook quality guard (koin sepi) ────────────────────────
+        # Apply basic orderbook quality checks to ALL coins, not just cheap ones.
+        # Uses the full-depth orderbook (200 levels from analyze_market) rather
+        # than the shallow execution-time depth (5 levels) for accuracy.
+        # Coins with only 1-2 bid levels AND extremely thin bid depth are
+        # unreliable for execution and exits can be impossible.
+        # Gated by small_coin_min_depth_idr to remain configurable.
+        _raw_depth = snapshot.get("raw_depth")
+        if (
+            decision.action == "buy"
+            and top_bid > 0
+            and self.config.small_coin_min_depth_idr > 0
+            and _raw_depth is not None
+        ):
+            _raw_bids = _raw_depth.get("buy") or []
+            _bid_count = len(_raw_bids)
+            if _bid_count < 3:
+                _bid_depth_idr = sum(
+                    float(b[0]) * float(b[1]) for b in _raw_bids
+                ) if _raw_bids else 0.0
+                # Very thin book: fewer than 3 bids AND low depth
+                if _bid_depth_idr < self.config.small_coin_min_depth_idr:
+                    logger.info(
+                        "Koin sepi %s: only %d bid level(s), depth Rp%.0f — skipping buy",
+                        snapshot["pair"], _bid_count, _bid_depth_idr,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            f"koin_sepi {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
+                        ),
+                        "portfolio": _tracker.as_dict(price),
+                    }
+
         # Spread anomaly detection
         if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
             live_spread_pct = (top_ask - top_bid) / top_bid
@@ -2131,6 +2998,93 @@ class Trader:
             anomaly = detect_spread_anomaly(live_spread_pct, recent_spreads, self.config.spread_anomaly_multiplier)
             if anomaly.detected:
                 return {"status": "skipped", "reason": f"spread_anomaly ratio={anomaly.ratio:.2f}x", "portfolio": _tracker.as_dict(price)}
+
+        # ── Spread expansion detection ───────────────────────────────────────
+        if self.config.spread_expansion_enabled and top_bid > 0 and top_ask > 0 and decision.action == "buy":
+            live_spread_pct = (top_ask - top_bid) / top_bid
+            pair_key = snapshot["pair"]
+            if pair_key not in self._spread_history:
+                self._spread_history[pair_key] = []
+            hist = self._spread_history[pair_key][-self.config.spread_expansion_window:]
+            expansion = detect_spread_expansion(
+                live_spread_pct, hist,
+                multiplier=self.config.spread_expansion_multiplier,
+            )
+            if expansion.detected:
+                logger.info(
+                    "Spread expansion on %s: ratio=%.2f× — skipping buy",
+                    pair_key, expansion.expansion_ratio,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"spread_expansion ratio={expansion.expansion_ratio:.2f}x",
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Orderbook absorption detection ───────────────────────────────────
+        if self.config.orderbook_absorption_threshold > 0 and decision.action == "buy":
+            pair_key = snapshot["pair"]
+            current_depth = {"buy": bids, "sell": asks}
+            prev_depth = self._prev_depth.get(pair_key)
+            if prev_depth is not None:
+                absorption = detect_orderbook_absorption(
+                    prev_depth, current_depth,
+                    threshold=self.config.orderbook_absorption_threshold,
+                )
+                if absorption.detected and absorption.side == "bid":
+                    logger.info(
+                        "Orderbook absorption on %s: side=%s ratio=%.2f — skipping buy (bid wall consumed)",
+                        pair_key, absorption.side, absorption.absorption_ratio,
+                    )
+                    self._prev_depth[pair_key] = current_depth
+                    return {
+                        "status": "skipped",
+                        "reason": f"ob_absorption side={absorption.side} ratio={absorption.absorption_ratio:.2f}",
+                        "portfolio": _tracker.as_dict(price),
+                    }
+            self._prev_depth[pair_key] = current_depth
+
+        # ── Liquidity vacuum guard ───────────────────────────────────────────
+        if self.config.liquidity_vacuum_min_gap_pct > 0 and decision.action == "buy":
+            vacuum = snapshot.get("liquidity_vacuum")
+            if vacuum is not None and vacuum.detected:
+                logger.info(
+                    "Liquidity vacuum on %s: gap=%.2f%% — skipping buy",
+                    snapshot["pair"], vacuum.gap_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"liquidity_vacuum gap={vacuum.gap_pct:.2%}",
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Liquidity sweep guard ─────────────────────────────────────────────
+        if self.config.liquidity_sweep_enabled and decision.action == "buy":
+            sweep = snapshot.get("liquidity_sweep")
+            if sweep is not None and sweep.detected and sweep.direction == "up":
+                logger.info(
+                    "Liquidity sweep (up) on %s: sweep=%.2f%% — skipping buy (stop-hunt risk)",
+                    snapshot["pair"], sweep.sweep_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"liquidity_sweep_up sweep={sweep.sweep_pct:.2%}",
+                    "portfolio": _tracker.as_dict(price),
+                }
+
+        # ── Liquidity trap guard ──────────────────────────────────────────────
+        if self.config.liquidity_trap_enabled and decision.action == "buy":
+            trap = snapshot.get("liquidity_trap")
+            if trap is not None and trap.detected and trap.direction == "up":
+                logger.info(
+                    "Liquidity trap (up) on %s: breakout=%.2f%% — skipping buy (false breakout)",
+                    snapshot["pair"], trap.breakout_pct * 100,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"liquidity_trap_up breakout={trap.breakout_pct:.2%}",
+                    "portfolio": _tracker.as_dict(price),
+                }
 
         # ── Sell-wall / orderbook wall guard ─────────────────────────────────
         # Skip buy when aggregate ask-side volume dominates bid-side volume by
@@ -2217,11 +3171,16 @@ class Trader:
             total_depth = self._liquidity_depth_idr(depth, price)
             if total_depth is None:
                 # Depth data unavailable (API error / unexpected format).
-                # Do NOT treat as thin market — skip the filter and proceed.
+                # Treat as thin market — safer to skip than enter blindly.
                 logger.warning(
-                    "Depth data unavailable for %s — skipping liquidity check",
+                    "Depth data unavailable for %s — skipping buy (no liquidity data)",
                     snapshot["pair"],
                 )
+                return {
+                    "status": "skipped",
+                    "reason": "depth_data_unavailable",
+                    "portfolio": _tracker.as_dict(price),
+                }
             elif total_depth < self.config.min_liquidity_depth_idr:
                 logger.info(
                     "Thin market on %s: depth Rp%.0f < min Rp%.0f — skipping buy",
@@ -2256,11 +3215,46 @@ class Trader:
             # In multi-position mode the tracker for a new pair is a zero-cash
             # placeholder; use the multi_manager's prospective allocation instead.
             if self.multi_manager is not None and not self.multi_manager.has_position(_pair):
-                available_cash = self.multi_manager.capital_per_new_position()
+                available_cash = self.multi_manager.capital_per_new_position(
+                    min_order_idr=self.config.min_order_idr,
+                )
             else:
                 available_cash = _tracker.cash
-            max_affordable = max(0.0, available_cash / reference_price)
+            max_affordable = max(0.0, available_cash / (reference_price * self._FEE_BUFFER))
             effective_amount = min(decision.amount, max_affordable)
+
+            # ── Fallback minimum sizing ──────────────────────────────────────
+            # When the strategy decision returned amount=0 (e.g. confidence
+            # tier dead-zone or missing stop-loss data) but cash is available
+            # and the signal passed the confidence gate, use the minimum order
+            # value so the trade is not silently dropped.
+            if (
+                effective_amount <= 0
+                and max_affordable > 0
+                and reference_price > 0
+                and decision.confidence >= _effective_min_conf
+            ):
+                min_viable = self.config.min_order_idr / reference_price * (1 + 1e-9)
+                if min_viable <= max_affordable:
+                    effective_amount = min_viable
+                    logger.info(
+                        "Fallback position sizing: %.8f coins (min_order_idr Rp%.0f)",
+                        effective_amount,
+                        self.config.min_order_idr,
+                    )
+
+            # ── Bump up to minimum order value when possible ─────────────────
+            # When the computed amount falls below the exchange minimum but the
+            # available cash can cover it, raise the amount to the minimum so
+            # the trade is not unnecessarily skipped.  A tiny 1e-9 buffer
+            # prevents floating-point rounding from landing exactly at the
+            # threshold where (amount * price) can round to < min_order_idr.
+            if reference_price > 0 and self.config.min_order_idr > 0:
+                order_value = effective_amount * reference_price
+                if 0 < order_value < self.config.min_order_idr:
+                    min_amount = self.config.min_order_idr / reference_price * (1 + 1e-9)
+                    if min_amount <= max_affordable:
+                        effective_amount = min_amount
             # Log adaptive sizing tier when it's active
             if self.config.adaptive_sizing_enabled:
                 equity = _tracker.effective_capital() or available_cash
@@ -2273,9 +3267,37 @@ class Trader:
         elif decision.action == "sell":
             max_sellable = max(0.0, _tracker.base_position)
             effective_amount = min(decision.amount, max_sellable)
+            # When selling, if the amount is below the exchange minimum but we
+            # hold the full position, sell everything rather than being stuck
+            # with an unsellable remainder.
+            if reference_price > 0 and self.config.min_order_idr > 0:
+                order_value = effective_amount * reference_price
+                if 0 < order_value < self.config.min_order_idr and max_sellable > 0:
+                    full_value = max_sellable * reference_price
+                    if full_value >= self.config.min_order_idr:
+                        effective_amount = max_sellable
+
+        # ── Dynamic position sizing (regime + liquidity) ─────────────────────
+        # Adjust the computed amount based on market regime (larger in trending
+        # up, smaller in volatile/down) and cap it against visible orderbook
+        # depth to avoid excessive slippage.
+        if decision.action == "buy" and effective_amount > 0:
+            effective_amount = self._regime_adjusted_position_size(
+                effective_amount, snapshot,
+            )
+            # Re-enforce the max_affordable ceiling after the adjustment
+            effective_amount = min(effective_amount, max_affordable)
 
         if effective_amount <= 0:
-            logger.info("Skip due to insufficient balance/position | action=%s", decision.action)
+            _diag_cash = available_cash if decision.action == "buy" else _tracker.base_position
+            logger.info(
+                "Skip due to insufficient balance/position | action=%s "
+                "decision_amount=%.8f available=%.2f price=%.2f",
+                decision.action,
+                decision.amount,
+                _diag_cash,
+                reference_price,
+            )
             outcome = {
                 "status": "skipped",
                 "reason": "insufficient balance or position",
@@ -2308,6 +3330,7 @@ class Trader:
             }
 
         staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
+        staged = self._collapse_staged_if_needed(staged, effective_amount, reference_price, self.config.min_order_idr)
 
         if not self._validate_balance(snapshot["pair"], decision.action, effective_amount, reference_price):
             return {"status": "skipped", "reason": "balance_check_failed", "portfolio": _tracker.as_dict(price)}
@@ -2317,12 +3340,13 @@ class Trader:
         # per-pair tracker now so record_trade() has a properly funded account.
         if decision.action == "buy" and self.multi_manager is not None:
             if not self.multi_manager.has_position(_pair):
-                _tracker = self.multi_manager.allocate_capital(_pair)
+                _tracker = self.multi_manager.allocate_capital(_pair, min_order_idr=self.config.min_order_idr)
                 # Tighten effective_amount against the newly allocated cash
-                max_affordable = max(0.0, _tracker.cash / reference_price)
+                max_affordable = max(0.0, _tracker.cash / (reference_price * self._FEE_BUFFER))
                 effective_amount = min(effective_amount, max_affordable)
                 # Re-derive staged after adjustment
                 staged = self._scale_staged_amounts(decision.amount, effective_amount, self._staged_amounts(decision, snapshot))
+                staged = self._collapse_staged_if_needed(staged, effective_amount, reference_price, self.config.min_order_idr)
 
         _pre_trade_avg_cost = _tracker.avg_cost
 
@@ -2449,6 +3473,64 @@ class Trader:
                     pass
             return received
 
+        # ── Pre-trade execution quality analysis ─────────────────────────────
+        _exec_quality = self._check_execution_quality(
+            snapshot, side=decision.action, quantity=effective_amount,
+        )
+        if _exec_quality.get("slippage_warning"):
+            logger.info(
+                "Execution quality warning for %s %s — proceeding with caution",
+                decision.action,
+                snapshot["pair"],
+            )
+
+        # ── Smart Entry Buffer ────────────────────────────────────────────────
+        # When enabled, re-read the orderbook once more before committing the
+        # first buy to confirm the spread is still tight and the best price has
+        # not moved against us (avoids false breakout entries).
+        if (
+            self.config.smart_entry_buffer_enabled
+            and decision.action == "buy"
+        ):
+            try:
+                _buf_depth = self.client.get_depth(snapshot["pair"], count=5)
+                _buf_bids = _buf_depth.get("buy") or []
+                _buf_asks = _buf_depth.get("sell") or []
+                if _buf_bids and _buf_asks:
+                    _buf_bid = float(_buf_bids[0][0])
+                    _buf_ask = float(_buf_asks[0][0])
+                    _buf_mid = (_buf_bid + _buf_ask) / 2 if (_buf_bid + _buf_ask) > 0 else price
+                    _buf_spread = (_buf_ask - _buf_bid) / _buf_mid if _buf_mid > 0 else 0
+                    # If the best ask moved above our allowed_max (slippage guard)
+                    # or the spread widened significantly, skip this entry.
+                    if _buf_ask > allowed_max:
+                        logger.info(
+                            "Smart entry buffer: ask %.2f moved above allowed_max %.2f on %s — skipping",
+                            _buf_ask, allowed_max, snapshot["pair"],
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "smart_entry_buffer_price_moved",
+                            "portfolio": _tracker.as_dict(price),
+                        }
+                    if self.config.max_spread_pct > 0 and _buf_spread >= self.config.max_spread_pct:
+                        logger.info(
+                            "Smart entry buffer: spread %.4f%% widened on %s — skipping",
+                            _buf_spread * 100, snapshot["pair"],
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "smart_entry_buffer_spread_widened",
+                            "portfolio": _tracker.as_dict(price),
+                        }
+                    # Update reference_price to the freshest top-of-book.
+                    reference_price = min(_buf_ask * (1 + entry_aggr), allowed_max)
+                    _fmt_price = getattr(self.client, "format_price", None)
+                    if callable(_fmt_price):
+                        reference_price, _ = _fmt_price(snapshot["pair"], reference_price)
+            except Exception as exc:
+                logger.debug("Smart entry buffer depth read failed: %s", exc)
+
         for amt in staged:
             step_amount = min(amt, remaining_amount)
             if step_amount <= 0:
@@ -2468,6 +3550,21 @@ class Trader:
                 self._consecutive_errors = 0
                 # Invalidate balance cache so next getInfo reflects the new order.
                 getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+            except RuntimeError as exc:
+                if "Insufficient balance" in str(exc):
+                    logger.warning(
+                        "Insufficient balance for %s %s @ Rp%.2f × %.8f — skipping step (pair=%s)",
+                        decision.action, snapshot["pair"].split("_")[0].upper(),
+                        reference_price, step_amount, snapshot["pair"],
+                    )
+                    remaining_amount -= step_amount
+                    executed_steps.append({"amount": 0.0, "price": reference_price, "skipped": True})
+                    continue
+                self._consecutive_errors += 1
+                if self.config.circuit_breaker_max_errors > 0 and self._consecutive_errors >= self.config.circuit_breaker_max_errors:
+                    self._circuit_breaker_until = time.time() + self.config.circuit_breaker_pause_seconds
+                    logger.warning("Circuit breaker triggered after %d errors: %s", self._consecutive_errors, exc)
+                raise
             except Exception as exc:
                 self._consecutive_errors += 1
                 if self.config.circuit_breaker_max_errors > 0 and self._consecutive_errors >= self.config.circuit_breaker_max_errors:
@@ -2478,47 +3575,363 @@ class Trader:
             # Indodax returns ``receive_<coin>`` in the trade response.  When a
             # buy limit order is merely placed (not filled) this value is 0.
             # Avoid opening a phantom position in that case; cancel and retry
-            # once with a slightly more aggressive price to avoid missing the move.
+            # using the *chase algorithm*: re-read the orderbook on every retry,
+            # progressively increase aggressiveness, and optionally convert to a
+            # market order after all chase retries are exhausted.
             received_amount = _calc_received_amount(order_resp, pre_step_position)
 
-            if decision.action == "buy" and received_amount <= 0:
-                order_id = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
-                if order_id:
-                    try:
-                        self.client.cancel_order(snapshot["pair"], order_id, decision.action)
-                        logger.info("Cancelled unfilled buy order %s on %s before retrying", order_id, snapshot["pair"])
-                    except Exception as exc:  # pragma: no cover - defensive
-                        logger.warning("Failed to cancel unfilled buy order %s on %s: %s", order_id, snapshot["pair"], exc)
+            # ── Per-pair effective minimum for chase ─────────────────────────
+            _get_min_chase = getattr(self.client, "get_pair_min_order", None)
+            _min_chase_info = _get_min_chase(snapshot["pair"]) if callable(_get_min_chase) else {}
+            _pair_min_idr_chase = _min_chase_info.get("min_idr", 0.0)
+            _pair_min_coin_chase = _min_chase_info.get("min_coin", 0.0)
+            _effective_min_idr_chase = max(self.config.min_order_idr, _pair_min_idr_chase)
 
-                retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct)
-                retry_price = reference_price
-                if retry_bump > 0:
-                    retry_price = min(reference_price * (1 + retry_bump), allowed_max)
+            # ── Partial fill management (buy) ─────────────────────────────────
+            # If the order was partially filled (0 < received < step_amount),
+            # record the filled portion and chase only the remaining quantity.
+            _chase_amount = step_amount
+            if decision.action == "buy" and 0 < received_amount < step_amount:
+                # Record the partially filled portion immediately.
+                _tracker.record_trade(decision.action, reference_price, received_amount)
+                remaining_amount -= received_amount
+                executed_steps.append({"amount": received_amount, "price": reference_price, "order": order_resp, "partial": True})
+                _chase_amount = step_amount - received_amount
+                received_amount = 0  # trigger the chase loop for the remainder
+                logger.info(
+                    "Partial fill on buy: %.8f filled, %.8f remaining (pair=%s)",
+                    step_amount - _chase_amount, _chase_amount, snapshot["pair"],
+                )
+
+            # ── Chase algorithm (buy) ─────────────────────────────────────────
+            # When the initial order is unfilled, cancel and retry up to
+            # chase_max_retries times.  Each retry re-reads the live orderbook
+            # so the new limit price tracks the moving best_ask (adaptive).
+            _max_chase = max(1, self.config.chase_max_retries) if self.config.chase_max_retries > 0 else 1
+            if decision.action == "buy" and received_amount <= 0:
+                for _chase_i in range(_max_chase):
+                    # Cancel the previous unfilled order
+                    _prev_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                    if _prev_oid:
+                        try:
+                            self.client.cancel_order(snapshot["pair"], _prev_oid, decision.action)
+                            logger.info("Chase[%d] cancelled unfilled buy %s on %s", _chase_i + 1, _prev_oid, snapshot["pair"])
+                        except Exception as _cexc:  # pragma: no cover - defensive
+                            logger.warning("Chase[%d] cancel failed for buy %s: %s", _chase_i + 1, _prev_oid, _cexc)
+
+                    # Re-read orderbook for adaptive pricing
+                    retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct) * (_chase_i + 1)
+                    try:
+                        _chase_depth = self.client.get_depth(snapshot["pair"], count=5)
+                        _chase_asks = _chase_depth.get("sell") or []
+                        _fresh_ask = float(_chase_asks[0][0]) if _chase_asks else reference_price
+                    except Exception:
+                        _fresh_ask = reference_price
+
+                    # Aggressive limit: price at best_ask + progressive bump
+                    retry_price = min(_fresh_ask * (1 + retry_bump), allowed_max)
                     _fmt_price = getattr(self.client, "format_price", None)
                     if callable(_fmt_price):
-                        retry_price = _fmt_price(snapshot["pair"], retry_price)
-                if retry_price > reference_price:
+                        retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+                    if retry_price <= reference_price:
+                        retry_price = min(reference_price * (1 + max(entry_aggr, self.config.entry_retry_aggressiveness_pct)), allowed_max)
+                        if callable(_fmt_price):
+                            retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+
+                    # Check remaining chase amount still meets minimum order
+                    _chase_below_idr = _effective_min_idr_chase > 0 and _chase_amount * retry_price < _effective_min_idr_chase
+                    _chase_below_coin = _pair_min_coin_chase > 0 and _chase_amount < _pair_min_coin_chase
+                    if _chase_below_idr or _chase_below_coin:
+                        logger.info(
+                            "Chase[%d] remaining amount %.8f × Rp%.2f = Rp%.0f below min Rp%.0f — accepting partial fill (pair=%s)",
+                            _chase_i + 1, _chase_amount, retry_price, _chase_amount * retry_price,
+                            _effective_min_idr_chase, snapshot["pair"],
+                        )
+                        break
+
                     logger.info(
-                        "Retrying buy at more aggressive price: %.10f → %.10f (pair=%s)",
-                        reference_price,
-                        retry_price,
-                        snapshot["pair"],
+                        "Chase[%d/%d] buy at %.10f → %.10f (pair=%s)",
+                        _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
                     )
-                    order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, step_amount)
+                    try:
+                        order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, _chase_amount)
+                    except RuntimeError as _chase_exc:
+                        _chase_exc_str = str(_chase_exc)
+                        _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
+                        _parsed = _parse_min_chase(_chase_exc_str) if callable(_parse_min_chase) else None
+                        if _parsed is not None:
+                            logger.warning(
+                                "Chase[%d] buy hit exchange minimum order (%.8f %s) — accepting partial fill (pair=%s)",
+                                _chase_i + 1, _parsed, snapshot["pair"].split("_")[0].upper(), snapshot["pair"],
+                            )
+                            _cache = getattr(self.client, "_pair_min_order", None)
+                            if isinstance(_cache, dict):
+                                _cached = _cache.setdefault(snapshot["pair"].lower(), {})
+                                _new_min_idr = _parsed * retry_price
+                                if _new_min_idr > _cached.get("min_idr", 0.0):
+                                    _cached["min_idr"] = _new_min_idr
+                                if _parsed > _cached.get("min_coin", 0.0):
+                                    _cached["min_coin"] = _parsed
+                            break
+                        if "Insufficient balance" in _chase_exc_str:
+                            logger.warning(
+                                "Chase[%d] buy insufficient balance — accepting partial fill (pair=%s)",
+                                _chase_i + 1, snapshot["pair"],
+                            )
+                            break
+                        raise
                     getattr(self.client, "invalidate_account_info_cache", lambda: None)()
                     reference_price = retry_price
                     received_amount = _calc_received_amount(order_resp, pre_step_position)
 
+                    # Partial fill during chase
+                    if 0 < received_amount < _chase_amount:
+                        _tracker.record_trade(decision.action, reference_price, received_amount)
+                        remaining_amount -= received_amount
+                        executed_steps.append({"amount": received_amount, "price": reference_price, "order": order_resp, "partial": True})
+                        _chase_amount -= received_amount
+                        received_amount = 0
+                        logger.info("Chase[%d] partial fill %.8f, remaining %.8f", _chase_i + 1, received_amount, _chase_amount)
+                        continue
+
+                    if received_amount > 0:
+                        break  # Filled — exit chase loop
+
+                # ── Timeout → market order (buy) ──────────────────────────────
+                # Only use market fallback when the regime indicates the coin
+                # is trending up or has strong upward momentum; otherwise keep
+                # the order as a pending limit to avoid overpaying in a flat or
+                # falling market.
+                if received_amount <= 0 and self.config.order_timeout_to_market and self._should_use_market_fallback(snapshot, "buy"):
+                    _prev_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                    if _prev_oid:
+                        try:
+                            self.client.cancel_order(snapshot["pair"], _prev_oid, decision.action)
+                        except Exception:
+                            pass
+                    # Place a market-crossing order at the maximum allowed price.
+                    market_price = allowed_max
+                    _fmt_price = getattr(self.client, "format_price", None)
+                    if callable(_fmt_price):
+                        market_price, _ = _fmt_price(snapshot["pair"], market_price)
+                    if _effective_min_idr_chase > 0 and _chase_amount * market_price < _effective_min_idr_chase:
+                        logger.info(
+                            "Chase exhausted — remaining buy Rp%.0f below min Rp%.0f, accepting partial fill (pair=%s)",
+                            _chase_amount * market_price, _effective_min_idr_chase, snapshot["pair"],
+                        )
+                    else:
+                        logger.info(
+                            "Chase exhausted — converting buy to market-price order at %.10f (pair=%s)",
+                            market_price, snapshot["pair"],
+                        )
+                        try:
+                            order_resp = self.client.create_order(snapshot["pair"], decision.action, market_price, _chase_amount)
+                        except RuntimeError as _mkt_exc:
+                            if "Insufficient balance" in str(_mkt_exc):
+                                logger.warning(
+                                    "Chase market buy: insufficient balance — accepting partial fill (pair=%s)",
+                                    snapshot["pair"],
+                                )
+                            else:
+                                raise
+                        else:
+                            getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                            reference_price = market_price
+                            received_amount = _calc_received_amount(order_resp, pre_step_position)
+
                 if received_amount <= 0:
                     logger.info(
-                        "Buy order not filled after retry (pair=%s) — will re-evaluate on next cycle",
-                        snapshot["pair"],
+                        "Buy order not filled after %d chase retries (pair=%s) — marking pending for resume",
+                        _max_chase, snapshot["pair"],
                     )
-                    remaining_amount -= step_amount
+                    _tracker.mark_pending_buy(_chase_amount, reference_price)
+                    remaining_amount -= _chase_amount
                     executed_steps.append(
                         {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
                     )
                     continue
+
+            # ── Exit protection: chase algorithm for unfilled sells ───────────
+            # The same adaptive chase logic applies to sell orders.  Re-read the
+            # orderbook on each retry, lower the price toward the best bid, and
+            # optionally convert to a market-price sell when retries run out.
+            if decision.action == "sell":
+                _sell_order_id = str(
+                    (order_resp.get("return") or {}).get("order_id")
+                    or order_resp.get("order_id")
+                    or ""
+                )
+                _sell_spent = float(
+                    (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                )
+
+                # ── Partial fill management (sell) ────────────────────────────
+                if _sell_spent > 0 and _sell_spent < step_amount:
+                    _tracker.record_trade(decision.action, reference_price, _sell_spent)
+                    remaining_amount -= _sell_spent
+                    executed_steps.append({"amount": _sell_spent, "price": reference_price, "order": order_resp, "partial": True})
+                    _chase_amount = step_amount - _sell_spent
+                    _sell_spent = 0  # trigger chase for remainder
+                    logger.info(
+                        "Partial fill on sell: %.8f filled, %.8f remaining (pair=%s)",
+                        step_amount - _chase_amount, _chase_amount, snapshot["pair"],
+                    )
+                else:
+                    _chase_amount = step_amount
+
+                if _sell_order_id and _sell_spent <= 0:
+                    for _chase_i in range(_max_chase):
+                        # Cancel previous unfilled sell
+                        _prev_sell_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                        if _prev_sell_oid:
+                            try:
+                                self.client.cancel_order(snapshot["pair"], _prev_sell_oid, decision.action)
+                                logger.info("Chase[%d] cancelled unfilled sell %s on %s", _chase_i + 1, _prev_sell_oid, snapshot["pair"])
+                            except Exception as _cexc:  # pragma: no cover - defensive
+                                logger.warning("Chase[%d] cancel failed for sell %s: %s", _chase_i + 1, _prev_sell_oid, _cexc)
+
+                        # Re-read orderbook for adaptive sell pricing
+                        retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct) * (_chase_i + 1)
+                        try:
+                            _chase_depth = self.client.get_depth(snapshot["pair"], count=5)
+                            _chase_bids = _chase_depth.get("buy") or []
+                            _fresh_bid = float(_chase_bids[0][0]) if _chase_bids else reference_price
+                        except Exception:
+                            _fresh_bid = reference_price
+
+                        # Aggressive limit sell: price at best_bid - progressive bump
+                        retry_price = max(_fresh_bid * (1 - retry_bump), allowed_min)
+                        _fmt_price = getattr(self.client, "format_price", None)
+                        if callable(_fmt_price):
+                            retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+                        if retry_price >= reference_price:
+                            retry_price = max(reference_price * (1 - max(entry_aggr, self.config.entry_retry_aggressiveness_pct)), allowed_min)
+                            if callable(_fmt_price):
+                                retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+
+                        # Check remaining chase amount still meets minimum order
+                        _chase_below_idr = _effective_min_idr_chase > 0 and _chase_amount * retry_price < _effective_min_idr_chase
+                        _chase_below_coin = _pair_min_coin_chase > 0 and _chase_amount < _pair_min_coin_chase
+                        if _chase_below_idr or _chase_below_coin:
+                            logger.info(
+                                "Chase[%d] remaining sell %.8f × Rp%.2f = Rp%.0f below min Rp%.0f — accepting partial fill (pair=%s)",
+                                _chase_i + 1, _chase_amount, retry_price, _chase_amount * retry_price,
+                                _effective_min_idr_chase, snapshot["pair"],
+                            )
+                            break
+
+                        logger.info(
+                            "Chase[%d/%d] sell at %.10f → %.10f (pair=%s)",
+                            _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
+                        )
+                        try:
+                            order_resp = self.client.create_order(
+                                snapshot["pair"], decision.action, retry_price, _chase_amount,
+                            )
+                        except RuntimeError as _chase_exc:
+                            _chase_exc_str = str(_chase_exc)
+                            _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
+                            _parsed = _parse_min_chase(_chase_exc_str) if callable(_parse_min_chase) else None
+                            if _parsed is not None:
+                                logger.warning(
+                                    "Chase[%d] sell hit exchange minimum order (%.8f %s) — accepting partial fill (pair=%s)",
+                                    _chase_i + 1, _parsed, snapshot["pair"].split("_")[0].upper(), snapshot["pair"],
+                                )
+                                _cache = getattr(self.client, "_pair_min_order", None)
+                                if isinstance(_cache, dict):
+                                    _cached = _cache.setdefault(snapshot["pair"].lower(), {})
+                                    _new_min_idr = _parsed * retry_price
+                                    if _new_min_idr > _cached.get("min_idr", 0.0):
+                                        _cached["min_idr"] = _new_min_idr
+                                    if _parsed > _cached.get("min_coin", 0.0):
+                                        _cached["min_coin"] = _parsed
+                                break
+                            if "Insufficient balance" in _chase_exc_str:
+                                logger.warning(
+                                    "Chase[%d] sell insufficient balance — accepting partial fill (pair=%s)",
+                                    _chase_i + 1, snapshot["pair"],
+                                )
+                                break
+                            raise
+                        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                        reference_price = retry_price
+
+                        _sell_spent = float(
+                            (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                        )
+
+                        # Partial fill during sell chase
+                        if 0 < _sell_spent < _chase_amount:
+                            _tracker.record_trade(decision.action, reference_price, _sell_spent)
+                            remaining_amount -= _sell_spent
+                            executed_steps.append({"amount": _sell_spent, "price": reference_price, "order": order_resp, "partial": True})
+                            _chase_amount -= _sell_spent
+                            _sell_spent = 0
+                            continue
+
+                        if _sell_spent > 0:
+                            break  # Filled
+
+                    # ── Timeout → market order (sell) ─────────────────────────
+                    # Only use market fallback when the regime indicates the coin
+                    # is trending down or volatile (dump risk); otherwise keep
+                    # the order as a pending sell to avoid selling at rock bottom.
+                    if _sell_spent <= 0 and self.config.order_timeout_to_market and self._should_use_market_fallback(snapshot, "sell"):
+                        _prev_sell_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                        if _prev_sell_oid:
+                            try:
+                                self.client.cancel_order(snapshot["pair"], _prev_sell_oid, decision.action)
+                            except Exception:
+                                pass
+                        market_price = allowed_min
+                        _fmt_price = getattr(self.client, "format_price", None)
+                        if callable(_fmt_price):
+                            market_price, _ = _fmt_price(snapshot["pair"], market_price)
+                        if _effective_min_idr_chase > 0 and _chase_amount * market_price < _effective_min_idr_chase:
+                            logger.info(
+                                "Chase exhausted — remaining sell Rp%.0f below min Rp%.0f, accepting partial fill (pair=%s)",
+                                _chase_amount * market_price, _effective_min_idr_chase, snapshot["pair"],
+                            )
+                        else:
+                            logger.info(
+                                "Chase exhausted — converting sell to market-price order at %.10f (pair=%s)",
+                                market_price, snapshot["pair"],
+                            )
+                            try:
+                                order_resp = self.client.create_order(
+                                    snapshot["pair"], decision.action, market_price, _chase_amount,
+                                )
+                            except RuntimeError as _mkt_exc:
+                                if "Insufficient balance" in str(_mkt_exc):
+                                    logger.warning(
+                                        "Chase market sell: insufficient balance — accepting partial fill (pair=%s)",
+                                        snapshot["pair"],
+                                    )
+                                else:
+                                    raise
+                            else:
+                                getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                                reference_price = market_price
+                                _sell_spent = float(
+                                    (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                                )
+
+                    # Update received for the record_trade below
+                    if _sell_spent > 0:
+                        received_amount = _sell_spent
+                    else:
+                        # Sell not filled after chase — do NOT record a phantom
+                        # sell.  Leave the position intact so the monitoring loop
+                        # retries the exit on the next cycle.
+                        logger.info(
+                            "Sell order not filled after %d chase retries (pair=%s) — will retry next cycle",
+                            _max_chase, snapshot["pair"],
+                        )
+                        remaining_amount -= _chase_amount
+                        executed_steps.append(
+                            {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
+                        )
+                        continue
 
             step_amount = min(step_amount, received_amount)
             _tracker.record_trade(decision.action, reference_price, step_amount)
@@ -2807,6 +4220,207 @@ class Trader:
         )
         return True
 
+    # ------------------------------------------------------------------
+    # Market Regime helpers for execution
+    # ------------------------------------------------------------------
+
+    def _should_use_market_fallback(
+        self,
+        snapshot: Dict[str, Any],
+        side: str,
+    ) -> bool:
+        """Decide whether a market-crossing order is appropriate after chase
+        exhaustion based on the current market regime.
+
+        For **buy**: market order only when the coin is trending up or the
+        snapshot signals rapid upward movement (avoid overpaying in a flat or
+        falling market).
+
+        For **sell**: market order only when the coin is trending down or
+        volatile (urgency to exit before further dump).
+
+        When the conditions are not met the caller should fall back to a pending
+        limit order that will be retried on the next monitoring cycle.
+        """
+        regime: Optional[MarketRegime] = snapshot.get("regime")
+        if regime is None:
+            # No regime data — conservative: stick with limit
+            return False
+
+        if side == "buy":
+            # Market buy justified when trending up with decent strength
+            if regime.regime == "trending_up" and regime.strength >= 0.3:
+                return True
+            # Also allow if volume acceleration or strong micro trend detected
+            vol_accel = snapshot.get("volume_accel")
+            if vol_accel and getattr(vol_accel, "detected", False):
+                return True
+            micro = snapshot.get("micro_trend")
+            if micro and getattr(micro, "detected", False) and getattr(micro, "direction", "") == "up":
+                return True
+            return False
+
+        if side == "sell":
+            # Market sell justified when trending down or volatile (dump risk)
+            if regime.regime in ("trending_down", "volatile"):
+                return True
+            # Also allow if the trend direction is down regardless of regime label
+            trend = snapshot.get("trend")
+            if trend and getattr(trend, "direction", "") == "down" and getattr(trend, "strength", 0) > 0.01:
+                return True
+            return False
+
+        return False
+
+    def _regime_adjusted_position_size(
+        self,
+        base_amount: float,
+        snapshot: Dict[str, Any],
+    ) -> float:
+        """Adjust position size based on market regime and liquidity.
+
+        * **trending_up** with strong signal → up to +20 % size boost
+        * **volatile / trending_down** → reduce size by up to 30 %
+        * **ranging** → no adjustment
+
+        Separately, if the orderbook lacks depth the amount is capped so that
+        the order does not exceed visible liquidity.
+        """
+        if base_amount <= 0:
+            return base_amount
+
+        regime: Optional[MarketRegime] = snapshot.get("regime")
+        multiplier = 1.0
+        if regime is not None:
+            if regime.regime == "trending_up":
+                # Stronger trend → bigger boost (max +20 %)
+                multiplier = 1.0 + min(0.20, regime.strength * 0.20)
+            elif regime.regime == "volatile":
+                # Higher volatility → bigger cut (max −30 %)
+                multiplier = max(0.70, 1.0 - regime.strength * 0.30)
+            elif regime.regime == "trending_down":
+                multiplier = max(0.70, 1.0 - regime.strength * 0.30)
+            # ranging → 1.0
+
+        adjusted = base_amount * multiplier
+
+        # ── Liquidity cap ────────────────────────────────────────────────────
+        adjusted = self._liquidity_adjusted_amount(adjusted, snapshot)
+
+        return adjusted
+
+    def _liquidity_adjusted_amount(
+        self,
+        amount: float,
+        snapshot: Dict[str, Any],
+    ) -> float:
+        """Cap *amount* so that the order does not exceed a fraction of the
+        visible orderbook depth on the relevant side.
+
+        For a buy we look at ask-side depth; for a sell we look at bid-side
+        depth.  The cap is 40 % of the total visible depth in the top 5 levels
+        so that a single order does not eat through the entire book and suffer
+        large slippage.
+        """
+        if amount <= 0:
+            return amount
+
+        depth = snapshot.get("raw_depth")
+        if not depth:
+            return amount
+
+        price = snapshot.get("price", 0)
+        if price <= 0:
+            return amount
+
+        decision = snapshot.get("decision")
+        side = getattr(decision, "action", "buy") if decision else "buy"
+
+        levels = depth.get("sell") if side == "buy" else depth.get("buy")
+        if not levels:
+            return amount
+
+        # Sum coin-equivalent volume in top 5 levels
+        total_coin = 0.0
+        for lvl in levels[:5]:
+            try:
+                total_coin += float(lvl[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+
+        if total_coin <= 0:
+            return amount
+
+        # Cap at 40 % of visible depth
+        max_amount = total_coin * 0.40
+        if amount > max_amount > 0:
+            logger.info(
+                "Liquidity cap: %.8f → %.8f (40%% of %.8f visible depth on %s)",
+                amount, max_amount, total_coin, snapshot.get("pair", "?"),
+            )
+            return max_amount
+
+        return amount
+
+    def analyze_reentry_opportunity(
+        self,
+        snapshot: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Analyse whether a re-entry at a lower price is justified after
+        a trailing-stop or stop-loss sell.
+
+        Returns a dict with ``reentry=True`` and a suggested ``target_price``
+        when conditions are favourable, or ``None`` when the bot should stay
+        flat.
+
+        Conditions checked:
+        * Market regime is *not* ``trending_down`` (would just keep falling).
+        * Support level is nearby below the current price.
+        * Trend is at least neutral or turning up.
+        * Orderbook shows bid-side strength (imbalance > 0).
+        """
+        regime: Optional[MarketRegime] = snapshot.get("regime")
+        trend = snapshot.get("trend")
+        orderbook = snapshot.get("orderbook")
+        levels = snapshot.get("levels")
+        price = snapshot.get("price", 0)
+
+        if price <= 0:
+            return None
+
+        # Do not re-enter if the market is clearly heading down
+        if regime and regime.regime == "trending_down" and regime.strength >= 0.4:
+            return None
+
+        # Need at least a non-bearish trend
+        if trend and getattr(trend, "direction", "") == "down" and getattr(trend, "strength", 0) > 0.02:
+            return None
+
+        # Look for a nearby support level below the current price
+        supports = getattr(levels, "support", []) if levels else []
+        target_price = None
+        for s in sorted(supports, reverse=True):
+            if s < price * 0.995:  # at least 0.5 % below current
+                target_price = s
+                break
+
+        if target_price is None:
+            # No identified support — use a 1 % dip from current as target
+            target_price = price * 0.99
+
+        # Orderbook should show some bid strength
+        imbalance = getattr(orderbook, "imbalance", 0.0) if orderbook else 0.0
+        if imbalance < -0.3:
+            # Heavy sell-side pressure — skip re-entry
+            return None
+
+        return {
+            "reentry": True,
+            "target_price": target_price,
+            "regime": regime.regime if regime else "unknown",
+            "imbalance": imbalance,
+        }
+
     def _conditions_allow_holding(self, snapshot: Dict[str, Any]) -> bool:
         """Return ``True`` when market indicators suggest holding past the TP target.
 
@@ -2860,6 +4474,12 @@ class Trader:
         price = snapshot["price"]
         _tracker = self._active_tracker(snapshot["pair"])
 
+        # Once a sell was already committed (triggered in a previous cycle but
+        # the order hasn't fully filled yet), keep returning the sell signal so
+        # it is not accidentally reverted to "hold" if the price bounces.
+        if _tracker.tp_sell_committed:
+            return "trailing_tp_triggered"
+
         # If neither feature is configured → standard TP behaviour (close now)
         dynamic_tp_enabled = (
             config.trailing_tp_pct > 0
@@ -2875,6 +4495,7 @@ class Trader:
             _tracker.trailing_tp_stop is not None
             and price <= _tracker.trailing_tp_stop
         ):
+            _tracker.commit_tp_sell()
             return "trailing_tp_triggered"
 
         # Check whether market conditions allow holding
@@ -2886,6 +4507,7 @@ class Trader:
                 "Conditional TP: conditions failed at price=%.2f — taking profit",
                 price,
             )
+            _tracker.commit_tp_sell()
             return "target_profit_reached"
 
         # Conditions still bullish — activate / advance the trailing TP floor
@@ -2899,6 +4521,568 @@ class Trader:
 
         # Hold the position — let profits run
         return None
+
+    # ------------------------------------------------------------------
+    # Resume pending buy
+    # ------------------------------------------------------------------
+    def resume_pending_buy(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-attempt a pending buy order using fresh orderbook data.
+
+        Called from the monitoring loop when a position has
+        ``has_pending_buy == True`` and ``base_position <= 0`` — i.e. a
+        previous buy was placed but never filled.  The method cancels any
+        stale open orders, reads the current orderbook, and places a new
+        aggressive limit order (at best_ask + bump) using the same chase
+        algorithm.  If the order fills, the pending flag is automatically
+        cleared by :meth:`PortfolioTracker.record_trade`.
+
+        Returns an outcome dict compatible with the main-loop logging.
+        """
+        pair = snapshot["pair"]
+        price = snapshot["price"]
+        _tracker = self._active_tracker(pair)
+
+        if not _tracker.has_pending_buy:
+            return {"status": "no_pending", "pair": pair, "price": price}
+
+        pending = _tracker.pending_orders[-1]  # most recent pending
+        amount = pending["amount"]
+
+        if amount <= 0:
+            _tracker.pending_orders.clear()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_zero", "pair": pair, "price": price}
+
+        # Cancel any stale open orders that may still sit on the book.
+        self._cancel_open_orders(pair, ("buy",))
+
+        if self.config.dry_run:
+            logger.info("DRY-RUN resume-pending-buy %.8f %s @ %s", amount, pair, price)
+            _tracker.record_trade("buy", price, amount)
+            self._persist_after_trade(pair)
+            return {
+                "status": "resumed",
+                "action": "buy",
+                "pair": pair,
+                "price": price,
+                "amount": amount,
+                "portfolio": _tracker.as_dict(price),
+            }
+
+        if self.config.api_key is None:
+            raise ValueError("API credentials required for live trading")
+
+        base_coin = pair.split("_")[0].lower()
+        receive_key = f"receive_{base_coin}"
+
+        # Read fresh orderbook for adaptive pricing.
+        try:
+            depth = self.client.get_depth(pair, count=5)
+            asks = depth.get("sell") or []
+            best_ask = float(asks[0][0]) if asks else price
+        except Exception:
+            best_ask = price
+
+        entry_aggr = max(
+            self.config.entry_retry_aggressiveness_pct,
+            0.001,
+        )
+        retry_price = best_ask * (1 + entry_aggr)
+        _fmt_price = getattr(self.client, "format_price", None)
+        if callable(_fmt_price):
+            retry_price, _ = _fmt_price(pair, retry_price)
+
+        # Per-pair effective minimum.
+        _get_min = getattr(self.client, "get_pair_min_order", None)
+        _min_info = _get_min(pair) if callable(_get_min) else {}
+        _eff_min_idr = max(self.config.min_order_idr, _min_info.get("min_idr", 0.0))
+
+        if _eff_min_idr > 0 and amount * retry_price < _eff_min_idr:
+            logger.info(
+                "Resume pending buy: Rp%.0f below min Rp%.0f — cancelling pending (pair=%s)",
+                amount * retry_price, _eff_min_idr, pair,
+            )
+            _tracker.pending_orders.clear()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+
+        # Pre-order balance for fill verification & IDR sufficiency check.
+        pre_balance = 0.0
+        idr_balance = 0.0
+        try:
+            acct_info = self.client.get_account_info()
+            balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+            pre_balance = float(balance_dict.get(base_coin) or "0")
+            idr_balance = float(balance_dict.get("idr") or "0")
+        except Exception:
+            pass
+
+        # Check IDR balance is sufficient; adjust amount downward if needed.
+        needed_idr = amount * retry_price
+        if idr_balance > 0 and needed_idr > idr_balance:
+            adjusted = idr_balance / retry_price * 0.995  # 0.5% margin for fees
+            if _eff_min_idr > 0 and adjusted * retry_price < _eff_min_idr:
+                logger.warning(
+                    "resume_pending_buy: IDR balance Rp%.0f insufficient for "
+                    "Rp%.0f and adjusted amount below minimum — cancelling (pair=%s)",
+                    idr_balance, needed_idr, pair,
+                )
+                _tracker.pending_orders.clear()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            logger.warning(
+                "resume_pending_buy: IDR balance Rp%.0f < needed Rp%.0f — "
+                "adjusting buy amount %.8f → %.8f (pair=%s)",
+                idr_balance, needed_idr, amount, adjusted, pair,
+            )
+            amount = adjusted
+        elif idr_balance <= 0 and not self.config.dry_run:
+            logger.warning(
+                "resume_pending_buy: no IDR balance — cancelling pending buy (pair=%s)",
+                pair,
+            )
+            _tracker.pending_orders.clear()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_zero", "pair": pair, "price": retry_price}
+
+        logger.info(
+            "🔄 Resuming pending buy %.8f %s @ Rp%.2f (pair=%s)",
+            amount, base_coin.upper(), retry_price, pair,
+        )
+        try:
+            order_resp = self.client.create_order(pair, "buy", retry_price, amount)
+        except RuntimeError as exc:
+            exc_str = str(exc)
+            _parse_min = getattr(self.client, "parse_minimum_order_error", None)
+            _parsed = _parse_min(exc_str) if callable(_parse_min) else None
+            if _parsed is not None:
+                logger.warning(
+                    "Resume pending buy hit exchange minimum — cancelling (pair=%s)", pair,
+                )
+                _tracker.pending_orders.clear()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            if "Insufficient balance" in exc_str:
+                logger.warning(
+                    "Resume pending buy: insufficient balance — cancelling (pair=%s)", pair,
+                )
+                _tracker.pending_orders.clear()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_insufficient", "pair": pair, "price": retry_price}
+            raise
+        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+
+        received = 0.0
+        try:
+            received = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
+        except (TypeError, ValueError):
+            received = 0.0
+
+        # Fallback: verify balance delta.
+        if received <= 0:
+            try:
+                acct_info = self.client.get_account_info()
+                balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+                actual = float(balance_dict.get(base_coin) or "0")
+                delta = actual - pre_balance
+                if delta > 0:
+                    received = min(amount, delta)
+            except Exception:
+                pass
+
+        if received > 0:
+            _tracker.record_trade("buy", retry_price, received)
+            remaining_buy = amount - received
+            # Partial fill: record filled portion and re-mark the remaining
+            # amount as pending_buy so it is retried on the next cycle.
+            if remaining_buy > 0:
+                _eff_min_re = max(self.config.min_order_idr, _min_info.get("min_idr", 0.0))
+                if _eff_min_re > 0 and remaining_buy * retry_price < _eff_min_re:
+                    logger.info(
+                        "⚠️ Pending buy partial fill: %.8f filled, remainder %.8f below min — accepting partial (pair=%s)",
+                        received, remaining_buy, pair,
+                    )
+                else:
+                    logger.info(
+                        "⚠️ Pending buy partial fill: %.8f filled, %.8f remaining — will retry remainder (pair=%s)",
+                        received, remaining_buy, pair,
+                    )
+                    _tracker.mark_pending_buy(remaining_buy, retry_price)
+            else:
+                logger.info(
+                    "✅ Pending buy filled: %.8f %s @ Rp%.2f (pair=%s)",
+                    received, base_coin.upper(), retry_price, pair,
+                )
+            self._ensure_position_feed(pair)
+            self._persist_after_trade(pair)
+            return {
+                "status": "resumed",
+                "action": "buy",
+                "pair": pair,
+                "price": retry_price,
+                "amount": received,
+                "portfolio": _tracker.as_dict(retry_price),
+            }
+
+        # Still not filled — try a market-crossing price before giving up.
+        # This ensures buy orders are actually filled rather than lingering
+        # indefinitely ("harus terisi").
+        if self.config.order_timeout_to_market:
+            _prev_oid = str(
+                (order_resp.get("return") or {}).get("order_id")
+                or order_resp.get("order_id")
+                or ""
+            )
+            if _prev_oid:
+                try:
+                    self.client.cancel_order(pair, _prev_oid, "buy")
+                except Exception:
+                    pass
+            market_price = best_ask * (1 + entry_aggr * 3)
+            if callable(_fmt_price):
+                market_price, _ = _fmt_price(pair, market_price)
+            if market_price > 0 and (_eff_min_idr <= 0 or amount * market_price >= _eff_min_idr):
+                logger.info(
+                    "resume_pending_buy: unfilled — market-price buy at Rp%.2f (pair=%s)",
+                    market_price, pair,
+                )
+                try:
+                    order_resp = self.client.create_order(pair, "buy", market_price, amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    _mkt_received = 0.0
+                    try:
+                        _mkt_received = float((order_resp.get("return") or {}).get(receive_key) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    if _mkt_received > 0:
+                        _tracker.record_trade("buy", market_price, _mkt_received)
+                        self._ensure_position_feed(pair)
+                        self._persist_after_trade(pair)
+                        return {
+                            "status": "resumed",
+                            "action": "buy",
+                            "pair": pair,
+                            "price": market_price,
+                            "amount": _mkt_received,
+                            "portfolio": _tracker.as_dict(market_price),
+                        }
+                except RuntimeError as _mkt_exc:
+                    _mkt_exc_str = str(_mkt_exc)
+                    if "Insufficient balance" in _mkt_exc_str:
+                        logger.warning(
+                            "resume_pending_buy: market fallback insufficient balance for %s",
+                            pair,
+                        )
+                    else:
+                        logger.warning(
+                            "resume_pending_buy: market fallback failed for %s: %s",
+                            pair, _mkt_exc,
+                        )
+                except Exception as _mkt_exc:
+                    logger.warning(
+                        "resume_pending_buy: market fallback failed for %s: %s",
+                        pair, _mkt_exc,
+                    )
+
+        # Update pending price, will retry next cycle.
+        _tracker.pending_orders[-1]["price"] = retry_price
+        logger.info(
+            "🔄 Pending buy still unfilled — will retry next cycle (pair=%s)", pair,
+        )
+        return {
+            "status": "pending",
+            "action": "buy",
+            "pair": pair,
+            "price": retry_price,
+            "amount": amount,
+        }
+
+    def resume_pending_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-attempt a pending sell order using fresh orderbook data.
+
+        Called from the monitoring loop when a position has
+        ``has_pending_sell == True`` — i.e. a previous sell was placed but
+        never filled.  The method cancels any stale open orders, reads the
+        current orderbook, and places a new aggressive limit order (at
+        best_bid − bump) so that the sell is more likely to fill.  If the
+        order fills, the pending flag is cleared.
+
+        Returns an outcome dict compatible with the main-loop logging.
+        """
+        pair = snapshot["pair"]
+        price = snapshot["price"]
+        _tracker = self._active_tracker(pair)
+
+        if not _tracker.has_pending_sell:
+            return {"status": "no_pending", "pair": pair, "price": price}
+
+        pending = _tracker.pending_sell_orders[-1]  # most recent pending sell
+        amount = pending["amount"]
+
+        if amount <= 0:
+            _tracker.clear_pending_sell()
+            if self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_zero", "pair": pair, "price": price}
+
+        # Cancel any stale open orders that may still sit on the book.
+        self._cancel_open_orders(pair, ("sell",))
+
+        if self.config.dry_run:
+            logger.info("DRY-RUN resume-pending-sell %.8f %s @ %s", amount, pair, price)
+            _tracker.record_trade("sell", price, amount)
+            if self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(pair)
+            if _tracker.base_position <= 0:
+                self._remove_position_feed(pair)
+            self._persist_after_trade(pair)
+            return {
+                "status": "resumed",
+                "action": "sell",
+                "pair": pair,
+                "price": price,
+                "amount": amount,
+                "portfolio": _tracker.as_dict(price),
+            }
+
+        if self.config.api_key is None:
+            raise ValueError("API credentials required for live trading")
+
+        base_coin = pair.split("_")[0].lower()
+        spend_key = f"spend_{base_coin}"
+
+        # Read fresh orderbook for adaptive pricing.
+        try:
+            depth = self.client.get_depth(pair, count=5)
+            bids = depth.get("buy") or []
+            best_bid = float(bids[0][0]) if bids else price
+        except Exception:
+            best_bid = price
+
+        entry_aggr = max(
+            self.config.entry_retry_aggressiveness_pct,
+            0.001,
+        )
+        retry_price = best_bid * (1 - entry_aggr)
+        _fmt_price = getattr(self.client, "format_price", None)
+        if callable(_fmt_price):
+            retry_price, _ = _fmt_price(pair, retry_price)
+
+        # Per-pair effective minimum.
+        _get_min = getattr(self.client, "get_pair_min_order", None)
+        _min_info = _get_min(pair) if callable(_get_min) else {}
+        _eff_min_idr = max(self.config.min_order_idr, _min_info.get("min_idr", 0.0))
+
+        if _eff_min_idr > 0 and amount * retry_price < _eff_min_idr:
+            logger.info(
+                "Resume pending sell: Rp%.0f below min Rp%.0f — clearing dust (pair=%s)",
+                amount * retry_price, _eff_min_idr, pair,
+            )
+            _tracker.clear_pending_sell()
+            _tracker.cancel_pending_buy()  # clear dust position
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+
+        # Pre-order balance for fill verification.
+        pre_balance = 0.0
+        try:
+            acct_info = self.client.get_account_info()
+            balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+            pre_balance = float(balance_dict.get(base_coin) or "0")
+        except Exception:
+            pass
+
+        # If the actual balance is much less than the expected amount, adjust.
+        if pre_balance < amount * 0.99 and pre_balance > 0:
+            logger.warning(
+                "resume_pending_sell: actual balance %.8f < tracked %.8f — "
+                "adjusting sell amount to actual (pair=%s)",
+                pre_balance, amount, pair,
+            )
+            amount = pre_balance
+        elif pre_balance <= 0:
+            logger.warning(
+                "resume_pending_sell: no balance for %s — clearing pending sell",
+                pair,
+            )
+            _tracker.clear_pending_sell()
+            _tracker.cancel_pending_buy()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            return {"status": "no_position", "pair": pair, "price": retry_price}
+
+        logger.info(
+            "🔄 Resuming pending sell %.8f %s @ Rp%.2f (pair=%s)",
+            amount, base_coin.upper(), retry_price, pair,
+        )
+        try:
+            order_resp = self.client.create_order(pair, "sell", retry_price, amount)
+        except RuntimeError as exc:
+            exc_str = str(exc)
+            _parse_min = getattr(self.client, "parse_minimum_order_error", None)
+            _parsed = _parse_min(exc_str) if callable(_parse_min) else None
+            if _parsed is not None:
+                logger.warning(
+                    "Resume pending sell hit exchange minimum — clearing dust (pair=%s)",
+                    pair,
+                )
+                _tracker.clear_pending_sell()
+                _tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
+            if "Insufficient balance" in exc_str:
+                logger.warning(
+                    "Resume pending sell: insufficient balance — clearing (pair=%s)", pair,
+                )
+                _tracker.clear_pending_sell()
+                _tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                return {"status": "cancelled_insufficient", "pair": pair, "price": retry_price}
+            raise
+        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+
+        spent = 0.0
+        try:
+            spent = float((order_resp.get("return") or {}).get(spend_key) or 0.0)
+        except (TypeError, ValueError):
+            spent = 0.0
+
+        # Fallback: verify balance delta.
+        if spent <= 0:
+            try:
+                acct_info = self.client.get_account_info()
+                balance_dict = (acct_info.get("return") or {}).get("balance") or {}
+                actual = float(balance_dict.get(base_coin) or "0")
+                delta = pre_balance - actual
+                if delta > 0:
+                    spent = min(amount, delta)
+            except Exception:
+                pass
+
+        if spent > 0:
+            _tracker.record_trade("sell", retry_price, spent)
+            remaining_sell = amount - spent
+            # Partial fill: record sold portion and re-mark the unsold
+            # remainder as pending_sell so it is retried on the next cycle.
+            if remaining_sell > 0 and _tracker.base_position > 0:
+                logger.info(
+                    "⚠️ Pending sell partial fill: %.8f sold, %.8f remaining — will retry remainder (pair=%s)",
+                    spent, remaining_sell, pair,
+                )
+                _tracker.mark_pending_sell(remaining_sell, retry_price)
+                self._persist_after_trade(pair)
+                return {
+                    "status": "partial",
+                    "action": "sell",
+                    "pair": pair,
+                    "price": retry_price,
+                    "amount": spent,
+                    "remaining": remaining_sell,
+                    "portfolio": _tracker.as_dict(retry_price),
+                }
+            logger.info(
+                "✅ Pending sell filled: %.8f %s @ Rp%.2f (pair=%s)",
+                spent, base_coin.upper(), retry_price, pair,
+            )
+            if self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(pair)
+            if _tracker.base_position <= 0:
+                self._remove_position_feed(pair)
+            self._persist_after_trade(pair)
+            return {
+                "status": "resumed",
+                "action": "sell",
+                "pair": pair,
+                "price": retry_price,
+                "amount": spent,
+                "portfolio": _tracker.as_dict(retry_price),
+            }
+
+        # Still not filled — try a market-crossing price before giving up.
+        # This ensures sell orders are actually filled rather than lingering
+        # indefinitely ("harus terisi").
+        if self.config.order_timeout_to_market:
+            _prev_oid = str(
+                (order_resp.get("return") or {}).get("order_id")
+                or order_resp.get("order_id")
+                or ""
+            )
+            if _prev_oid:
+                try:
+                    self.client.cancel_order(pair, _prev_oid, "sell")
+                except Exception:
+                    pass
+            market_price = best_bid * (1 - entry_aggr * 3)
+            if callable(_fmt_price):
+                market_price, _ = _fmt_price(pair, market_price)
+            if market_price > 0 and (_eff_min_idr <= 0 or amount * market_price >= _eff_min_idr):
+                logger.info(
+                    "resume_pending_sell: unfilled — market-price sell at Rp%.2f (pair=%s)",
+                    market_price, pair,
+                )
+                try:
+                    order_resp = self.client.create_order(pair, "sell", market_price, amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    _mkt_spent = 0.0
+                    try:
+                        _mkt_spent = float((order_resp.get("return") or {}).get(spend_key) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    if _mkt_spent > 0:
+                        _tracker.record_trade("sell", market_price, _mkt_spent)
+                        remaining_sell = amount - _mkt_spent
+                        if remaining_sell > 0 and _tracker.base_position > 0:
+                            _tracker.mark_pending_sell(remaining_sell, market_price)
+                            self._persist_after_trade(pair)
+                            return {
+                                "status": "partial",
+                                "action": "sell",
+                                "pair": pair,
+                                "price": market_price,
+                                "amount": _mkt_spent,
+                                "remaining": remaining_sell,
+                                "portfolio": _tracker.as_dict(market_price),
+                            }
+                        if self.multi_manager is not None and _tracker.base_position <= 0:
+                            self.multi_manager.return_position_cash(pair)
+                        if _tracker.base_position <= 0:
+                            self._remove_position_feed(pair)
+                        self._persist_after_trade(pair)
+                        return {
+                            "status": "resumed",
+                            "action": "sell",
+                            "pair": pair,
+                            "price": market_price,
+                            "amount": _mkt_spent,
+                            "portfolio": _tracker.as_dict(market_price),
+                        }
+                except Exception as _mkt_exc:
+                    logger.warning(
+                        "resume_pending_sell: market fallback failed for %s: %s",
+                        pair, _mkt_exc,
+                    )
+
+        # Update pending price, will retry next cycle.
+        _tracker.pending_sell_orders[-1]["price"] = retry_price
+        logger.info(
+            "🔄 Pending sell still unfilled — will retry next cycle (pair=%s)", pair,
+        )
+        return {
+            "status": "pending",
+            "action": "sell",
+            "pair": pair,
+            "price": retry_price,
+            "amount": amount,
+        }
 
     def force_sell(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """Sell the entire open base position at current market price.
@@ -3026,33 +5210,42 @@ class Trader:
         _get_min = getattr(self.client, "get_pair_min_order", None)
         min_info = _get_min(pair) if callable(_get_min) else {}
         min_idr_per_pair = min_info.get("min_idr", 0.0)
+        min_coin_per_pair = min_info.get("min_coin", 0.0)
         sell_idr_value = amount * reference_price
 
         # Indodax enforces minimum order size by total IDR value, not coin amount.
         # Keep the effective threshold in rupiah to mirror that rule.
         effective_min_idr = max(self.config.min_order_idr, min_idr_per_pair)
+        is_below_coin_min = min_coin_per_pair > 0 and amount < min_coin_per_pair
         is_below_idr_min = effective_min_idr > 0 and sell_idr_value < effective_min_idr
 
+        # ── Dust check (IDR value below minimum) ────────────────────────
+        # When the IDR value is below the effective minimum, the position
+        # is unsellable dust — clear it so the bot can move on without
+        # making an API call that would always be rejected by the exchange.
         if is_below_idr_min:
-            # Instead of discarding the position as "dust", keep it for monitoring
-            # so the bot can aggregate or retry later once the position is large
-            # enough. Surface the condition to the caller and leave state intact.
             logger.warning(
-                "force_sell: sell amount %.8f %s (Rp %.0f) is below exchange minimum "
-                "(min_idr=%.0f) — skipping sell and keeping position to monitor",
+                "force_sell: amount %.8f %s (Rp %.0f) is below exchange minimums "
+                "(min_coin=%.8f, min_idr=%.0f) — clearing dust position",
                 amount,
                 pair.split("_")[0].upper(),
                 sell_idr_value,
+                min_coin_per_pair,
                 effective_min_idr,
             )
-            return {
-                "status": "below_minimum",
+            _tracker.cancel_pending_buy()
+            if self.multi_manager is not None:
+                self.multi_manager.return_position_cash(pair)
+            outcome = {
+                "status": "dust_cleared",
                 "pair": pair,
                 "price": reference_price,
                 "amount": amount,
                 "min_idr": effective_min_idr,
                 "portfolio": _tracker.as_dict(reference_price),
             }
+            self._persist_after_trade(pair)
+            return outcome
 
         # ── Place the sell order ─────────────────────────────────────────────
         try:
@@ -3067,7 +5260,7 @@ class Trader:
             if parsed_min is None:
                 # Fallback: detect via the error text directly
                 import re as _re
-                _m = _re.search(r"Minimum order\s+([\d.]+)", exc_str, _re.IGNORECASE)
+                _m = _re.search(r"Minimum order\s+(?:is\s+)?([\d.]+)", exc_str, _re.IGNORECASE)
                 if _m:
                     try:
                         parsed_min = float(_m.group(1))
@@ -3104,30 +5297,274 @@ class Trader:
                         }
                         self._persist_after_trade(pair)
                         return outcome
-            # Amount was not below the parsed minimum — bubble up so the caller
-            # sees the real failure instead of silently clearing the position.
+            # Amount was not below the parsed minimum — check for insufficient balance
+            if "Insufficient balance" in exc_str:
+                logger.warning(
+                    "force_sell: insufficient balance for %s — clearing position",
+                    pair,
+                )
+                _tracker.cancel_pending_buy()
+                if self.multi_manager is not None:
+                    self.multi_manager.return_position_cash(pair)
+                outcome = {
+                    "status": "dust_cleared",
+                    "pair": pair,
+                    "price": reference_price,
+                    "amount": amount,
+                    "portfolio": _tracker.as_dict(reference_price),
+                }
+                self._persist_after_trade(pair)
+                return outcome
+            # bubble up so the caller sees the real failure instead of silently
+            # clearing the position.
             raise
 
-        _tracker.record_trade("sell", reference_price, amount)
-        if self.multi_manager is not None and _tracker.base_position <= 0:
-            self.multi_manager.return_position_cash(pair)
-        if _tracker.base_position <= 0:
-            self._remove_position_feed(pair)
-        # Invalidate balance cache so next getInfo reflects the sell proceeds.
         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
-        # Invalidate open-orders cache for this pair; the order is now closed.
-        getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
-        outcome = {
-            "status": "force_sold",
+
+        # ── Verify sell fill ─────────────────────────────────────────────────
+        # Indodax returns ``spend_<coin>`` for the actual amount sold.  When a
+        # limit sell is filled immediately there is no ``order_id`` (the order
+        # never enters the book).  When the order sits on the book unfilled,
+        # ``order_id`` is returned and ``spend_<coin>`` is 0.
+        spend_key = f"spend_{base_coin}"
+        sold_amount = 0.0
+        try:
+            sold_amount = float((order_resp.get("return") or {}).get(spend_key) or 0.0)
+        except (TypeError, ValueError):
+            sold_amount = 0.0
+
+        _return_dict = order_resp.get("return") or {}
+        _sell_order_id = str(
+            _return_dict.get("order_id") or ""
+        )
+
+        # Fallback: verify balance delta if spend_<coin> unavailable.
+        if sold_amount <= 0:
+            try:
+                acct_after = self.client.get_account_info()
+                balance_after = (acct_after.get("return") or {}).get("balance") or {}
+                actual_after = float(balance_after.get(base_coin) or "0")
+                _pre_sell = actual_balance  # noqa: F821 – set in phantom-buy check above
+                delta = _pre_sell - actual_after
+                if delta > amount * 0.5:  # at least half sold
+                    sold_amount = min(amount, delta)
+            except Exception:
+                pass
+
+        # If sold_amount confirmed OR no order_id in return dict (immediate
+        # fill — order never sat on the book), record as filled.
+        if sold_amount > 0 or not _sell_order_id:
+            final_amount = sold_amount if sold_amount > 0 else amount
+            _tracker.record_trade("sell", reference_price, final_amount)
+            if self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(pair)
+            if _tracker.base_position <= 0:
+                self._remove_position_feed(pair)
+            # Invalidate open-orders cache for this pair; the order is now closed.
+            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
+            outcome = {
+                "status": "force_sold",
+                "action": "sell",
+                "pair": pair,
+                "price": reference_price,
+                "amount": final_amount,
+                "order": order_resp,
+                "portfolio": _tracker.as_dict(reference_price),
+            }
+            self._persist_after_trade(pair)
+            return outcome
+
+        # ── Chase loop: sell not filled — retry with progressively lower price ─
+        _chase_amount = amount
+        _max_chase = max(1, self.config.chase_max_retries) if self.config.chase_max_retries > 0 else 1
+        entry_aggr = max(self.config.entry_retry_aggressiveness_pct, 0.001)
+
+        for _chase_i in range(_max_chase):
+            # Cancel the previous unfilled sell order.
+            _prev_oid = str(
+                (order_resp.get("return") or {}).get("order_id")
+                or order_resp.get("order_id")
+                or ""
+            )
+            if _prev_oid:
+                try:
+                    self.client.cancel_order(pair, _prev_oid, "sell")
+                    logger.info(
+                        "force_sell chase[%d] cancelled unfilled sell %s on %s",
+                        _chase_i + 1, _prev_oid, pair,
+                    )
+                except Exception as _cexc:
+                    logger.warning(
+                        "force_sell chase[%d] cancel failed for sell %s: %s",
+                        _chase_i + 1, _prev_oid, _cexc,
+                    )
+
+            # Re-read orderbook for adaptive sell pricing.
+            retry_bump = entry_aggr * (_chase_i + 1)
+            try:
+                _chase_depth = self.client.get_depth(pair, count=5)
+                _chase_bids = _chase_depth.get("buy") or []
+                _fresh_bid = float(_chase_bids[0][0]) if _chase_bids else reference_price
+            except Exception:
+                _fresh_bid = reference_price
+
+            retry_price = _fresh_bid * (1 - retry_bump)
+            _fmt_price = getattr(self.client, "format_price", None)
+            if callable(_fmt_price):
+                retry_price, _ = _fmt_price(pair, retry_price)
+            if retry_price <= 0:
+                retry_price = reference_price * (1 - entry_aggr)
+                if callable(_fmt_price):
+                    retry_price, _ = _fmt_price(pair, retry_price)
+
+            # Check remaining amount still meets minimum.
+            if effective_min_idr > 0 and _chase_amount * retry_price < effective_min_idr:
+                logger.info(
+                    "force_sell chase[%d] remaining %.8f × Rp%.2f = Rp%.0f below min — accepting partial (pair=%s)",
+                    _chase_i + 1, _chase_amount, retry_price,
+                    _chase_amount * retry_price, pair,
+                )
+                break
+
+            logger.info(
+                "force_sell chase[%d/%d] sell at Rp%.2f → Rp%.2f (pair=%s)",
+                _chase_i + 1, _max_chase, reference_price, retry_price, pair,
+            )
+            try:
+                order_resp = self.client.create_order(pair, "sell", retry_price, _chase_amount)
+            except RuntimeError as _chase_exc:
+                _chase_exc_str = str(_chase_exc)
+                _parse_min_chase = getattr(self.client, "parse_minimum_order_error", None)
+                _parsed = _parse_min_chase(_chase_exc_str) if callable(_parse_min_chase) else None
+                if _parsed is not None:
+                    logger.warning(
+                        "force_sell chase[%d] hit exchange minimum — accepting partial (pair=%s)",
+                        _chase_i + 1, pair,
+                    )
+                    break
+                if "Insufficient balance" in _chase_exc_str:
+                    logger.warning(
+                        "force_sell chase[%d] insufficient balance — accepting partial (pair=%s)",
+                        _chase_i + 1, pair,
+                    )
+                    break
+                raise
+            getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+            reference_price = retry_price
+
+            _sell_spent = 0.0
+            try:
+                _sell_spent = float((order_resp.get("return") or {}).get(spend_key) or 0.0)
+            except (TypeError, ValueError):
+                _sell_spent = 0.0
+
+            if _sell_spent > 0:
+                sold_amount += _sell_spent
+                _chase_amount -= _sell_spent
+                if _chase_amount <= 0:
+                    break  # Fully filled
+                # Partial fill — continue chase for remainder.
+                logger.info(
+                    "force_sell chase[%d] partial fill %.8f, remaining %.8f (pair=%s)",
+                    _chase_i + 1, _sell_spent, _chase_amount, pair,
+                )
+                continue
+
+        # ── Market fallback if chase exhausted ───────────────────────────────
+        # Use market fallback for ANY remaining unsold amount (not just when
+        # nothing was sold).  This ensures TP-triggered sells and force-sells
+        # are fully completed instead of being left as pending_sell.
+        if _chase_amount > 0 and self.config.order_timeout_to_market:
+            _prev_oid = str(
+                (order_resp.get("return") or {}).get("order_id")
+                or order_resp.get("order_id")
+                or ""
+            )
+            if _prev_oid:
+                try:
+                    self.client.cancel_order(pair, _prev_oid, "sell")
+                except Exception:
+                    pass
+            # Use a very low market price to ensure fill.
+            market_price = reference_price * (1 - entry_aggr * (_max_chase + 1))
+            if callable(_fmt_price):
+                market_price, _ = _fmt_price(pair, market_price)
+            if market_price > 0 and (effective_min_idr <= 0 or _chase_amount * market_price >= effective_min_idr):
+                logger.info(
+                    "force_sell: chase exhausted — market-price sell at Rp%.2f (pair=%s)",
+                    market_price, pair,
+                )
+                try:
+                    order_resp = self.client.create_order(pair, "sell", market_price, _chase_amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    _sell_spent = 0.0
+                    try:
+                        _sell_spent = float((order_resp.get("return") or {}).get(spend_key) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    if _sell_spent > 0:
+                        sold_amount += _sell_spent
+                        _chase_amount -= _sell_spent
+                        reference_price = market_price
+                except Exception as _mkt_exc:
+                    logger.warning("force_sell: market fallback failed for %s: %s", pair, _mkt_exc)
+
+        # ── Record result ────────────────────────────────────────────────────
+        if sold_amount > 0:
+            _tracker.record_trade("sell", reference_price, sold_amount)
+            # If only partially sold, mark the remaining unsold amount as
+            # pending_sell so the monitoring loop retries the remainder on the
+            # next cycle instead of silently losing it.
+            if _chase_amount > 0 and _tracker.base_position > 0:
+                logger.info(
+                    "force_sell: partial fill %.8f sold, %.8f remaining — marking remainder pending (pair=%s)",
+                    sold_amount, _chase_amount, pair,
+                )
+                _tracker.mark_pending_sell(_chase_amount, reference_price)
+                self._persist_after_trade(pair)
+                return {
+                    "status": "pending_sell",
+                    "action": "sell",
+                    "pair": pair,
+                    "price": reference_price,
+                    "amount": sold_amount,
+                    "remaining": _chase_amount,
+                    "order": order_resp,
+                    "portfolio": _tracker.as_dict(reference_price),
+                }
+            if self.multi_manager is not None and _tracker.base_position <= 0:
+                self.multi_manager.return_position_cash(pair)
+            if _tracker.base_position <= 0:
+                self._remove_position_feed(pair)
+            getattr(self.client, "invalidate_open_orders_cache", lambda p: None)(pair)
+            outcome = {
+                "status": "force_sold",
+                "action": "sell",
+                "pair": pair,
+                "price": reference_price,
+                "amount": sold_amount,
+                "order": order_resp,
+                "portfolio": _tracker.as_dict(reference_price),
+            }
+            self._persist_after_trade(pair)
+            return outcome
+
+        # Sell not filled after chase — mark as pending so the monitoring loop
+        # retries on the next cycle (mirrors the buy-side pending mechanism).
+        logger.info(
+            "force_sell: sell not filled after %d chase retries (pair=%s) — marking pending for resume",
+            _max_chase, pair,
+        )
+        _tracker.mark_pending_sell(amount, reference_price)
+        self._persist_after_trade(pair)
+        return {
+            "status": "pending_sell",
             "action": "sell",
             "pair": pair,
             "price": reference_price,
             "amount": amount,
-            "order": order_resp,
             "portfolio": _tracker.as_dict(reference_price),
         }
-        self._persist_after_trade(pair)
-        return outcome
 
     _MAX_SCAN_RETRIES = 3
     _SCAN_BACKOFF_BASE = 2.0  # seconds for the first retry; doubles each attempt (2 → 4 → 8 …)
@@ -3460,7 +5897,7 @@ class Trader:
             if decision.action == "hold":
                 # Keep the best hold so we can return real data in the fallback
                 # instead of triggering another REST round-trip.
-                score = self._score_snapshot(snapshot)
+                score = self._enhanced_score_snapshot(snapshot)
                 if score > best_hold_score:
                     best_hold_score = score
                     best_hold_pair = pair
@@ -3471,13 +5908,13 @@ class Trader:
             # treat it as "hold" here so the scanner continues looking for BUY
             # opportunities on other pairs instead of returning early.
             if decision.action == "sell" and self._active_tracker(pair).base_position <= 0:
-                score = self._score_snapshot(snapshot)
+                score = self._enhanced_score_snapshot(snapshot)
                 if score > best_hold_score:
                     best_hold_score = score
                     best_hold_pair = pair
                     best_hold_snapshot = snapshot
                 continue
-            score = self._score_snapshot(snapshot)
+            score = self._enhanced_score_snapshot(snapshot)
             if score > best_score:
                 best_score = score
                 best_snapshot = snapshot

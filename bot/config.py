@@ -121,6 +121,41 @@ class BotConfig:
     entry_aggressiveness_pct: float = 0.0005
     # Extra bump used for a one-off retry when the first buy attempt isn't filled.
     entry_retry_aggressiveness_pct: float = 0.001
+    # ── Professional Order Execution ──────────────────────────────────────────
+    # Chase algorithm: max retries following price when order is not filled.
+    # Each retry re-reads the orderbook and adjusts the limit price.
+    # 0 = fall back to legacy single-retry behaviour.  Recommended: 1–5.
+    chase_max_retries: int = 5
+    # After all chase retries are exhausted, convert the unfilled remainder to
+    # a market-price order so the bot does not miss the move entirely.
+    order_timeout_to_market: bool = True
+    # Maximum seconds the monitoring loop waits before retrying a pending
+    # (unfilled) buy order.  Keeps exposure time short so capital is not
+    # locked up waiting for a fill.
+    resume_buy_wait_seconds: int = 20
+    # Smart entry buffer: when enabled, the bot waits for one additional
+    # confirmation read of the orderbook (spread + direction check) before
+    # committing the very first buy order.  Helps avoid false breakouts.
+    smart_entry_buffer_enabled: bool = True
+    # ── Entry quality scoring ─────────────────────────────────────────────────
+    # Multi-signal quality check before buying.  The bot aggregates signals
+    # (regime, trend, orderbook, volume acceleration, micro-trend) into a
+    # 0→1 score and skips buys when the score is below this threshold.
+    # Higher values → pickier entry, lower values → more aggressive.
+    # 0 disables the check entirely.
+    entry_quality_min_score: float = 0.25
+    # Adaptive limit order: when enabled, the first buy order is placed
+    # slightly above best_bid (passive) rather than at best_ask (aggressive).
+    # This gives a better fill price when the market isn't trending hard.
+    # If the order doesn't fill, the chase algorithm takes over and moves
+    # the price toward best_ask.  For sell, the initial order is placed
+    # slightly below best_ask for a similar passive advantage.
+    adaptive_order_enabled: bool = True
+    # Minimum orderbook volume (in IDR) required before entering a trade.
+    # The bot sums the top 5 levels of bids and asks.  When the total
+    # volume is below this threshold the trade is skipped (liquidity too
+    # thin).  Set to 0 to disable the check.
+    min_orderbook_volume_idr: float = 0.0
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
@@ -140,7 +175,8 @@ class BotConfig:
     state_backup_interval: int = 10  # save a backup copy every N scan cycles (0 = disabled)
     # Minimum 24-h IDR trading volume a pair must have to be analysed.
     # Pairs below this threshold are skipped during multi-pair scanning.
-    # Set to 0 to disable the filter (default).
+    # Set to 0 to disable the filter (default for direct instantiation).
+    # from_env() uses 500_000 as the default to filter dead/"koin sepi" pairs.
     min_volume_idr: float = 0.0
     # Optional path to a log file.  When set, every log line is written to
     # both stdout/stderr *and* this file.  Rotation is not handled here;
@@ -225,7 +261,8 @@ class BotConfig:
     # equivalent to the per-coin exposure cap at the portfolio level.
     max_portfolio_risk_pct: float = 0.0
     # Minimum total order-book depth (sum of top-20 bid and ask levels in IDR)
-    # a pair must have before it is analysed.  0 = no filter (default).
+    # a pair must have before it is analysed.  Set to 0 to disable (default
+    # for direct instantiation).  from_env() uses 100_000 as the default.
     min_liquidity_depth_idr: float = 0.0
     # Profit-buffer drawdown protection: stop new buys when the profit buffer
     # has fallen more than this fraction from its all-time peak.
@@ -630,6 +667,20 @@ class BotConfig:
     spread_expansion_multiplier: float = 2.0  # current > this * recent_avg = expanding
     spread_expansion_window: int = 10  # recent candle count to build spread baseline
 
+    # ── Market Data Infrastructure ────────────────────────────────────────────
+    # Settings for the market data feed (historical storage, tick processing,
+    # anomaly detection, cross-exchange comparison, latency monitoring, etc.).
+    market_data_enabled: bool = False
+    market_data_dir: str = "market_data"
+    market_data_max_ticks: int = 100_000
+    market_data_tick_window: float = 60.0
+    market_data_large_trade_idr: float = 10_000_000.0
+    market_data_stale_seconds: float = 120.0
+    market_data_anomaly_price_pct: float = 0.05
+    market_data_anomaly_volume_mult: float = 5.0
+    market_data_anomaly_spread_mult: float = 3.0
+    market_data_anomaly_crash_pct: float = 0.10
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         existing_keys = set(os.environ.keys())
@@ -673,6 +724,13 @@ class BotConfig:
             max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", "0.001"),
             entry_aggressiveness_pct=_env_float("ENTRY_AGGRESSIVENESS_PCT", "0.0005"),
             entry_retry_aggressiveness_pct=_env_float("ENTRY_RETRY_AGGRESSIVENESS_PCT", "0.001"),
+            chase_max_retries=_env_int("CHASE_MAX_RETRIES", "5"),
+            order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
+            resume_buy_wait_seconds=_env_int("RESUME_BUY_WAIT_SECONDS", "20"),
+            smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "true").lower() in {"1", "true", "yes"},
+            entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.35"),
+            adaptive_order_enabled=os.getenv("ADAPTIVE_ORDER_ENABLED", "true").lower() in {"1", "true", "yes"},
+            min_orderbook_volume_idr=_env_float("MIN_ORDERBOOK_VOLUME_IDR", "0"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
             target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
             max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),
@@ -685,7 +743,7 @@ class BotConfig:
             trade_mode=os.getenv("TRADE_MODE", "continuous").lower(),
             state_path=Path(os.getenv("STATE_PATH", "bot_state.json")),
             state_backup_interval=_env_int("STATE_BACKUP_INTERVAL", "10"),
-            min_volume_idr=_env_float("MIN_VOLUME_IDR", "0"),
+            min_volume_idr=_env_float("MIN_VOLUME_IDR", "500000"),
             log_file=os.getenv("LOG_FILE") or None,
             telegram_token=os.getenv("TELEGRAM_TOKEN") or None,
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
@@ -708,7 +766,7 @@ class BotConfig:
             adaptive_interval_enabled=os.getenv("ADAPTIVE_INTERVAL_ENABLED", "false").lower() in {"1", "true", "yes"},
             adaptive_interval_min_seconds=_env_int("ADAPTIVE_INTERVAL_MIN_SECONDS", "30"),
             max_portfolio_risk_pct=_env_float("MAX_PORTFOLIO_RISK_PCT", "0"),
-            min_liquidity_depth_idr=_env_float("MIN_LIQUIDITY_DEPTH_IDR", "0"),
+            min_liquidity_depth_idr=_env_float("MIN_LIQUIDITY_DEPTH_IDR", "100000"),
             profit_buffer_drawdown_pct=_env_float("PROFIT_BUFFER_DRAWDOWN_PCT", "0"),
             trailing_tp_pct=_env_float("TRAILING_TP_PCT", "0.02"),
             conditional_tp_min_trend_strength=_env_float("CONDITIONAL_TP_MIN_TREND_STRENGTH", "0"),
@@ -824,6 +882,17 @@ class BotConfig:
             spread_expansion_enabled=os.getenv("SPREAD_EXPANSION_ENABLED", "false").lower() in {"1", "true", "yes"},
             spread_expansion_multiplier=_env_float("SPREAD_EXPANSION_MULTIPLIER", "2.0"),
             spread_expansion_window=_env_int("SPREAD_EXPANSION_WINDOW", "10"),
+            # Market Data Infrastructure
+            market_data_enabled=os.getenv("MARKET_DATA_ENABLED", "false").lower() in {"1", "true", "yes"},
+            market_data_dir=os.getenv("MARKET_DATA_DIR", "market_data"),
+            market_data_max_ticks=_env_int("MARKET_DATA_MAX_TICKS", "100000"),
+            market_data_tick_window=_env_float("MARKET_DATA_TICK_WINDOW", "60"),
+            market_data_large_trade_idr=_env_float("MARKET_DATA_LARGE_TRADE_IDR", "10000000"),
+            market_data_stale_seconds=_env_float("MARKET_DATA_STALE_SECONDS", "120"),
+            market_data_anomaly_price_pct=_env_float("MARKET_DATA_ANOMALY_PRICE_PCT", "0.05"),
+            market_data_anomaly_volume_mult=_env_float("MARKET_DATA_ANOMALY_VOLUME_MULT", "5"),
+            market_data_anomaly_spread_mult=_env_float("MARKET_DATA_ANOMALY_SPREAD_MULT", "3"),
+            market_data_anomaly_crash_pct=_env_float("MARKET_DATA_ANOMALY_CRASH_PCT", "0.10"),
         )
         cfg._validate()
         return cfg
@@ -865,6 +934,10 @@ class BotConfig:
             raise ValueError("ENTRY_AGGRESSIVENESS_PCT must be non-negative")
         if self.entry_retry_aggressiveness_pct < 0:
             raise ValueError("ENTRY_RETRY_AGGRESSIVENESS_PCT must be non-negative")
+        if self.chase_max_retries < 0:
+            raise ValueError("CHASE_MAX_RETRIES must be non-negative")
+        if self.resume_buy_wait_seconds < 0:
+            raise ValueError("RESUME_BUY_WAIT_SECONDS must be non-negative")
         if self.initial_capital <= 0:
             raise ValueError("INITIAL_CAPITAL must be positive (e.g. INITIAL_CAPITAL=1000000)")
         if self.staged_entry_steps <= 0:

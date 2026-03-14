@@ -1054,3 +1054,53 @@ class WsDepthAndTradesInScanTests(unittest.TestCase):
 
         # With WS data absent, REST /depth must still NOT be called
         self.assertEqual(client.depth_calls, 0)
+
+
+class WsZombieConnectionTests(unittest.TestCase):
+    """Verify that the WS reconnection loop does NOT create zombie connections.
+
+    The fix replaces the old ``wst.join(timeout=30.0)`` pattern (which could
+    time out while the connection was still healthy, causing the loop to create
+    *another* connection) with an indefinite wait loop that checks the stop
+    signal periodically.
+    """
+
+    def test_realtime_feed_waits_for_ws_thread_to_finish(self):
+        """RealtimeFeed._run_websocket must block until the WS thread dies, not
+        use a fixed 30-second timeout that would accumulate zombie sockets."""
+        import inspect
+        from bot.realtime import RealtimeFeed
+        source = inspect.getsource(RealtimeFeed._run_websocket)
+        # Must NOT contain the old fixed-timeout join pattern
+        self.assertNotIn("join(timeout=30", source,
+                         "Fixed 30s join timeout causes zombie connections")
+        # Must contain the polling loop that waits for the thread to actually finish
+        self.assertIn("while wst.is_alive()", source,
+                       "Missing indefinite wait loop for WS thread")
+        # Must force-close the WebSocket when stop is requested
+        self.assertIn("ws_app.close()", source,
+                       "Missing ws_app.close() for clean shutdown")
+
+    def test_multi_pair_feed_waits_for_ws_thread_to_finish(self):
+        """MultiPairFeed._run_ws_centrifuge must block until the WS thread dies."""
+        import inspect
+        from bot.realtime import MultiPairFeed
+        source = inspect.getsource(MultiPairFeed._run_ws_centrifuge)
+        self.assertNotIn("join(timeout=30", source,
+                         "Fixed 30s join timeout causes zombie connections")
+        self.assertIn("while wst.is_alive()", source,
+                       "Missing indefinite wait loop for WS thread")
+        self.assertIn("ws_app.close()", source,
+                       "Missing ws_app.close() for clean shutdown")
+
+    def test_private_feed_waits_for_ws_thread_to_finish(self):
+        """PrivateFeed._connect_once must block until the WS thread dies."""
+        import inspect
+        from bot.realtime import PrivateFeed
+        source = inspect.getsource(PrivateFeed._connect_once)
+        self.assertNotIn("join(timeout=30", source,
+                         "Fixed 30s join timeout causes zombie connections")
+        self.assertIn("while wst.is_alive()", source,
+                       "Missing indefinite wait loop for WS thread")
+        self.assertIn("ws_app.close()", source,
+                       "Missing ws_app.close() for clean shutdown")

@@ -2,7 +2,7 @@ import unittest
 
 from bot.config import BotConfig
 from bot.grid import build_grid_plan
-from bot.strategies import StrategyDecision, make_trade_decision, select_strategy, _position_size, confidence_position_pct
+from bot.strategies import StrategyDecision, make_trade_decision, select_strategy, _position_size, confidence_position_pct, score_strategies
 from bot.analysis import (
     OrderbookInsight,
     TrendResult,
@@ -717,3 +717,278 @@ class ObImbalanceEntryFilterTest(unittest.TestCase):
         dec = make_trade_decision(trend, ob, vol, 100.0, cfg)
         # Not filtered — uptrend should still produce buy
         self.assertEqual(dec.action, "buy")
+
+
+# ── Tests for confidence_tier_skip alignment with min_confidence ──────────
+
+
+class TestConfidenceTierSkipAlignment(unittest.TestCase):
+    """Verify that confidence_position_pct aligns tier_skip with min_confidence."""
+
+    def _cfg(self, **kw) -> BotConfig:
+        defaults = dict(
+            api_key=None, dry_run=True,
+            confidence_position_sizing_enabled=True,
+            confidence_tier_skip=0.40,
+            confidence_tier_low=0.50,
+            confidence_tier_mid=0.65,
+            confidence_tier_high=0.80,
+            confidence_tier_low_pct=0.10,
+            confidence_tier_mid_pct=0.15,
+            confidence_tier_high_pct=0.20,
+            confidence_tier_max_pct=0.25,
+            initial_capital=1_000_000.0,
+        )
+        defaults.update(kw)
+        return BotConfig(**defaults)
+
+    def test_below_both_thresholds_returns_zero(self):
+        """Confidence below both min_confidence and tier_skip → 0."""
+        cfg = self._cfg(min_confidence=0.52)
+        self.assertEqual(confidence_position_pct(0.30, cfg), 0.0)
+        self.assertEqual(confidence_position_pct(0.39, cfg), 0.0)
+
+    def test_lowered_min_confidence_opens_low_tier(self):
+        """When min_confidence < tier_skip, signals between them get low tier."""
+        cfg = self._cfg(min_confidence=0.30, confidence_tier_skip=0.40)
+        # 0.374 is above min_confidence (0.30) but below tier_skip (0.40)
+        # With alignment, effective_skip = min(0.40, 0.30) = 0.30
+        # 0.374 >= 0.30 and < 0.50 → low tier
+        self.assertEqual(confidence_position_pct(0.374, cfg), 0.10)
+
+    def test_at_min_confidence_boundary(self):
+        """Confidence exactly at min_confidence → low tier."""
+        cfg = self._cfg(min_confidence=0.30)
+        self.assertEqual(confidence_position_pct(0.30, cfg), 0.10)
+
+    def test_below_min_confidence_still_zero(self):
+        """Confidence below the lowered min_confidence → 0."""
+        cfg = self._cfg(min_confidence=0.30)
+        self.assertEqual(confidence_position_pct(0.29, cfg), 0.0)
+
+    def test_default_min_confidence_no_change(self):
+        """Default min_confidence (0.52) > tier_skip (0.40) → tier_skip unchanged."""
+        cfg = self._cfg(min_confidence=0.52)
+        # effective_skip = min(0.40, 0.52) = 0.40 → same as before
+        self.assertEqual(confidence_position_pct(0.39, cfg), 0.0)
+        self.assertEqual(confidence_position_pct(0.40, cfg), 0.10)
+
+
+# ── Tests for _position_size fallback minimum sizing ─────────────────────
+
+
+class TestPositionSizeFallback(unittest.TestCase):
+    """Verify fallback sizing when primary methods yield 0 but capital available."""
+
+    def _cfg(self, **kw) -> BotConfig:
+        defaults = dict(
+            api_key=None, dry_run=True,
+            min_order_idr=30_000.0,
+            initial_capital=1_000_000.0,
+        )
+        defaults.update(kw)
+        return BotConfig(**defaults)
+
+    def test_confidence_fallback_above_min_confidence(self):
+        """Confidence above min_confidence but below tier_skip → fallback size."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=True,
+            min_confidence=0.20,
+            confidence_tier_skip=0.40,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        # confidence 0.25 > min_confidence 0.20 but < tier_skip 0.40
+        # With alignment effective_skip = min(0.40, 0.20) = 0.20
+        # 0.25 >= 0.20 → tier_low → 10% not fallback
+        size = _position_size(3000.0, 2900.0, cfg, 100.0, 0.25, vol, 1_000_000.0)
+        self.assertGreater(size, 0.0)
+
+    def test_confidence_fallback_below_min_confidence(self):
+        """Confidence below min_confidence → returns 0 (no fallback)."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=True,
+            min_confidence=0.52,
+            confidence_tier_skip=0.40,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        size = _position_size(3000.0, 2900.0, cfg, 100.0, 0.35, vol, 1_000_000.0)
+        self.assertEqual(size, 0.0)
+
+    def test_risk_based_fallback_no_stop_loss(self):
+        """No stop loss but confidence passed gate → fallback min order size."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=False,
+            min_confidence=0.30,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        # stop_loss=None, risk_per_unit=0 → normally returns 0
+        # but confidence 0.374 >= min_confidence 0.30 → fallback
+        size = _position_size(3000.0, None, cfg, 0.0, 0.374, vol, 1_000_000.0)
+        expected_min = 30_000.0 / 3000.0
+        self.assertGreater(size, 0.0)
+        self.assertAlmostEqual(size, expected_min, delta=0.01)
+
+    def test_risk_based_no_fallback_below_min_confidence(self):
+        """No stop loss and confidence below gate → returns 0."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=False,
+            min_confidence=0.52,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        size = _position_size(3000.0, None, cfg, 0.0, 0.35, vol, 1_000_000.0)
+        self.assertEqual(size, 0.0)
+
+    def test_fallback_respects_insufficient_capital(self):
+        """When capital can't cover min order, fallback doesn't apply."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=True,
+            min_confidence=0.20,
+            min_order_idr=30_000.0,
+            initial_capital=20_000.0,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        # capital 20k < min_order 30k * 1.003 → no fallback
+        size = _position_size(3000.0, 2900.0, cfg, 100.0, 0.15, vol, 20_000.0)
+        self.assertEqual(size, 0.0)
+
+
+# ── Effective min confidence parameter tests ──────────────────────────────────
+class EffectiveMinConfidenceTests(unittest.TestCase):
+    """Tests for the effective_min_confidence parameter in _position_size()."""
+
+    @staticmethod
+    def _cfg(**kw):
+        defaults = dict(
+            api_key=None,
+            initial_capital=1_000_000.0,
+            min_order_idr=30_000.0,
+        )
+        defaults.update(kw)
+        return BotConfig(**defaults)
+
+    def test_effective_min_confidence_overrides_config(self):
+        """When effective_min_confidence is lower, signals that would be rejected
+        by config.min_confidence (0.52) should get a fallback size."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=False,
+            min_confidence=0.52,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        # confidence 0.374 < config.min_confidence 0.52 → normally returns 0
+        size_without = _position_size(3000.0, None, cfg, 0.0, 0.374, vol, 1_000_000.0)
+        self.assertEqual(size_without, 0.0)
+
+        # With effective_min_confidence=0.30, confidence 0.374 >= 0.30 → gets fallback
+        size_with = _position_size(
+            3000.0, None, cfg, 0.0, 0.374, vol, 1_000_000.0,
+            effective_min_confidence=0.30,
+        )
+        self.assertGreater(size_with, 0.0)
+
+    def test_effective_min_confidence_tier_mode(self):
+        """effective_min_confidence also works with confidence-tier sizing."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=True,
+            min_confidence=0.52,
+            confidence_tier_skip=0.40,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        # Without effective_min_confidence: confidence 0.35 < config.min_confidence 0.52
+        # and < tier_skip 0.40 → returns 0
+        size_without = _position_size(3000.0, None, cfg, 0.0, 0.35, vol, 1_000_000.0)
+        self.assertEqual(size_without, 0.0)
+
+        # With effective_min_confidence=0.30: 0.35 >= 0.30 → gets fallback
+        size_with = _position_size(
+            3000.0, None, cfg, 0.0, 0.35, vol, 1_000_000.0,
+            effective_min_confidence=0.30,
+        )
+        self.assertGreater(size_with, 0.0)
+
+    def test_none_effective_min_confidence_uses_config(self):
+        """When effective_min_confidence is None, uses config.min_confidence."""
+        cfg = self._cfg(
+            confidence_position_sizing_enabled=False,
+            min_confidence=0.52,
+        )
+        vol = VolatilityStats(volatility=0.02, avg_volume=1000.0)
+        size = _position_size(3000.0, None, cfg, 0.0, 0.35, vol, 1_000_000.0,
+                              effective_min_confidence=None)
+        self.assertEqual(size, 0.0)
+
+
+# ── Scalping strategy optimization tests ──────────────────────────────────────
+class ScalpingStrategyOptimizationTests(unittest.TestCase):
+    """Tests for the widened scalping strategy thresholds."""
+
+    def test_scalping_selected_wider_spread(self):
+        """Scalping should be selected with spread up to 0.3% (was 0.15%)."""
+        trend = TrendResult(direction="flat", strength=0.005, fast_ma=100.0, slow_ma=100.0)
+        # 0.25% spread — was rejected before, should now be accepted
+        orderbook = OrderbookInsight(
+            spread_pct=0.0025, imbalance=0.30, bid_volume=100.0, ask_volume=80.0,
+        )
+        vol = VolatilityStats(volatility=0.008, avg_volume=1000.0)
+        strategy = select_strategy(trend, orderbook, vol)
+        self.assertEqual(strategy, "scalping")
+
+    def test_scalping_selected_moderate_volatility(self):
+        """Scalping should work with volatility up to 1.5% (was 1.0%)."""
+        trend = TrendResult(direction="flat", strength=0.005, fast_ma=100.0, slow_ma=100.0)
+        orderbook = OrderbookInsight(
+            spread_pct=0.001, imbalance=0.30, bid_volume=100.0, ask_volume=80.0,
+        )
+        # 1.2% volatility — was rejected before (> 0.01), now accepted (< 0.015)
+        vol = VolatilityStats(volatility=0.012, avg_volume=1000.0)
+        strategy = select_strategy(trend, orderbook, vol)
+        self.assertEqual(strategy, "scalping")
+
+    def test_scalping_score_wider_imbalance(self):
+        """Scalping score should benefit from imbalance > 0.20 (was 0.25)."""
+        trend = TrendResult(direction="flat", strength=0.005, fast_ma=100.0, slow_ma=100.0)
+        orderbook = OrderbookInsight(
+            spread_pct=0.001, imbalance=0.22, bid_volume=100.0, ask_volume=80.0,
+        )
+        vol = VolatilityStats(volatility=0.008, avg_volume=1000.0)
+        scores = score_strategies(trend, orderbook, vol)
+        self.assertGreater(scores["scalping"], 0.6)
+
+    def test_day_trading_wider_volatility_range(self):
+        """Day trading should accept volatility from 0.5% (was 1.0%)."""
+        trend = TrendResult(direction="up", strength=0.02, fast_ma=101.0, slow_ma=100.0)
+        orderbook = OrderbookInsight(
+            spread_pct=0.01, imbalance=0.1, bid_volume=100.0, ask_volume=100.0,
+        )
+        vol = VolatilityStats(volatility=0.007, avg_volume=1000.0)
+        strategy = select_strategy(trend, orderbook, vol)
+        self.assertEqual(strategy, "day_trading")
+
+
+# ── Trailing TP committed sell tests ──────────────────────────────────────────
+class TrailingTPCommittedSellTests(unittest.TestCase):
+    """Tests for the tp_sell_committed flag in PortfolioTracker."""
+
+    def test_commit_tp_sell_flag(self):
+        """commit_tp_sell() sets the flag, cleared on position close."""
+        from bot.tracking import PortfolioTracker
+        t = PortfolioTracker(1_000_000.0, 0.20, 0.10)
+        self.assertFalse(t.tp_sell_committed)
+
+        t.commit_tp_sell()
+        self.assertTrue(t.tp_sell_committed)
+
+        # Record a buy then a sell (full close) to reset
+        t.record_trade("buy", 100.0, 10.0)
+        t.record_trade("sell", 110.0, 10.0)
+        self.assertFalse(t.tp_sell_committed)
+
+    def test_cancel_pending_buy_clears_flag(self):
+        """cancel_pending_buy() also clears the committed flag."""
+        from bot.tracking import PortfolioTracker
+        t = PortfolioTracker(1_000_000.0, 0.20, 0.10)
+        t.record_trade("buy", 100.0, 10.0)
+        t.commit_tp_sell()
+        self.assertTrue(t.tp_sell_committed)
+
+        t.cancel_pending_buy()
+        self.assertFalse(t.tp_sell_committed)
