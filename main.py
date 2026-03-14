@@ -1250,7 +1250,12 @@ def main() -> None:
                             _BOLD, held_pair, _RESET,
                             _cancel_reason,
                         )
+                        # Cancel any live exchange orders before clearing the
+                        # in-memory tracker state — otherwise the orders remain
+                        # open on the exchange and may fill unexpectedly.
+                        trader._cancel_open_orders(held_pair, ("buy",))
                         held_tracker.cancel_pending_buy()
+                        trader._resume_buy_retry_counts.pop(held_pair, None)
                         if hasattr(trader, 'multi_manager') and trader.multi_manager is not None:
                             trader.multi_manager.return_position_cash(held_pair)
                         trader._persist_after_trade(held_pair)

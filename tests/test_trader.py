@@ -8642,3 +8642,209 @@ class FromEnvProtectiveDefaultsTests(unittest.TestCase):
             cfg = BotConfig.from_env()
             self.assertEqual(cfg.min_volume_idr, 0.0)
             self.assertEqual(cfg.min_liquidity_depth_idr, 0.0)
+
+
+class ResumeBuyPriceTierTests(unittest.TestCase):
+    """Tests for the 3-tier price strategy in resume_pending_buy.
+
+    Tier 0 (retry_count % 3 == 0): above best_ask (aggressive)
+    Tier 1 (retry_count % 3 == 1): at best_ask (same / neutral)
+    Tier 2 (retry_count % 3 == 2): at best_bid (below / passive)
+    """
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=0.0,
+            entry_retry_aggressiveness_pct=0.002,
+            order_timeout_to_market=False,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair="btc_idr", price=100.0):
+        return {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action="hold",
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=0.0,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+
+    def _make_client(self, ask=101.0, bid=99.0, fill_amount=0.0):
+        """Create a minimal stub client with configurable depth and order response."""
+        class _Client:
+            def __init__(self, ask, bid, fill_amount):
+                self._ask = ask
+                self._bid = bid
+                self._fill_amount = fill_amount
+                self.last_order_price = None
+                self._pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {
+                    "sell": [[str(self._ask), "1"]],
+                    "buy": [[str(self._bid), "1"]],
+                }
+
+            def create_order(self, pair, action, price, amount):
+                self.last_order_price = price
+                coin = pair.split("_")[0]
+                return {
+                    "success": 1,
+                    "return": {
+                        f"receive_{coin}": str(self._fill_amount),
+                        "order_id": "999",
+                    },
+                }
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"btc": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": []}}
+
+        return _Client(ask, bid, fill_amount)
+
+    def test_tier_0_uses_above_ask(self):
+        """First retry (count=0) should price above best_ask."""
+        cfg = self._make_config()
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.0)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 0  # tier 0
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+
+        # Tier 0: best_ask * (1 + aggr) = 100 * 1.002
+        self.assertAlmostEqual(client.last_order_price, 100.0 * 1.002, places=4)
+
+    def test_tier_1_uses_ask(self):
+        """Second retry (count=1) should price at best_ask (neutral)."""
+        cfg = self._make_config()
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.0)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 1  # tier 1
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+
+        # Tier 1: best_ask = 100.0 exactly
+        self.assertAlmostEqual(client.last_order_price, 100.0, places=4)
+
+    def test_tier_2_uses_bid(self):
+        """Third retry (count=2) should price at best_bid (passive/below)."""
+        cfg = self._make_config()
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.0)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 2  # tier 2
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+
+        # Tier 2: best_bid = 98.0
+        self.assertAlmostEqual(client.last_order_price, 98.0, places=4)
+
+    def test_tier_cycles_back_to_above(self):
+        """Tier 3 (count=3) should cycle back to 'above' (tier 0 behaviour)."""
+        cfg = self._make_config()
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.0)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 3  # tier 3 == tier 0
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+
+        self.assertAlmostEqual(client.last_order_price, 100.0 * 1.002, places=4)
+
+    def test_retry_counter_increments_each_call(self):
+        """Counter should advance by 1 on each resume_pending_buy call."""
+        cfg = self._make_config()
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.0)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 0
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+        self.assertEqual(trader._resume_buy_retry_counts.get("btc_idr"), 1)
+
+        # Add pending again and call once more
+        tracker.mark_pending_buy(0.001, 100.0)
+        trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+        self.assertEqual(trader._resume_buy_retry_counts.get("btc_idr"), 2)
+
+    def test_retry_counter_cleared_on_fill(self):
+        """Counter must be reset when the order is filled."""
+        cfg = self._make_config()
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.001)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 5  # non-zero
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        result = trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+
+        self.assertEqual(result["status"], "resumed")
+        self.assertNotIn("btc_idr", trader._resume_buy_retry_counts)
+
+    def test_retry_counter_cleared_on_cancelled_below_min(self):
+        """Counter must be reset when the pending buy is cancelled (below min)."""
+        cfg = self._make_config(min_order_idr=999_999.0)  # very high min so it cancels
+        client = self._make_client(ask=100.0, bid=98.0, fill_amount=0.0)
+        trader = Trader(cfg, client=client)
+        trader._resume_buy_retry_counts["btc_idr"] = 4
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        result = trader.resume_pending_buy(self._make_snap("btc_idr", 100.0))
+
+        self.assertEqual(result["status"], "cancelled_below_min")
+        self.assertNotIn("btc_idr", trader._resume_buy_retry_counts)
+
+    def test_new_trader_starts_with_empty_retry_counts(self):
+        """A freshly created Trader must have an empty _resume_buy_retry_counts."""
+        cfg = self._make_config()
+        trader = Trader(cfg, client=self._make_client())
+        self.assertEqual(trader._resume_buy_retry_counts, {})

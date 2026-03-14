@@ -221,6 +221,12 @@ class Trader:
         # saturate the REST rate limit.  Entries are reused until
         # config.scan_candle_cache_seconds have elapsed.
         self._candle_cache: Dict[str, Tuple[float, List[Any]]] = {}
+        # ── Resume-buy retry counters ─────────────────────────────────────────
+        # Tracks how many resume cycles have elapsed for each pair while a
+        # pending buy is outstanding.  Used by resume_pending_buy() to rotate
+        # through the 3-tier price strategy (above → same → below best_ask).
+        # Reset to 0 when the order fills or the pending state is cancelled.
+        self._resume_buy_retry_counts: Dict[str, int] = {}
 
         # ── Market Data Feed ──────────────────────────────────────────────────
         self.market_data_feed: Optional[MarketDataFeed] = None
@@ -4875,18 +4881,48 @@ class Trader:
         try:
             depth = self.client.get_depth(pair, count=5)
             asks = depth.get("sell") or []
+            bids = depth.get("buy") or []
             best_ask = float(asks[0][0]) if asks else price
+            best_bid = float(bids[0][0]) if bids else price
         except Exception:
             best_ask = price
+            best_bid = price
 
         entry_aggr = max(
             self.config.entry_retry_aggressiveness_pct,
             0.001,
         )
-        retry_price = best_ask * (1 + entry_aggr)
+
+        # ── 3-tier price strategy ─────────────────────────────────────────────
+        # Rotate through three price levels on consecutive unfilled retries:
+        #   Tier 0 (above)  — best_ask + aggr%  : aggressive, fills immediately
+        #   Tier 1 (same)   — best_ask           : neutral, at market ask
+        #   Tier 2 (below)  — best_bid           : passive, catches a dip
+        # When the price is falling, placing above market often won't fill.
+        # Cycling through tiers maximises the chance of getting the order
+        # filled while still capturing a favourable entry on dips.
+        _retry_count = self._resume_buy_retry_counts.get(pair, 0)
+        _price_tier = _retry_count % 3
+        if _price_tier == 0:
+            retry_price = best_ask * (1 + entry_aggr)  # above
+            _tier_label = "above"
+        elif _price_tier == 1:
+            retry_price = best_ask  # same / at-market
+            _tier_label = "same"
+        else:
+            retry_price = best_bid  # below / passive
+            _tier_label = "below"
+        # Advance the retry counter for next cycle.
+        self._resume_buy_retry_counts[pair] = _retry_count + 1
+
         _fmt_price = getattr(self.client, "format_price", None)
         if callable(_fmt_price):
             retry_price, _ = _fmt_price(pair, retry_price)
+
+        logger.info(
+            "resume_pending_buy: price tier %d (%s) — Rp%.2f (pair=%s)",
+            _price_tier, _tier_label, retry_price, pair,
+        )
 
         # Per-pair effective minimum.
         _get_min = getattr(self.client, "get_pair_min_order", None)
@@ -4899,6 +4935,7 @@ class Trader:
                 amount * retry_price, _eff_min_idr, pair,
             )
             _tracker.pending_orders.clear()
+            self._resume_buy_retry_counts.pop(pair, None)
             if self.multi_manager is not None:
                 self.multi_manager.return_position_cash(pair)
             return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
@@ -4925,6 +4962,7 @@ class Trader:
                     idr_balance, needed_idr, pair,
                 )
                 _tracker.pending_orders.clear()
+                self._resume_buy_retry_counts.pop(pair, None)
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
@@ -4940,6 +4978,7 @@ class Trader:
                 pair,
             )
             _tracker.pending_orders.clear()
+            self._resume_buy_retry_counts.pop(pair, None)
             if self.multi_manager is not None:
                 self.multi_manager.return_position_cash(pair)
             return {"status": "cancelled_zero", "pair": pair, "price": retry_price}
@@ -4959,6 +4998,7 @@ class Trader:
                     "Resume pending buy hit exchange minimum — cancelling (pair=%s)", pair,
                 )
                 _tracker.pending_orders.clear()
+                self._resume_buy_retry_counts.pop(pair, None)
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
@@ -4967,6 +5007,7 @@ class Trader:
                     "Resume pending buy: insufficient balance — cancelling (pair=%s)", pair,
                 )
                 _tracker.pending_orders.clear()
+                self._resume_buy_retry_counts.pop(pair, None)
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_insufficient", "pair": pair, "price": retry_price}
@@ -4993,6 +5034,8 @@ class Trader:
 
         if received > 0:
             _tracker.record_trade("buy", retry_price, received)
+            # Reset the price-tier retry counter now that the order is filled.
+            self._resume_buy_retry_counts.pop(pair, None)
             remaining_buy = amount - received
             # Partial fill: record filled portion and re-mark the remaining
             # amount as pending_buy so it is retried on the next cycle.
@@ -5057,6 +5100,7 @@ class Trader:
                         pass
                     if _mkt_received > 0:
                         _tracker.record_trade("buy", market_price, _mkt_received)
+                        self._resume_buy_retry_counts.pop(pair, None)
                         self._ensure_position_feed(pair)
                         self._persist_after_trade(pair)
                         return {
