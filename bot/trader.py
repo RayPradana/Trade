@@ -2619,17 +2619,55 @@ class Trader:
         except (ValueError, TypeError):
             top_ask = price
         reference_price = top_ask if decision.action == "buy" else top_bid
-        # Make entries slightly more aggressive (within slippage guard) to
-        # improve the likelihood of an immediate fill instead of sitting at the
-        # back of the queue at the same best price.
+        # ── Adaptive Limit Order ──────────────────────────────────────────────
+        # When enabled, the first buy order is placed slightly above best_bid
+        # (passive) instead of at best_ask (aggressive).  This gives a better
+        # fill price in a range-bound market.  If the order is not filled, the
+        # chase algorithm progressively moves the price toward best_ask.
+        # For sell, place slightly below best_ask for a similar passive edge.
         entry_aggr = max(0.0, self.config.entry_aggressiveness_pct)
         allowed_max = price * (1 + self.config.max_slippage_pct)
         allowed_min = price * (1 - self.config.max_slippage_pct)
-        if entry_aggr > 0:
+        if self.config.adaptive_order_enabled:
+            if decision.action == "buy" and top_bid > 0:
+                reference_price = min(top_bid * (1 + entry_aggr), allowed_max)
+            elif decision.action == "sell" and top_ask > 0:
+                reference_price = max(top_ask * (1 - entry_aggr), allowed_min)
+        elif entry_aggr > 0:
+            # Aggressive limit order: cross the spread to get an immediate fill.
             if decision.action == "buy" and top_ask > 0:
                 reference_price = min(top_ask * (1 + entry_aggr), allowed_max)
             elif decision.action == "sell" and top_bid > 0:
                 reference_price = max(top_bid * (1 - entry_aggr), allowed_min)
+
+        # ── Liquidity Check ───────────────────────────────────────────────────
+        # Before entering, sum the volume (IDR) in the top orderbook levels.
+        # If total volume is below the configured threshold, skip the trade
+        # because the market is too thin for reliable execution.
+        if self.config.min_orderbook_volume_idr > 0:
+            _bid_vol_idr = sum(
+                float(b[0]) * float(b[1]) for b in bids[:5]
+            ) if bids else 0.0
+            _ask_vol_idr = sum(
+                float(a[0]) * float(a[1]) for a in asks[:5]
+            ) if asks else 0.0
+            _total_vol_idr = _bid_vol_idr + _ask_vol_idr
+            if _total_vol_idr < self.config.min_orderbook_volume_idr:
+                logger.info(
+                    "Orderbook volume too thin on %s: Rp%.0f < min Rp%.0f — skipping %s",
+                    snapshot["pair"],
+                    _total_vol_idr,
+                    self.config.min_orderbook_volume_idr,
+                    decision.action,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"liquidity_too_thin volume=Rp{_total_vol_idr:.0f}"
+                        f" < min=Rp{self.config.min_orderbook_volume_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
 
         # ── Spread filter ─────────────────────────────────────────────────────
         # Skip any trade (buy or sell) when the bid-ask spread is too wide.
@@ -3001,11 +3039,13 @@ class Trader:
             # ── Bump up to minimum order value when possible ─────────────────
             # When the computed amount falls below the exchange minimum but the
             # available cash can cover it, raise the amount to the minimum so
-            # the trade is not unnecessarily skipped.
+            # the trade is not unnecessarily skipped.  A tiny 1e-9 buffer
+            # prevents floating-point rounding from landing exactly at the
+            # threshold where (amount * price) can round to < min_order_idr.
             if reference_price > 0 and self.config.min_order_idr > 0:
                 order_value = effective_amount * reference_price
                 if 0 < order_value < self.config.min_order_idr:
-                    min_amount = self.config.min_order_idr / reference_price
+                    min_amount = self.config.min_order_idr / reference_price * (1 + 1e-9)
                     if min_amount <= max_affordable:
                         effective_amount = min_amount
             # Log adaptive sizing tier when it's active

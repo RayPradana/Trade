@@ -132,7 +132,19 @@ class BotConfig:
     # Smart entry buffer: when enabled, the bot waits for one additional
     # confirmation read of the orderbook (spread + direction check) before
     # committing the very first buy order.  Helps avoid false breakouts.
-    smart_entry_buffer_enabled: bool = False
+    smart_entry_buffer_enabled: bool = True
+    # Adaptive limit order: when enabled, the first buy order is placed
+    # slightly above best_bid (passive) rather than at best_ask (aggressive).
+    # This gives a better fill price when the market isn't trending hard.
+    # If the order doesn't fill, the chase algorithm takes over and moves
+    # the price toward best_ask.  For sell, the initial order is placed
+    # slightly below best_ask for a similar passive advantage.
+    adaptive_order_enabled: bool = True
+    # Minimum orderbook volume (in IDR) required before entering a trade.
+    # The bot sums the top 5 levels of bids and asks.  When the total
+    # volume is below this threshold the trade is skipped (liquidity too
+    # thin).  Set to 0 to disable the check.
+    min_orderbook_volume_idr: float = 0.0
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
@@ -701,7 +713,9 @@ class BotConfig:
             entry_retry_aggressiveness_pct=_env_float("ENTRY_RETRY_AGGRESSIVENESS_PCT", "0.001"),
             chase_max_retries=_env_int("CHASE_MAX_RETRIES", "3"),
             order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
-            smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "false").lower() in {"1", "true", "yes"},
+            smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "true").lower() in {"1", "true", "yes"},
+            adaptive_order_enabled=os.getenv("ADAPTIVE_ORDER_ENABLED", "true").lower() in {"1", "true", "yes"},
+            min_orderbook_volume_idr=_env_float("MIN_ORDERBOOK_VOLUME_IDR", "0"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
             target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
             max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),

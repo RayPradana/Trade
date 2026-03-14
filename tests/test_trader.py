@@ -3496,6 +3496,8 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=15000,
+            # Use capital too small to bump amount up to minimum.
+            initial_capital=10.0,
             # disable RSI / resistance / cooldown filters so the only skip reason
             # is the min_order check
             buy_max_rsi=0.0,
@@ -3520,6 +3522,7 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=15000,
+            initial_capital=10.0,
             buy_max_rsi=0.0,
             buy_max_resistance_proximity_pct=0.0,
             pair_cooldown_seconds=0.0,
@@ -3538,6 +3541,7 @@ class ZeroAmountBuySkipTest(unittest.TestCase):
         config = BotConfig(
             api_key=None, dry_run=True,
             min_order_idr=15000,
+            initial_capital=10.0,
             buy_max_rsi=0.0,
             buy_max_resistance_proximity_pct=0.0,
             pair_cooldown_seconds=300.0,
@@ -5782,3 +5786,218 @@ class ChaseAlgorithmTests(unittest.TestCase):
         # Should have the partial fill step plus chase completion
         partial_steps = [s for s in outcome["executed_steps"] if s.get("partial")]
         self.assertGreaterEqual(len(partial_steps), 1, "Should record partial fill step")
+
+
+class AdaptiveLimitOrderTests(unittest.TestCase):
+    """Tests for the adaptive limit order feature."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    @staticmethod
+    def _dummy_client(bids=None, asks=None):
+        bids = bids or [["2699999", "1"]]
+        asks = asks or [["2700001", "1"]]
+        return type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
+        })()
+
+    def _make_snap(self, pair="test_idr", price=2_700_000.0, action="buy", amount=0.5):
+        return {
+            "pair": pair,
+            "price": price,
+            "trend": None, "orderbook": None, "volatility": None, "levels": None,
+            "indicators": None, "insufficient_data": False, "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action=action, confidence=0.9,
+                reason="test", target_price=price, amount=amount,
+                stop_loss=price * 0.95, take_profit=price * 1.05,
+            ),
+        }
+
+    def test_adaptive_buy_uses_bid_side(self):
+        """With adaptive_order_enabled, buy reference_price is based on best_bid."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            adaptive_order_enabled=True,
+            entry_aggressiveness_pct=0.001,
+            max_slippage_pct=0.05,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client(
+            bids=[["100000", "10"]],
+            asks=[["100100", "10"]],
+        )
+        snap = self._make_snap(price=100_050.0, amount=0.5)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        # Price should be based on best_bid (100000) * (1 + 0.001) = 100100,
+        # NOT on best_ask (100100) * (1 + 0.001) = 100200.1
+        self.assertAlmostEqual(outcome["price"], 100000 * 1.001, places=0)
+
+    def test_adaptive_disabled_uses_ask_side(self):
+        """With adaptive_order_enabled=False, buy uses best_ask."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            adaptive_order_enabled=False,
+            entry_aggressiveness_pct=0.001,
+            max_slippage_pct=0.05,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client(
+            bids=[["100000", "10"]],
+            asks=[["100100", "10"]],
+        )
+        snap = self._make_snap(price=100_050.0, amount=0.5)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        # Price should be based on best_ask (100100) * (1 + 0.001)
+        self.assertAlmostEqual(outcome["price"], 100100 * 1.001, places=0)
+
+    def test_adaptive_sell_uses_ask_side(self):
+        """With adaptive_order_enabled, sell reference_price is based on best_ask."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            adaptive_order_enabled=True,
+            entry_aggressiveness_pct=0.0,
+            max_slippage_pct=0.05,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+            multi_position_enabled=False,
+            target_profit_pct=99.0,
+            max_loss_pct=99.0,
+        )
+        trader = Trader(config)
+        trader.client = self._dummy_client(
+            bids=[["100000", "10"]],
+            asks=[["100100", "10"]],
+        )
+        # Set up a sell position on the main tracker
+        trader.tracker.cash = 0
+        trader.tracker.base_position = 1.0
+        trader.tracker.avg_cost = 100000.0
+        snap = self._make_snap(price=100_050.0, action="sell", amount=0.5)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+        # Sell price based on best_ask (100100) * (1 - 0) = 100100
+        self.assertAlmostEqual(outcome["price"], 100100.0, places=0)
+
+
+class LiquidityCheckTests(unittest.TestCase):
+    """Tests for the orderbook liquidity check before entry."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    @staticmethod
+    def _dummy_client(bids=None, asks=None):
+        bids = bids or [["100000", "1"]]
+        asks = asks or [["100100", "1"]]
+        return type("_C", (), {
+            "get_depth": lambda self, *a, **kw: {"buy": bids, "sell": asks},
+        })()
+
+    def _make_snap(self, pair="test_idr", price=100_050.0, action="buy", amount=0.5):
+        return {
+            "pair": pair,
+            "price": price,
+            "trend": None, "orderbook": None, "volatility": None, "levels": None,
+            "indicators": None, "insufficient_data": False, "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action=action, confidence=0.9,
+                reason="test", target_price=price, amount=amount,
+                stop_loss=price * 0.95, take_profit=price * 1.05,
+            ),
+        }
+
+    def test_liquidity_check_skips_thin_market(self):
+        """Trades should be skipped when orderbook volume < min_orderbook_volume_idr."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_orderbook_volume_idr=500_000.0,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        # bid: 100000 * 1 = 100000 IDR; ask: 100100 * 1 = 100100 IDR
+        # total = 200100 < 500000 → should skip
+        trader.client = self._dummy_client(
+            bids=[["100000", "1"]],
+            asks=[["100100", "1"]],
+        )
+        snap = self._make_snap()
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("liquidity_too_thin", outcome["reason"])
+
+    def test_liquidity_check_passes_with_sufficient_volume(self):
+        """Trades should proceed when orderbook volume >= min_orderbook_volume_idr."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_orderbook_volume_idr=100_000.0,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        # bid: 100000 * 1 = 100000 IDR; ask: 100100 * 1 = 100100 IDR
+        # total = 200100 >= 100000 → should proceed
+        trader.client = self._dummy_client(
+            bids=[["100000", "1"]],
+            asks=[["100100", "1"]],
+        )
+        snap = self._make_snap()
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "simulated")
+
+    def test_liquidity_check_disabled_by_default(self):
+        """When min_orderbook_volume_idr=0 (default), the check is disabled."""
+        config = BotConfig(
+            api_key=None, dry_run=True,
+            min_orderbook_volume_idr=0.0,
+            min_order_idr=1.0,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            smart_entry_buffer_enabled=False,
+        )
+        trader = Trader(config)
+        # Even with 1 IDR of volume, should proceed when check is disabled
+        trader.client = self._dummy_client(
+            bids=[["1", "1"]],
+            asks=[["2", "1"]],
+        )
+        snap = self._make_snap(price=1.5, amount=1.0)
+        outcome = trader.maybe_execute(snap)
+        # Should not be skipped for liquidity reasons
+        self.assertNotEqual(outcome.get("reason", ""), "liquidity_too_thin")
