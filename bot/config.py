@@ -121,6 +121,18 @@ class BotConfig:
     entry_aggressiveness_pct: float = 0.0005
     # Extra bump used for a one-off retry when the first buy attempt isn't filled.
     entry_retry_aggressiveness_pct: float = 0.001
+    # ── Professional Order Execution ──────────────────────────────────────────
+    # Chase algorithm: max retries following price when order is not filled.
+    # Each retry re-reads the orderbook and adjusts the limit price.
+    # 0 = fall back to legacy single-retry behaviour.
+    chase_max_retries: int = 3
+    # After all chase retries are exhausted, convert the unfilled remainder to
+    # a market-price order so the bot does not miss the move entirely.
+    order_timeout_to_market: bool = True
+    # Smart entry buffer: when enabled, the bot waits for one additional
+    # confirmation read of the orderbook (spread + direction check) before
+    # committing the very first buy order.  Helps avoid false breakouts.
+    smart_entry_buffer_enabled: bool = False
     initial_capital: float = 1_000_000.0  # in quote currency (e.g., IDR)
     target_profit_pct: float = 0.2  # 20%
     max_loss_pct: float = 0.1  # 10%
@@ -687,6 +699,9 @@ class BotConfig:
             max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", "0.001"),
             entry_aggressiveness_pct=_env_float("ENTRY_AGGRESSIVENESS_PCT", "0.0005"),
             entry_retry_aggressiveness_pct=_env_float("ENTRY_RETRY_AGGRESSIVENESS_PCT", "0.001"),
+            chase_max_retries=_env_int("CHASE_MAX_RETRIES", "3"),
+            order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
+            smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "false").lower() in {"1", "true", "yes"},
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
             target_profit_pct=_env_float("TARGET_PROFIT_PCT", "0.2"),
             max_loss_pct=_env_float("MAX_LOSS_PCT", "0.1"),
@@ -890,6 +905,8 @@ class BotConfig:
             raise ValueError("ENTRY_AGGRESSIVENESS_PCT must be non-negative")
         if self.entry_retry_aggressiveness_pct < 0:
             raise ValueError("ENTRY_RETRY_AGGRESSIVENESS_PCT must be non-negative")
+        if self.chase_max_retries < 0:
+            raise ValueError("CHASE_MAX_RETRIES must be non-negative")
         if self.initial_capital <= 0:
             raise ValueError("INITIAL_CAPITAL must be positive (e.g. INITIAL_CAPITAL=1000000)")
         if self.staged_entry_steps <= 0:

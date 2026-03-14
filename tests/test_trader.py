@@ -5264,3 +5264,521 @@ class SellRetryExitProtectionTests(unittest.TestCase):
         self.assertEqual(cancelled[0], "99")
         # The retry price should be LOWER than original (more aggressive for sell)
         self.assertLess(created[1]["price"], created[0]["price"])
+
+
+class ChaseAlgorithmTests(unittest.TestCase):
+    """Tests for the professional order execution chase algorithm."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            multi_position_enabled=False,
+            min_order_idr=30_000.0,
+            max_slippage_pct=0.05,
+            entry_aggressiveness_pct=0.001,
+            entry_retry_aggressiveness_pct=0.002,
+            pair_cooldown_seconds=0.0,
+            min_confidence=0.0,
+            buy_max_rsi=0.0,
+            buy_max_resistance_proximity_pct=0.0,
+            chase_max_retries=3,
+            order_timeout_to_market=True,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_snap(self, pair, action, price, amount, **extra):
+        snap = {
+            "pair": pair,
+            "price": price,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading",
+                action=action,
+                confidence=0.9,
+                reason="test",
+                target_price=price,
+                amount=amount,
+                stop_loss=None,
+                take_profit=None,
+            ),
+        }
+        snap.update(extra)
+        return snap
+
+    # ── Chase Algorithm (Buy) ─────────────────────────────────────────────
+
+    def test_buy_chase_multiple_retries(self):
+        """Buy chase should retry up to chase_max_retries times before giving up."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                # Never fill
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # Initial order + 3 chase retries = 4 orders total
+        self.assertEqual(len(created), 4, f"Expected 1 initial + 3 chase = 4 orders, got {len(created)}")
+        # All 4 orders should have been cancelled (3 in chase + initial has no cancel because it's inside chase)
+        self.assertGreaterEqual(len(cancelled), 3)
+        # Each retry price should be higher than the previous (aggressive)
+        for i in range(1, len(created)):
+            self.assertGreaterEqual(created[i]["price"], created[0]["price"],
+                                    f"Chase retry {i} price should be >= initial price")
+
+    def test_buy_chase_fills_on_second_retry(self):
+        """When a buy fills on the 2nd chase retry, no further retries are made."""
+        created = []
+        cancelled = []
+        _balance = [0.0]  # track simulated balance
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 2:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+                else:
+                    _balance[0] = amount  # simulate fill
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 2 chase retries (fills on 2nd retry) = 3
+        self.assertEqual(len(created), 3, f"Expected 3 orders (fill on 2nd retry), got {len(created)}")
+        self.assertEqual(outcome["status"], "placed")
+
+    def test_buy_timeout_to_market_order(self):
+        """After all chase retries fail, convert to market order if enabled."""
+        created = []
+        cancelled = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 4:
+                    # First 4: 1 initial + 3 chase retries, none fill
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+                else:
+                    # The 5th order is the market-price conversion → fill
+                    _balance[0] = amount
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=True)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 3 chase + 1 market = 5 orders
+        self.assertEqual(len(created), 5, f"Expected 5 orders (market fallback), got {len(created)}")
+        self.assertEqual(outcome["status"], "placed")
+        # The market order should be at the maximum allowed price
+        allowed_max = 100.0 * (1 + 0.05)  # price * (1 + max_slippage_pct)
+        self.assertAlmostEqual(created[-1]["price"], allowed_max, places=1)
+
+    # ── Chase Algorithm (Sell / Exit Protection) ──────────────────────────
+
+    def test_sell_chase_multiple_retries(self):
+        """Sell chase should retry up to chase_max_retries times."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 3:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": 0}}
+                else:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+
+        snap = self._make_snap("ponke_idr", "sell", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 3 chase retries = 4 (fills on last)
+        self.assertGreaterEqual(len(created), 4, f"Expected >= 4 sell orders, got {len(created)}")
+        # Chase retries should have LOWER prices (more aggressive sell)
+        for i in range(2, len(created)):
+            self.assertLessEqual(created[i]["price"], created[1]["price"])
+
+    def test_sell_timeout_to_market_order(self):
+        """After all sell chase retries fail, convert to market-price sell."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 4:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": 0}}
+                else:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "spend_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "100000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=True)
+        trader = Trader(config)
+        trader.client = _Client()
+        trader.tracker.record_trade("buy", 100.0, 500.0)
+
+        snap = self._make_snap("ponke_idr", "sell", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 3 chase + 1 market = 5 orders
+        self.assertEqual(len(created), 5, f"Expected 5 sell orders (market fallback), got {len(created)}")
+        # The market order should be at the minimum allowed price
+        allowed_min = 100.0 * (1 - 0.05)  # price * (1 - max_slippage_pct)
+        self.assertAlmostEqual(created[-1]["price"], allowed_min, places=1)
+
+    # ── Adaptive Limit Order (Orderbook Re-read) ─────────────────────────
+
+    def test_buy_chase_re_reads_orderbook(self):
+        """Each chase retry should re-read the orderbook for adaptive pricing."""
+        depth_calls = []
+        created = []
+        cancelled = []
+        _ask_prices = iter([101.0, 102.0, 103.0, 104.0, 105.0])
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                try:
+                    ask = next(_ask_prices)
+                except StopIteration:
+                    ask = 105.0
+                depth_calls.append(ask)
+                return {"buy": [["100.0", "1"]], "sell": [[str(ask), "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) <= 2:
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+                else:
+                    _balance[0] = amount
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # get_depth should be called multiple times (1 initial + N chase retries)
+        self.assertGreaterEqual(len(depth_calls), 2,
+                                "Chase should re-read orderbook for adaptive pricing")
+
+    # ── Smart Entry Buffer ────────────────────────────────────────────────
+
+    def test_smart_entry_buffer_skips_when_price_moved(self):
+        """Smart entry buffer should skip buy if ask moves above allowed_max."""
+        depth_calls = [0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                depth_calls[0] += 1
+                if depth_calls[0] == 1:
+                    # Initial depth read
+                    return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+                else:
+                    # Buffer re-read: ask has moved way up (beyond allowed_max)
+                    return {"buy": [["100.0", "1"]], "sell": [["200.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                return {"success": 1, "return": {"order_id": "1", "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(smart_entry_buffer_enabled=True, max_slippage_pct=0.05)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("smart_entry_buffer", outcome["reason"])
+
+    def test_smart_entry_buffer_proceeds_when_price_stable(self):
+        """Smart entry buffer proceeds normally when price hasn't moved much."""
+        created = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "500", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(smart_entry_buffer_enabled=True, max_slippage_pct=0.05)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(outcome["status"], "placed")
+        self.assertGreaterEqual(len(created), 1)
+
+    # ── Config validation ─────────────────────────────────────────────────
+
+    def test_chase_max_retries_config(self):
+        """chase_max_retries must be non-negative."""
+        cfg = BotConfig(api_key=None, chase_max_retries=-1)
+        with self.assertRaises(ValueError):
+            cfg._validate()
+
+    def test_chase_max_retries_zero_uses_single_retry(self):
+        """chase_max_retries=0 should fall back to single retry behaviour."""
+        created = []
+        cancelled = []
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": 0}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": "0", "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=0, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        # 1 initial + 1 chase retry (min=1) = 2 orders
+        self.assertEqual(len(created), 2, "chase_max_retries=0 should still do 1 retry")
+
+    # ── Partial Fill Management ───────────────────────────────────────────
+
+    def test_buy_partial_fill_records_filled_portion(self):
+        """When a buy order is partially filled, record the filled amount
+        and chase the remaining unfilled portion."""
+        created = []
+        cancelled = []
+        _balance = [0.0]
+
+        class _Client:
+            _pair_min_order = {}
+
+            def get_depth(self, pair, count=5):
+                return {"buy": [["100.0", "1"]], "sell": [["101.0", "1"]]}
+
+            def create_order(self, pair, action, price, amount):
+                created.append({"pair": pair, "action": action, "price": price, "amount": amount})
+                if len(created) == 1:
+                    # Partial fill: 40% of requested
+                    filled = amount * 0.4
+                    _balance[0] += filled
+                    return {"success": 1, "return": {"order_id": "1", "receive_ponke": filled}}
+                else:
+                    # Subsequent orders fill completely
+                    _balance[0] += amount
+                    return {"success": 1, "return": {"order_id": str(len(created)), "receive_ponke": amount}}
+
+            def cancel_order(self, pair, order_id, order_type=None):
+                cancelled.append(order_id)
+                return {"success": 1}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"ponke": str(_balance[0]), "idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+            def open_orders(self, pair):
+                return {"return": {"orders": {}}}
+
+        config = self._make_config(chase_max_retries=3, order_timeout_to_market=False)
+        trader = Trader(config)
+        trader.client = _Client()
+
+        snap = self._make_snap("ponke_idr", "buy", 100.0, 500.0)
+        outcome = trader.maybe_execute(snap)
+
+        self.assertEqual(outcome["status"], "placed")
+        # Should have the partial fill step plus chase completion
+        partial_steps = [s for s in outcome["executed_steps"] if s.get("partial")]
+        self.assertGreaterEqual(len(partial_steps), 1, "Should record partial fill step")

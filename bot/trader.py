@@ -3218,6 +3218,53 @@ class Trader:
                 snapshot["pair"],
             )
 
+        # ── Smart Entry Buffer ────────────────────────────────────────────────
+        # When enabled, re-read the orderbook once more before committing the
+        # first buy to confirm the spread is still tight and the best price has
+        # not moved against us (avoids false breakout entries).
+        if (
+            self.config.smart_entry_buffer_enabled
+            and decision.action == "buy"
+        ):
+            try:
+                _buf_depth = self.client.get_depth(snapshot["pair"], count=5)
+                _buf_bids = _buf_depth.get("buy") or []
+                _buf_asks = _buf_depth.get("sell") or []
+                if _buf_bids and _buf_asks:
+                    _buf_bid = float(_buf_bids[0][0])
+                    _buf_ask = float(_buf_asks[0][0])
+                    _buf_mid = (_buf_bid + _buf_ask) / 2 if (_buf_bid + _buf_ask) > 0 else price
+                    _buf_spread = (_buf_ask - _buf_bid) / _buf_mid if _buf_mid > 0 else 0
+                    # If the best ask moved above our allowed_max (slippage guard)
+                    # or the spread widened significantly, skip this entry.
+                    if _buf_ask > allowed_max:
+                        logger.info(
+                            "Smart entry buffer: ask %.2f moved above allowed_max %.2f on %s — skipping",
+                            _buf_ask, allowed_max, snapshot["pair"],
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "smart_entry_buffer_price_moved",
+                            "portfolio": _tracker.as_dict(price),
+                        }
+                    if self.config.max_spread_pct > 0 and _buf_spread >= self.config.max_spread_pct:
+                        logger.info(
+                            "Smart entry buffer: spread %.4f%% widened on %s — skipping",
+                            _buf_spread * 100, snapshot["pair"],
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "smart_entry_buffer_spread_widened",
+                            "portfolio": _tracker.as_dict(price),
+                        }
+                    # Update reference_price to the freshest top-of-book.
+                    reference_price = min(_buf_ask * (1 + entry_aggr), allowed_max)
+                    _fmt_price = getattr(self.client, "format_price", None)
+                    if callable(_fmt_price):
+                        reference_price, _ = _fmt_price(snapshot["pair"], reference_price)
+            except Exception as exc:
+                logger.debug("Smart entry buffer depth read failed: %s", exc)
+
         for amt in staged:
             step_amount = min(amt, remaining_amount)
             if step_amount <= 0:
@@ -3247,50 +3294,121 @@ class Trader:
             # Indodax returns ``receive_<coin>`` in the trade response.  When a
             # buy limit order is merely placed (not filled) this value is 0.
             # Avoid opening a phantom position in that case; cancel and retry
-            # once with a slightly more aggressive price to avoid missing the move.
+            # using the *chase algorithm*: re-read the orderbook on every retry,
+            # progressively increase aggressiveness, and optionally convert to a
+            # market order after all chase retries are exhausted.
             received_amount = _calc_received_amount(order_resp, pre_step_position)
 
-            if decision.action == "buy" and received_amount <= 0:
-                order_id = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
-                if order_id:
-                    try:
-                        self.client.cancel_order(snapshot["pair"], order_id, decision.action)
-                        logger.info("Cancelled unfilled buy order %s on %s before retrying", order_id, snapshot["pair"])
-                    except Exception as exc:  # pragma: no cover - defensive
-                        logger.warning("Failed to cancel unfilled buy order %s on %s: %s", order_id, snapshot["pair"], exc)
+            # ── Partial fill management (buy) ─────────────────────────────────
+            # If the order was partially filled (0 < received < step_amount),
+            # record the filled portion and chase only the remaining quantity.
+            _chase_amount = step_amount
+            if decision.action == "buy" and 0 < received_amount < step_amount:
+                # Record the partially filled portion immediately.
+                _tracker.record_trade(decision.action, reference_price, received_amount)
+                remaining_amount -= received_amount
+                executed_steps.append({"amount": received_amount, "price": reference_price, "order": order_resp, "partial": True})
+                _chase_amount = step_amount - received_amount
+                received_amount = 0  # trigger the chase loop for the remainder
+                logger.info(
+                    "Partial fill on buy: %.8f filled, %.8f remaining (pair=%s)",
+                    step_amount - _chase_amount, _chase_amount, snapshot["pair"],
+                )
 
-                retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct)
-                retry_price = reference_price
-                if retry_bump > 0:
-                    retry_price = min(reference_price * (1 + retry_bump), allowed_max)
+            # ── Chase algorithm (buy) ─────────────────────────────────────────
+            # When the initial order is unfilled, cancel and retry up to
+            # chase_max_retries times.  Each retry re-reads the live orderbook
+            # so the new limit price tracks the moving best_ask (adaptive).
+            _max_chase = max(1, self.config.chase_max_retries) if self.config.chase_max_retries > 0 else 1
+            if decision.action == "buy" and received_amount <= 0:
+                for _chase_i in range(_max_chase):
+                    # Cancel the previous unfilled order
+                    _prev_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                    if _prev_oid:
+                        try:
+                            self.client.cancel_order(snapshot["pair"], _prev_oid, decision.action)
+                            logger.info("Chase[%d] cancelled unfilled buy %s on %s", _chase_i + 1, _prev_oid, snapshot["pair"])
+                        except Exception as _cexc:  # pragma: no cover - defensive
+                            logger.warning("Chase[%d] cancel failed for buy %s: %s", _chase_i + 1, _prev_oid, _cexc)
+
+                    # Re-read orderbook for adaptive pricing
+                    retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct) * (_chase_i + 1)
+                    try:
+                        _chase_depth = self.client.get_depth(snapshot["pair"], count=5)
+                        _chase_asks = _chase_depth.get("sell") or []
+                        _fresh_ask = float(_chase_asks[0][0]) if _chase_asks else reference_price
+                    except Exception:
+                        _fresh_ask = reference_price
+
+                    # Aggressive limit: price at best_ask + progressive bump
+                    retry_price = min(_fresh_ask * (1 + retry_bump), allowed_max)
                     _fmt_price = getattr(self.client, "format_price", None)
                     if callable(_fmt_price):
-                        # format_price returns (price, precision) tuple
                         retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
-                if retry_price > reference_price:
+                    if retry_price <= reference_price:
+                        retry_price = min(reference_price * (1 + max(entry_aggr, self.config.entry_retry_aggressiveness_pct)), allowed_max)
+                        if callable(_fmt_price):
+                            retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+
                     logger.info(
-                        "Retrying buy at more aggressive price: %.10f → %.10f (pair=%s)",
-                        reference_price,
-                        retry_price,
-                        snapshot["pair"],
+                        "Chase[%d/%d] buy at %.10f → %.10f (pair=%s)",
+                        _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
                     )
-                    order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, step_amount)
+                    order_resp = self.client.create_order(snapshot["pair"], decision.action, retry_price, _chase_amount)
                     getattr(self.client, "invalidate_account_info_cache", lambda: None)()
                     reference_price = retry_price
                     received_amount = _calc_received_amount(order_resp, pre_step_position)
 
+                    # Partial fill during chase
+                    if 0 < received_amount < _chase_amount:
+                        _tracker.record_trade(decision.action, reference_price, received_amount)
+                        remaining_amount -= received_amount
+                        executed_steps.append({"amount": received_amount, "price": reference_price, "order": order_resp, "partial": True})
+                        _chase_amount -= received_amount
+                        received_amount = 0
+                        logger.info("Chase[%d] partial fill %.8f, remaining %.8f", _chase_i + 1, received_amount, _chase_amount)
+                        continue
+
+                    if received_amount > 0:
+                        break  # Filled — exit chase loop
+
+                # ── Timeout → market order (buy) ──────────────────────────────
+                if received_amount <= 0 and self.config.order_timeout_to_market:
+                    _prev_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                    if _prev_oid:
+                        try:
+                            self.client.cancel_order(snapshot["pair"], _prev_oid, decision.action)
+                        except Exception:
+                            pass
+                    # Place a market-crossing order at the maximum allowed price.
+                    market_price = allowed_max
+                    _fmt_price = getattr(self.client, "format_price", None)
+                    if callable(_fmt_price):
+                        market_price, _ = _fmt_price(snapshot["pair"], market_price)
+                    logger.info(
+                        "Chase exhausted — converting buy to market-price order at %.10f (pair=%s)",
+                        market_price, snapshot["pair"],
+                    )
+                    order_resp = self.client.create_order(snapshot["pair"], decision.action, market_price, _chase_amount)
+                    getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                    reference_price = market_price
+                    received_amount = _calc_received_amount(order_resp, pre_step_position)
+
                 if received_amount <= 0:
                     logger.info(
-                        "Buy order not filled after retry (pair=%s) — will re-evaluate on next cycle",
-                        snapshot["pair"],
+                        "Buy order not filled after %d chase retries (pair=%s) — will re-evaluate",
+                        _max_chase, snapshot["pair"],
                     )
-                    remaining_amount -= step_amount
+                    remaining_amount -= _chase_amount
                     executed_steps.append(
                         {"amount": 0.0, "price": reference_price, "order": order_resp, "pending": True}
                     )
                     continue
 
-            # ── Exit protection: retry unfilled sell at more aggressive price ──
+            # ── Exit protection: chase algorithm for unfilled sells ───────────
+            # The same adaptive chase logic applies to sell orders.  Re-read the
+            # orderbook on each retry, lower the price toward the best bid, and
+            # optionally convert to a market-price sell when retries run out.
             if decision.action == "sell":
                 _sell_order_id = str(
                     (order_resp.get("return") or {}).get("order_id")
@@ -3300,40 +3418,107 @@ class Trader:
                 _sell_spent = float(
                     (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
                 )
-                if _sell_order_id and _sell_spent <= 0:
-                    # Sell order was placed but not filled — cancel and retry
-                    # at a lower (more aggressive) price.
-                    try:
-                        self.client.cancel_order(snapshot["pair"], _sell_order_id, decision.action)
-                        logger.info(
-                            "Cancelled unfilled sell order %s on %s before retrying",
-                            _sell_order_id, snapshot["pair"],
-                        )
-                    except Exception as exc:  # pragma: no cover - defensive
-                        logger.warning(
-                            "Failed to cancel unfilled sell order %s on %s: %s",
-                            _sell_order_id, snapshot["pair"], exc,
-                        )
 
-                    retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct)
-                    retry_price = reference_price
-                    if retry_bump > 0:
-                        retry_price = max(reference_price * (1 - retry_bump), allowed_min)
+                # ── Partial fill management (sell) ────────────────────────────
+                if _sell_spent > 0 and _sell_spent < step_amount:
+                    _tracker.record_trade(decision.action, reference_price, _sell_spent)
+                    remaining_amount -= _sell_spent
+                    executed_steps.append({"amount": _sell_spent, "price": reference_price, "order": order_resp, "partial": True})
+                    _chase_amount = step_amount - _sell_spent
+                    _sell_spent = 0  # trigger chase for remainder
+                    logger.info(
+                        "Partial fill on sell: %.8f filled, %.8f remaining (pair=%s)",
+                        step_amount - _chase_amount, _chase_amount, snapshot["pair"],
+                    )
+                else:
+                    _chase_amount = step_amount
+
+                if _sell_order_id and _sell_spent <= 0:
+                    for _chase_i in range(_max_chase):
+                        # Cancel previous unfilled sell
+                        _prev_sell_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                        if _prev_sell_oid:
+                            try:
+                                self.client.cancel_order(snapshot["pair"], _prev_sell_oid, decision.action)
+                                logger.info("Chase[%d] cancelled unfilled sell %s on %s", _chase_i + 1, _prev_sell_oid, snapshot["pair"])
+                            except Exception as _cexc:  # pragma: no cover - defensive
+                                logger.warning("Chase[%d] cancel failed for sell %s: %s", _chase_i + 1, _prev_sell_oid, _cexc)
+
+                        # Re-read orderbook for adaptive sell pricing
+                        retry_bump = max(entry_aggr, self.config.entry_retry_aggressiveness_pct) * (_chase_i + 1)
+                        try:
+                            _chase_depth = self.client.get_depth(snapshot["pair"], count=5)
+                            _chase_bids = _chase_depth.get("buy") or []
+                            _fresh_bid = float(_chase_bids[0][0]) if _chase_bids else reference_price
+                        except Exception:
+                            _fresh_bid = reference_price
+
+                        # Aggressive limit sell: price at best_bid - progressive bump
+                        retry_price = max(_fresh_bid * (1 - retry_bump), allowed_min)
                         _fmt_price = getattr(self.client, "format_price", None)
                         if callable(_fmt_price):
                             retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
-                    if retry_price < reference_price:
+                        if retry_price >= reference_price:
+                            retry_price = max(reference_price * (1 - max(entry_aggr, self.config.entry_retry_aggressiveness_pct)), allowed_min)
+                            if callable(_fmt_price):
+                                retry_price, _ = _fmt_price(snapshot["pair"], retry_price)
+
                         logger.info(
-                            "Retrying sell at more aggressive price: %.10f → %.10f (pair=%s)",
-                            reference_price,
-                            retry_price,
-                            snapshot["pair"],
+                            "Chase[%d/%d] sell at %.10f → %.10f (pair=%s)",
+                            _chase_i + 1, _max_chase, reference_price, retry_price, snapshot["pair"],
                         )
                         order_resp = self.client.create_order(
-                            snapshot["pair"], decision.action, retry_price, step_amount,
+                            snapshot["pair"], decision.action, retry_price, _chase_amount,
                         )
                         getattr(self.client, "invalidate_account_info_cache", lambda: None)()
                         reference_price = retry_price
+
+                        _sell_spent = float(
+                            (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                        )
+
+                        # Partial fill during sell chase
+                        if 0 < _sell_spent < _chase_amount:
+                            _tracker.record_trade(decision.action, reference_price, _sell_spent)
+                            remaining_amount -= _sell_spent
+                            executed_steps.append({"amount": _sell_spent, "price": reference_price, "order": order_resp, "partial": True})
+                            _chase_amount -= _sell_spent
+                            _sell_spent = 0
+                            continue
+
+                        if _sell_spent > 0:
+                            break  # Filled
+
+                    # ── Timeout → market order (sell) ─────────────────────────
+                    if _sell_spent <= 0 and self.config.order_timeout_to_market:
+                        _prev_sell_oid = str((order_resp.get("return") or {}).get("order_id") or order_resp.get("order_id") or "")
+                        if _prev_sell_oid:
+                            try:
+                                self.client.cancel_order(snapshot["pair"], _prev_sell_oid, decision.action)
+                            except Exception:
+                                pass
+                        market_price = allowed_min
+                        _fmt_price = getattr(self.client, "format_price", None)
+                        if callable(_fmt_price):
+                            market_price, _ = _fmt_price(snapshot["pair"], market_price)
+                        logger.info(
+                            "Chase exhausted — converting sell to market-price order at %.10f (pair=%s)",
+                            market_price, snapshot["pair"],
+                        )
+                        order_resp = self.client.create_order(
+                            snapshot["pair"], decision.action, market_price, _chase_amount,
+                        )
+                        getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                        reference_price = market_price
+                        _sell_spent = float(
+                            (order_resp.get("return") or {}).get(f"spend_{base_coin}") or 0.0
+                        )
+
+                    # Update received for the record_trade below
+                    if _sell_spent > 0:
+                        received_amount = _sell_spent
+                    else:
+                        received_amount = step_amount  # fallback for record_trade
 
             step_amount = min(step_amount, received_amount)
             _tracker.record_trade(decision.action, reference_price, step_amount)
