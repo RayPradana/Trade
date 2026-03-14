@@ -172,6 +172,13 @@ class PortfolioTracker:
             # Record when this position was first opened (first buy only)
             if self.position_open_time == 0.0:
                 self.position_open_time = time.time()
+            # Anchor trailing stop/TP baseline at the buy fill price.
+            # This ensures the trailing mechanisms start from the actual entry
+            # price rather than a potentially lower mark price observed later.
+            if self._peak_price is None:
+                self._peak_price = price
+            if self._trailing_tp_peak is None and self._tp_activated:
+                self._trailing_tp_peak = price
         elif action == "sell":
             # A filled sell clears any pending sell markers for this tracker.
             self.pending_sell_orders.clear()

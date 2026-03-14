@@ -3164,8 +3164,10 @@ class Trader:
         # Apply basic orderbook quality checks to ALL coins, not just cheap ones.
         # Uses the full-depth orderbook (200 levels from analyze_market) rather
         # than the shallow execution-time depth (5 levels) for accuracy.
-        # Coins with only 1-2 bid levels AND extremely thin bid depth are
-        # unreliable for execution and exits can be impossible.
+        # Thin books are unreliable for execution and exits can be impossible.
+        # Two-level check:
+        #   Level 1 — very thin book (< 5 bids): reject if depth below threshold
+        #   Level 2 — sparse book (5–9 bids, i.e. < 10): reject if total depth is too small
         # Gated by small_coin_min_depth_idr to remain configurable.
         _raw_depth = snapshot.get("raw_depth")
         if (
@@ -3176,23 +3178,39 @@ class Trader:
         ):
             _raw_bids = _raw_depth.get("buy") or []
             _bid_count = len(_raw_bids)
-            if _bid_count < 3:
-                _bid_depth_idr = sum(
-                    float(b[0]) * float(b[1]) for b in _raw_bids
-                ) if _raw_bids else 0.0
-                # Very thin book: fewer than 3 bids AND low depth
-                if _bid_depth_idr < self.config.small_coin_min_depth_idr:
-                    logger.info(
-                        "Koin sepi %s: only %d bid level(s), depth Rp%.0f — skipping buy",
-                        snapshot["pair"], _bid_count, _bid_depth_idr,
-                    )
-                    return {
-                        "status": "skipped",
-                        "reason": (
-                            f"koin_sepi {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
-                        ),
-                        "portfolio": _tracker.as_dict(price),
-                    }
+            _bid_depth_idr = (
+                sum(float(b[0]) * float(b[1]) for b in _raw_bids)
+                if _raw_bids else 0.0
+            )
+            # Level 1: very thin book (< 5 bid levels)
+            if _bid_count < 5 and _bid_depth_idr < self.config.small_coin_min_depth_idr:
+                logger.info(
+                    "Koin sepi %s: only %d bid level(s), depth Rp%.0f — skipping buy",
+                    snapshot["pair"], _bid_count, _bid_depth_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"koin_sepi {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
+            # Level 2: sparse book (5–9 bid levels) with insufficient total depth
+            if (
+                _bid_count < 10
+                and _bid_depth_idr < self.config.small_coin_min_depth_idr * 3
+            ):
+                logger.info(
+                    "Koin sepi %s: sparse book %d bids, depth Rp%.0f — skipping buy",
+                    snapshot["pair"], _bid_count, _bid_depth_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"koin_sepi_sparse {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
 
         # Spread anomaly detection
         if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
@@ -4893,6 +4911,51 @@ class Trader:
             0.001,
         )
 
+        # ── Pump detection: bypass limit order, switch to market immediately ──
+        # When a genuine price pump is active (pump_protection_pct > 0, price
+        # has risen by at least that fraction) and it is NOT a fake pump (i.e.
+        # not a spike-then-reversal), there is a live upward move happening.
+        # A pending limit order priced below the rising market will never fill;
+        # switch to a market-crossing price so the bot does not miss the move.
+        if self._is_pumped(pair, price) and not self._is_fake_pump(pair, price):
+            _pump_market_price = best_ask * (1 + entry_aggr * 2)
+            _fmt_price = getattr(self.client, "format_price", None)
+            if callable(_fmt_price):
+                _pump_market_price, _ = _fmt_price(pair, _pump_market_price)
+            logger.info(
+                "resume_pending_buy: PUMP DETECTED — market order Rp%.2f (pair=%s)",
+                _pump_market_price, pair,
+            )
+            try:
+                _pump_resp = self.client.create_order(pair, "buy", _pump_market_price, amount)
+                getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                _pump_recv = 0.0
+                try:
+                    _pump_recv = float(
+                        (_pump_resp.get("return") or {}).get(receive_key) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    _pump_recv = 0.0
+                if _pump_recv > 0:
+                    _tracker.record_trade("buy", _pump_market_price, _pump_recv)
+                    self._resume_buy_retry_counts.pop(pair, None)
+                    self._ensure_position_feed(pair)
+                    self._persist_after_trade(pair)
+                    return {
+                        "status": "resumed",
+                        "action": "buy",
+                        "pair": pair,
+                        "price": _pump_market_price,
+                        "amount": _pump_recv,
+                        "portfolio": _tracker.as_dict(_pump_market_price),
+                    }
+            except Exception as _pump_exc:
+                logger.warning(
+                    "resume_pending_buy: pump market order failed — falling back to tier (pair=%s): %s",
+                    pair, _pump_exc,
+                )
+            # Fall through to tier-based limit order if market order fails.
+
         # ── 3-tier price strategy ─────────────────────────────────────────────
         # Rotate through three price levels on consecutive unfilled retries:
         #   Tier 0 (above)  — best_ask + aggr%  : aggressive, fills immediately
@@ -5212,6 +5275,31 @@ class Trader:
         _fmt_price = getattr(self.client, "format_price", None)
         if callable(_fmt_price):
             retry_price, _ = _fmt_price(pair, retry_price)
+
+        # ── Flash-dump detection: switch to market-crossing price immediately ─
+        # When a rapid price drop is detected via the rolling price history,
+        # a resting limit order will miss the exit window as bids collapse.
+        # Place a deeply-discounted limit order (below best_bid) so that it
+        # fills immediately against the aggressive bid side — effectively a
+        # market sell without requiring a true market-order API call.
+        if self.config.flash_dump_pct > 0:
+            _pair_hist = self._price_history.get(pair, [])
+            _dump_signal = detect_flash_dump(
+                _pair_hist,
+                self.config.flash_dump_lookback_seconds,
+                self.config.flash_dump_pct,
+            )
+            if _dump_signal.detected:
+                _dump_market_price = best_bid * (1 - entry_aggr * 3)
+                _fmt2 = getattr(self.client, "format_price", None)
+                if callable(_fmt2):
+                    _dump_market_price, _ = _fmt2(pair, _dump_market_price)
+                logger.info(
+                    "resume_pending_sell: DUMP DETECTED (drop=%.2f%%) — "
+                    "market-crossing sell Rp%.2f (pair=%s)",
+                    _dump_signal.drop_pct * 100, _dump_market_price, pair,
+                )
+                retry_price = _dump_market_price
 
         # Per-pair effective minimum.
         _get_min = getattr(self.client, "get_pair_min_order", None)

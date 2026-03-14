@@ -1534,15 +1534,21 @@ def main() -> None:
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
 
-                    # ── Re-entry analysis after trail/stop sell ──────────────
-                    # When the exit was triggered by a trailing stop or stop
-                    # loss, analyse whether the coin still has upside potential.
-                    # If so, mark a pending buy at a lower target price so the
-                    # bot can re-enter instead of staying flat.
-                    if stop_reason in (
+                    # ── Re-entry analysis after any exit ─────────────────────
+                    # After any exit (trailing stop, stop loss, TP reached, sell
+                    # signal, dump) re-analyse whether the pair still has upside
+                    # potential for a fresh position.  This prevents the bot from
+                    # leaving a profitable coin too early and allows it to
+                    # compound gains by re-entering on a dip after TP.
+                    # analyze_reentry_opportunity checks market regime, trend, OB
+                    # pressure, and support levels — it returns None when
+                    # conditions are unfavourable so safe to call on every exit.
+                    _run_reentry = stop_reason in (
                         "trailing_stop", "stop_loss", "trailing_tp_triggered",
                         "momentum_exit", "post_entry_dump",
-                    ):
+                        "target_profit_reached",
+                    ) or (stop_reason is None and held_decision.action == "sell")
+                    if _run_reentry:
                         try:
                             _reentry = trader.analyze_reentry_opportunity(held_snapshot)
                             if _reentry and _reentry.get("reentry"):

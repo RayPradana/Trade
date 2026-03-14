@@ -463,6 +463,9 @@ class TestConfidencePositionSizing(unittest.TestCase):
             confidence_tier_high_pct=0.20,
             confidence_tier_max_pct=0.25,
             initial_capital=500_000.0,
+            # Disable the min-order floor so these tests purely compare
+            # formula outputs without the fallback changing the result.
+            min_order_idr=0.0,
         )
         defaults.update(kw)
         return BotConfig(**defaults)
@@ -537,9 +540,11 @@ class TestConfidencePositionSizing(unittest.TestCase):
     def test_feature_disabled_uses_original_formula(self):
         """When confidence_position_sizing_enabled=False, original formula is used."""
         from bot.analysis import VolatilityStats
+        # Use min_order_idr=0 to disable the fallback floor so the comparison
+        # is purely between the two formula paths (disabled vs enabled).
         cfg_off = BotConfig(api_key=None, confidence_position_sizing_enabled=False,
-                            initial_capital=500_000.0)
-        cfg_on = self._cfg(initial_capital=500_000.0)
+                            initial_capital=500_000.0, min_order_idr=0.0)
+        cfg_on = self._cfg(initial_capital=500_000.0, min_order_idr=0.0)
         vol = VolatilityStats(volatility=0.01, avg_volume=1000.0)
         price, stop = 50_000.0, 49_000.0
         size_off = _position_size(price, stop, cfg_off, price - stop, 0.70, vol, 500_000.0)

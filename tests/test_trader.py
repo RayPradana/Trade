@@ -2810,9 +2810,9 @@ class MinOrderIdrTest(unittest.TestCase):
         self.assertNotEqual(outcome["status"], "skipped")
 
     def test_config_min_order_idr_default(self):
-        """BotConfig default min_order_idr must be 30,000 (bot safety floor above the 10,000 IDR exchange minimum)."""
+        """BotConfig default min_order_idr must be 100,000 IDR (practical floor for achievable profit targets)."""
         config = BotConfig(api_key=None)
-        self.assertEqual(config.min_order_idr, 30_000.0)
+        self.assertEqual(config.min_order_idr, 100_000.0)
 
     def test_config_min_order_idr_validation(self):
         """min_order_idr must be positive; zero or negative must raise ValueError."""
@@ -8848,3 +8848,251 @@ class ResumeBuyPriceTierTests(unittest.TestCase):
         cfg = self._make_config()
         trader = Trader(cfg, client=self._make_client())
         self.assertEqual(trader._resume_buy_retry_counts, {})
+
+
+# ---------------------------------------------------------------------------
+# Tests for new behaviours introduced by the second problem-statement batch
+# ---------------------------------------------------------------------------
+
+class TrailingStopAnchorAtBuyFillTests(unittest.TestCase):
+    """Trailing stop _peak_price must be anchored at the buy fill price."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def test_peak_price_set_after_buy(self):
+        """After record_trade('buy'), _peak_price equals buy price, not None."""
+        tracker = PortfolioTracker(500_000.0, 0.02, 0.05)
+        self.assertIsNone(tracker._peak_price)
+        tracker.record_trade("buy", 50_000.0, 2.0)
+        self.assertEqual(tracker._peak_price, 50_000.0)
+
+    def test_peak_price_not_reset_if_already_set(self):
+        """Second buy does not lower _peak_price if already set above buy price."""
+        tracker = PortfolioTracker(1_000_000.0, 0.02, 0.05)
+        tracker.record_trade("buy", 50_000.0, 1.0)
+        # Simulate price rising: update trailing stop
+        tracker.update_trailing_stop(60_000.0, 0.05)
+        self.assertEqual(tracker._peak_price, 60_000.0)
+        # Second partial buy at a lower price should NOT lower the peak
+        tracker.record_trade("buy", 40_000.0, 1.0)
+        self.assertEqual(tracker._peak_price, 60_000.0)
+
+    def test_trailing_stop_computed_from_buy_price_immediately(self):
+        """update_trailing_stop() called right after buy should use the buy price as peak."""
+        tracker = PortfolioTracker(500_000.0, 0.02, 0.05)
+        tracker.record_trade("buy", 50_000.0, 2.0)
+        # Simulate mark price equal to buy price (no movement yet)
+        tracker.update_trailing_stop(50_000.0, 0.05)
+        # Stop should be 50_000 * (1 - 0.05) = 47_500
+        self.assertAlmostEqual(tracker._trailing_stop, 47_500.0, places=1)
+
+    def test_peak_price_reset_to_none_after_full_close(self):
+        """_peak_price must be cleared when position is fully closed."""
+        tracker = PortfolioTracker(500_000.0, 0.02, 0.05)
+        tracker.record_trade("buy", 50_000.0, 2.0)
+        self.assertIsNotNone(tracker._peak_price)
+        tracker.record_trade("sell", 55_000.0, 2.0)
+        self.assertIsNone(tracker._peak_price)
+
+
+class ResumeBuyPumpMarketOrderTests(unittest.TestCase):
+    """resume_pending_buy must switch to market order when a pump is detected."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_config(self, pump_protection_pct=0.02, **overrides):
+        defaults = dict(
+            api_key="test_key",
+            api_secret="test_secret",
+            dry_run=False,
+            initial_capital=1_000_000.0,
+            min_order_idr=0.0,
+            entry_retry_aggressiveness_pct=0.002,
+            order_timeout_to_market=False,
+            pump_protection_pct=pump_protection_pct,
+            multi_position_enabled=False,
+        )
+        defaults.update(overrides)
+        return BotConfig(**defaults)
+
+    def _make_client(self, ask=105.0, bid=104.0, fill_amount=0.001):
+        class _Client:
+            def __init__(self, ask, bid, fill_amount):
+                self._ask = ask
+                self._bid = bid
+                self._fill = fill_amount
+                self.last_order_price = None
+                self.last_order_side = None
+
+            def get_depth(self, pair, count=5):
+                return {"sell": [[str(self._ask), "10"]], "buy": [[str(self._bid), "10"]]}
+
+            def create_order(self, pair, side, price, amount):
+                self.last_order_price = price
+                self.last_order_side = side
+                bc = pair.split("_")[0].lower()
+                return {"return": {f"receive_{bc}": self._fill}}
+
+            def get_account_info(self):
+                return {"return": {"balance": {"idr": "1000000"}}}
+
+            def invalidate_account_info_cache(self):
+                pass
+
+        return _Client(ask, bid, fill_amount)
+
+    def _inject_pump_history(self, trader, pair, old_price, current_price):
+        """Seed price history so that _is_pumped returns True."""
+        import time as _time
+        now = _time.time()
+        # oldest price is old_price; current is current_price → pump detected
+        trader._price_history[pair] = [
+            (now - 120, old_price),
+            (now - 60, (old_price + current_price) / 2),
+            (now, current_price),
+        ]
+
+    def test_pump_triggers_market_order(self):
+        """When pump is detected and no fake pump, a market-crossing order is placed."""
+        cfg = self._make_config()
+        client = self._make_client(ask=105.0, bid=104.0, fill_amount=0.001)
+        trader = Trader(cfg, client=client)
+        # Seed pump: price rose 3 % from 100 to 103 (above pump_protection_pct=2 %)
+        self._inject_pump_history(trader, "btc_idr", 100.0, 103.0)
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        snap = {
+            "pair": "btc_idr", "price": 103.0,
+            "trend": None, "orderbook": None, "volatility": None,
+            "levels": None, "indicators": None,
+            "insufficient_data": False, "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action="hold", confidence=0.9,
+                reason="test", target_price=103.0, amount=0.0,
+                stop_loss=None, take_profit=None,
+            ),
+        }
+        result = trader.resume_pending_buy(snap)
+        self.assertEqual(result["status"], "resumed")
+        # Market-crossing price should be higher than best_ask
+        self.assertGreater(client.last_order_price, 105.0)
+
+    def test_no_pump_uses_tier_pricing(self):
+        """Without pump, the normal 3-tier pricing is used (no large premium)."""
+        cfg = self._make_config(pump_protection_pct=0.10)  # 10% threshold not met
+        client = self._make_client(ask=105.0, bid=104.0, fill_amount=0.001)
+        trader = Trader(cfg, client=client)
+        # Price only rose 1 % — not a pump
+        self._inject_pump_history(trader, "btc_idr", 100.0, 101.0)
+
+        tracker = trader._active_tracker("btc_idr")
+        tracker.mark_pending_buy(0.001, 100.0)
+
+        snap = {
+            "pair": "btc_idr", "price": 101.0,
+            "trend": None, "orderbook": None, "volatility": None,
+            "levels": None, "indicators": None,
+            "insufficient_data": False, "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action="hold", confidence=0.9,
+                reason="test", target_price=101.0, amount=0.0,
+                stop_loss=None, take_profit=None,
+            ),
+        }
+        result = trader.resume_pending_buy(snap)
+        self.assertEqual(result["status"], "resumed")
+        # Should use tier-0 price: best_ask * (1 + aggr) = 105 * 1.002 = 105.21
+        self.assertAlmostEqual(client.last_order_price, 105.0 * 1.002, places=2)
+
+
+class KoinSepiTighterCheckTests(unittest.TestCase):
+    """Tighter koin sepi: sparse books (5-9 bids) with thin depth must be rejected."""
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+
+    def _make_cfg(self):
+        return BotConfig(
+            api_key=None, dry_run=True, initial_capital=500_000.0,
+            small_coin_min_depth_idr=100_000.0,
+            min_order_idr=0.0,
+            min_coin_price_idr=0.0,  # disable price floor so depth check fires
+        )
+
+    def _make_snap(self, pair="shib_idr", price=100.0, bid_count=7,
+                   depth_idr_per_bid=5_000.0):
+        # Each bid: [price, qty] where qty = depth_idr_per_bid / price
+        qty = max(depth_idr_per_bid / price, 0.001)
+        bids = [[str(price), str(round(qty, 4))] for _ in range(bid_count)]
+        asks = [[str(price * 1.01), str(round(qty, 4))] for _ in range(bid_count)]
+        raw_depth = {"buy": bids, "sell": asks}
+        return {
+            "pair": pair,
+            "price": price,
+            "top_bid": price,
+            "top_ask": price * 1.01,
+            "raw_depth": raw_depth,
+            "trend": None,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+            "insufficient_data": False,
+            "grid_plan": None,
+            "decision": StrategyDecision(
+                mode="day_trading", action="buy", confidence=0.9,
+                reason="test", target_price=price, amount=10000.0,
+                stop_loss=None, take_profit=None,
+            ),
+        }
+
+    def _stub_client(self, price=100.0, bid_count=7, depth_idr_per_bid=50_000.0):
+        qty = max(depth_idr_per_bid / price, 0.001)
+        bids = [[str(price), str(round(qty, 4))] for _ in range(bid_count)]
+        asks = [[str(price * 1.01), str(round(qty, 4))] for _ in range(bid_count)]
+        depth = {"buy": bids, "sell": asks}
+        return type("_C", (), {
+            "get_depth": lambda self, *a, **kw: depth,
+        })()
+
+    def test_sparse_book_rejected(self):
+        """7 bid levels with thin total depth should be rejected as koin_sepi_sparse."""
+        trader = Trader(self._make_cfg())
+        # 7 bids × 5,000 IDR each = 35,000 IDR total depth
+        # threshold for sparse (5-9 bids): 100,000 * 3 = 300,000
+        trader.client = self._stub_client(price=100.0, bid_count=7, depth_idr_per_bid=5_000.0)
+        snap = self._make_snap(price=100.0, bid_count=7, depth_idr_per_bid=5_000.0)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("koin_sepi_sparse", outcome["reason"])
+
+    def test_sparse_book_deep_enough_passes(self):
+        """7 bid levels with enough total depth should NOT be rejected for koin_sepi."""
+        trader = Trader(self._make_cfg())
+        # 7 bids × 50,000 IDR each = 350,000 IDR > 300,000 threshold
+        trader.client = self._stub_client(price=100.0, bid_count=7, depth_idr_per_bid=50_000.0)
+        snap = self._make_snap(price=100.0, bid_count=7, depth_idr_per_bid=50_000.0)
+        outcome = trader.maybe_execute(snap)
+        self.assertNotIn("koin_sepi", outcome.get("reason", ""))
+
+    def test_very_thin_book_rejected_by_level1(self):
+        """3 bid levels with thin depth should be rejected (level-1 check, < 5 bids)."""
+        trader = Trader(self._make_cfg())
+        trader.client = self._stub_client(price=100.0, bid_count=3, depth_idr_per_bid=10_000.0)
+        snap = self._make_snap(price=100.0, bid_count=3, depth_idr_per_bid=10_000.0)
+        outcome = trader.maybe_execute(snap)
+        self.assertEqual(outcome["status"], "skipped")
+        self.assertIn("koin_sepi", outcome["reason"])
