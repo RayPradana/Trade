@@ -99,6 +99,7 @@ _STATUS_ICONS = {
     "grid_placed":    "🔲",
     "partial_tp":     "🎯",
     "cancelled":      "⚠️",
+    "scanning":       "🔍",
 }
 
 # ── Display primitives ───────────────────────────────────────────────────
@@ -792,6 +793,33 @@ def _run_engine_monitor(
                                         "status": "skipped",
                                         "reason": f"no_position ({_decision.reason[:60]})" if _decision.reason else "no_position",
                                     })
+                            elif _decision.action == "buy":
+                                # Catch-all: a buy signal was emitted by StrategyEngine
+                                # but no execution outcome was captured this cycle.
+                                # Common causes: (1) still queued in SignalQueue at
+                                # display time, (2) outcome callback threw and was
+                                # silently dropped.  Risk rejections are already
+                                # covered by ExecutionEngine pushing a skipped outcome,
+                                # so this branch mostly handles timing races.
+                                # Skip held-position pairs — they are shown by _log_holding.
+                                _held = _active.get(_disp_pair)
+                                if not (_held and _held.base_position > 0):
+                                    _log_outcome({
+                                        "action": "buy",
+                                        "status": "skipped",
+                                        "reason": "pending_execution",
+                                    })
+                        else:
+                            # No analysis decision yet — not enough candle data or
+                            # MarketDataEngine hasn't completed the first cycle.
+                            # Only show for flat pairs (held pairs shown via _log_holding).
+                            _held = _active.get(_disp_pair)
+                            if not (_held and _held.base_position > 0):
+                                _log_outcome({
+                                    "action": "—",
+                                    "status": "scanning",
+                                    "reason": "awaiting_analysis",
+                                })
                     # Show position status for pairs where we hold a position
                     _tracker = _active.get(_disp_pair)
                     if _tracker and _tracker.base_position > 0:

@@ -547,7 +547,61 @@ class TestExecutionEngine:
         engine.stop()
         trader.maybe_execute.assert_not_called()
 
-    def test_on_outcome_callback(self):
+    def test_risk_rejection_pushes_skipped_outcome(self):
+        """Risk-rejected signals must emit a skipped outcome so the display loop
+        can show status + reason for every pair without a blank row."""
+        sq = SignalQueue()
+        config = _make_config()
+        trader = _make_trader()
+        risk = RiskEngine(config)
+        outcomes: list = []
+        engine = ExecutionEngine(
+            trader, config, sq, risk,
+            on_outcome=lambda sig, out: outcomes.append((sig, out)),
+        )
+        engine.start()
+        # Zero price → rejected by RiskEngine (invalid_price)
+        sq.put(TradingSignal(
+            pair="btc_idr",
+            snapshot=_make_snap(price=0.0),
+            signal_type="buy",
+        ))
+        time.sleep(0.3)
+        engine.stop()
+        # maybe_execute must NOT have been called
+        trader.maybe_execute.assert_not_called()
+        # But on_outcome callback MUST have been called with a skipped outcome
+        assert len(outcomes) == 1
+        sig, out = outcomes[0]
+        assert sig.signal_type == "buy"
+        assert out["status"] == "skipped"
+        assert out["reason"] == "invalid_price"
+        assert out["pair"] == "btc_idr"
+
+    def test_risk_rejection_outcome_visible_via_pop_recent_outcomes(self):
+        """pop_recent_outcomes() must include risk-rejected outcomes so the
+        engine-mode monitor cycle always has a status/reason to display."""
+        from bot.engine import TradingOrchestrator
+        config = _make_config()
+        trader = _make_trader()
+        orchestrator = TradingOrchestrator(trader, config)
+        orchestrator.start()
+        # Inject a zero-price snapshot (will be risk-rejected) directly into cache
+        orchestrator.cache.put("btc_idr", _make_snap(price=0.0))
+        # Put a buy signal with zero price into the signal queue
+        orchestrator.signal_queue.put(TradingSignal(
+            pair="btc_idr",
+            snapshot=_make_snap(price=0.0),
+            signal_type="buy",
+        ))
+        time.sleep(0.4)
+        outcomes = orchestrator.pop_recent_outcomes()
+        orchestrator.stop()
+        # At least the rejection outcome should be present
+        assert any(
+            out.get("status") == "skipped" and out.get("reason") == "invalid_price"
+            for _, out in outcomes
+        )
         sq = SignalQueue()
         config = _make_config()
         trader = _make_trader()

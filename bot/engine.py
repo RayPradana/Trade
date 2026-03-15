@@ -718,6 +718,20 @@ class ExecutionEngine:
                 signal.pair,
                 reason,
             )
+            _rej: Dict[str, Any] = {
+                "action": signal.signal_type,
+                "status": "skipped",
+                "reason": reason,
+                "pair": signal.pair,
+                "price": signal.snapshot.get("price") or 0.0,
+            }
+            if self._on_outcome is not None:
+                try:
+                    self._on_outcome(signal, _rej)
+                except Exception as _cb_exc:
+                    logger.debug(
+                        "ExecutionEngine: on_outcome callback failed for rejection — %s", _cb_exc
+                    )
             return
 
         snap = signal.snapshot
