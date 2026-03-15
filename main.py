@@ -422,7 +422,7 @@ def _log_signal(snapshot: dict) -> None:
         spread_str = "N/A"
         imb_str    = "N/A"
         imb_color  = _DIM
-    vol_str = f"{vol.volatility:.4f}" if vol else "N/A"
+    vol_str = f"{vol.volatility * 100:.2f}%" if vol else "N/A"
     logging.info(
         "   %s├─%s market  : spread=%s%s%s  imbalance=%s%s%s  vol=%s%s%s",
         _DIM, _RESET,

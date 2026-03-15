@@ -93,7 +93,7 @@ class BotConfig:
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
     websocket_batch_size: int = 100  # max pairs per WebSocket connection for multi-pair feed
     pairs_per_cycle: int = 20  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
-    min_confidence: float = 0.52
+    min_confidence: float = 0.45
     # ── Confidence-based position sizing ──────────────────────────────────────
     # When enabled, position size is a direct percentage of available capital
     # determined by confidence tier rather than the risk/stop-distance formula.
@@ -730,7 +730,7 @@ class BotConfig:
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
             websocket_batch_size=_env_int("WEBSOCKET_BATCH_SIZE", "100"),
             pairs_per_cycle=_env_int("PAIRS_PER_CYCLE", "20"),
-            min_confidence=_env_float("MIN_CONFIDENCE", "0.52"),
+            min_confidence=_env_float("MIN_CONFIDENCE", "0.45"),
             interval_seconds=interval_seconds,
             fast_window=_env_int("FAST_WINDOW", "12"),
             slow_window=_env_int("SLOW_WINDOW", "48"),
@@ -741,7 +741,7 @@ class BotConfig:
             order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
             resume_buy_wait_seconds=_env_int("RESUME_BUY_WAIT_SECONDS", "20"),
             smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "true").lower() in {"1", "true", "yes"},
-            entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.35"),
+            entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.25"),
             adaptive_order_enabled=os.getenv("ADAPTIVE_ORDER_ENABLED", "true").lower() in {"1", "true", "yes"},
             min_orderbook_volume_idr=_env_float("MIN_ORDERBOOK_VOLUME_IDR", "0"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),

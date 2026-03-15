@@ -956,7 +956,7 @@ class TraderSelectionTests(unittest.TestCase):
                 "pair": p, "price": 100.0, "trend": None, "orderbook": None,
                 "volatility": None, "levels": None, "indicators": None,
                 "decision": StrategyDecision(
-                    mode="scalping", action="buy", confidence=0.5, reason="ok",
+                    mode="scalping", action="buy", confidence=0.3, reason="ok",
                     target_price=100, amount=1, stop_loss=99, take_profit=101,
                 ),
             }
@@ -1014,7 +1014,7 @@ class TraderSelectionTests(unittest.TestCase):
                 "pair": p, "price": 100.0, "trend": None, "orderbook": None,
                 "volatility": None, "levels": None, "indicators": None,
                 "decision": StrategyDecision(
-                    mode="scalping", action="buy", confidence=0.5, reason="ok",
+                    mode="scalping", action="buy", confidence=0.3, reason="ok",
                     target_price=100, amount=1, stop_loss=99, take_profit=101,
                 ),
             }
