@@ -97,6 +97,8 @@ _STATUS_ICONS = {
     "force_sold":     "📤",
     "grid_simulated": "🔲",
     "grid_placed":    "🔲",
+    "partial_tp":     "🎯",
+    "cancelled":      "⚠️",
 }
 
 # ── Display primitives ───────────────────────────────────────────────────
@@ -485,8 +487,8 @@ def _log_outcome(outcome: dict) -> None:
     icon   = _STATUS_ICONS.get(status, "❓")
 
     status_color = (
-        _GREEN  if status in ("simulated", "placed")
-        else _RED    if status in ("stopped", "force_sold")
+        _GREEN  if status in ("simulated", "placed", "partial_tp")
+        else _RED    if status in ("stopped", "force_sold", "cancelled")
         else _YELLOW if status in ("skipped",)
         else _DIM
     )

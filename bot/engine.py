@@ -71,12 +71,24 @@ class TradingSignal:
       * ``"exit"``         – close the current position
       * ``"resume_buy"``   – retry an unfilled buy order
       * ``"resume_sell"``  – retry an unfilled sell order
+      * ``"partial_tp"``   – take partial profit on an open position
+      * ``"cancel_buy"``   – cancel a pending buy (re-analysis gate)
+
+    ``metadata`` carries signal-type-specific payload:
+      * ``"partial_tp"``  → ``{"fraction": float, "level": int}``
+        *fraction*: portion of the position to sell (0 < fraction < 1).
+        *level*: which partial-TP level triggered (1, 2, or 3).
+      * ``"cancel_buy"``  → ``{"reason": str}``
+        *reason*: human-readable explanation of why the buy was cancelled
+        (e.g. ``"sell signal (bearish candle)"`` or
+        ``"regime trending_down strength=0.70"``).
     """
 
     pair: str
     snapshot: Dict[str, Any]
-    signal_type: str  # "buy" | "exit" | "resume_buy" | "resume_sell"
+    signal_type: str  # "buy" | "exit" | "resume_buy" | "resume_sell" | "partial_tp" | "cancel_buy"
     timestamp: float = field(default_factory=time.monotonic)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +417,38 @@ class StrategyEngine:
 
         # ── Pending buy resume ───────────────────────────────────────────────
         if getattr(tracker, "has_pending_buy", False):
+            # Re-analysis gate: cancel the pending buy if market turned bearish.
+            # Mirrors the non-engine monitoring loop logic in main.py.
+            _regime = snap.get("regime")
+            _should_cancel = False
+            _cancel_reason = ""
+            if decision.action == "sell":
+                _should_cancel = True
+                _cancel_reason = (
+                    f"sell signal ({getattr(decision, 'reason', '?')[:60]})"
+                )
+            elif (
+                _regime is not None
+                and getattr(_regime, "regime", "") == "trending_down"
+                and getattr(_regime, "strength", 0) >= 0.5
+                and tracker.base_position <= 0
+            ):
+                _should_cancel = True
+                _cancel_reason = (
+                    f"regime trending_down strength={getattr(_regime, 'strength', 0):.2f}"
+                )
+
+            if _should_cancel and tracker.base_position <= 0:
+                self._signals.put(
+                    TradingSignal(
+                        pair=pair,
+                        snapshot=snap,
+                        signal_type="cancel_buy",
+                        metadata={"reason": _cancel_reason},
+                    )
+                )
+                return
+
             self._signals.put(
                 TradingSignal(pair=pair, snapshot=snap, signal_type="resume_buy")
             )
@@ -419,6 +463,72 @@ class StrategyEngine:
 
         # ── Exit conditions (held position) ──────────────────────────────────
         if tracker.base_position > 0:
+            # ── Partial take-profit checks (level 1 / 2 / 3) ────────────────
+            # Mirror the partial-TP logic from the non-engine monitoring loop.
+            try:
+                _ptp1 = getattr(self._config, "partial_tp_fraction", 0.0)
+                if (
+                    _ptp1 > 0
+                    and not getattr(tracker, "partial_tp_taken", False)
+                    and getattr(decision, "take_profit", None) is not None
+                    and price >= decision.take_profit
+                ):
+                    self._signals.put(
+                        TradingSignal(
+                            pair=pair,
+                            snapshot=snap,
+                            signal_type="partial_tp",
+                            metadata={"fraction": _ptp1, "level": 1},
+                        )
+                    )
+                    return
+            except Exception:
+                pass
+
+            try:
+                _ptp2 = getattr(self._config, "partial_tp2_fraction", 0.0)
+                _ptp2_target = getattr(self._config, "partial_tp2_target_pct", 0.0)
+                if (
+                    _ptp2 > 0
+                    and not getattr(tracker, "partial_tp2_taken", False)
+                    and tracker.avg_cost > 0
+                    and _ptp2_target > 0
+                    and price >= tracker.avg_cost * (1 + _ptp2_target)
+                ):
+                    self._signals.put(
+                        TradingSignal(
+                            pair=pair,
+                            snapshot=snap,
+                            signal_type="partial_tp",
+                            metadata={"fraction": _ptp2, "level": 2},
+                        )
+                    )
+                    return
+            except Exception:
+                pass
+
+            try:
+                _ptp3 = getattr(self._config, "partial_tp3_fraction", 0.0)
+                _ptp3_target = getattr(self._config, "partial_tp3_target_pct", 0.0)
+                if (
+                    _ptp3 > 0
+                    and not getattr(tracker, "partial_tp3_taken", False)
+                    and tracker.avg_cost > 0
+                    and _ptp3_target > 0
+                    and price >= tracker.avg_cost * (1 + _ptp3_target)
+                ):
+                    self._signals.put(
+                        TradingSignal(
+                            pair=pair,
+                            snapshot=snap,
+                            signal_type="partial_tp",
+                            metadata={"fraction": _ptp3, "level": 3},
+                        )
+                    )
+                    return
+            except Exception:
+                pass
+
             stop_reason = tracker.stop_reason(price)
             # Momentum / post-entry-dump checks
             if stop_reason is None:
@@ -457,6 +567,7 @@ class StrategyEngine:
             self._signals.put(
                 TradingSignal(pair=pair, snapshot=snap, signal_type="buy")
             )
+
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +739,75 @@ class ExecutionEngine:
                 logger.info(
                     "❌ Pending buy cancelled for %s: %s", signal.pair, status
                 )
+
+        elif signal.signal_type == "cancel_buy":
+            # Re-analysis gate: cancel the pending buy order and free the slot.
+            cancel_reason = signal.metadata.get("reason", "re_analysis")
+            try:
+                _tracker = self._trader._active_tracker(signal.pair)
+                self._trader._cancel_open_orders(signal.pair, ("buy",))
+                _tracker.cancel_pending_buy()
+                getattr(self._trader, "_resume_buy_retry_counts", {}).pop(signal.pair, None)
+                _mm = getattr(self._trader, "multi_manager", None)
+                if _mm is not None:
+                    try:
+                        _mm.return_position_cash(signal.pair)
+                    except Exception:
+                        pass
+                self._trader._persist_after_trade(signal.pair)
+                outcome = {
+                    "action": "cancel_buy",
+                    "status": "cancelled",
+                    "reason": cancel_reason,
+                    "pair": signal.pair,
+                    "price": price,
+                }
+                logger.info(
+                    "⚠️ RESUME CANCELLED  %s  ·  re-analysis: %s",
+                    signal.pair,
+                    cancel_reason,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    "cancel_buy: error for %s — %s", signal.pair, _exc
+                )
+                outcome = {}
+
+        elif signal.signal_type == "partial_tp":
+            fraction = signal.metadata.get("fraction", 0.0)
+            level = signal.metadata.get("level", 1)
+            outcome = self._trader.partial_take_profit(snap, fraction)
+            ptp_status = outcome.get("status", "")
+            if ptp_status == "partial_tp":
+                tracker = self._trader._active_tracker(signal.pair)
+                portfolio = tracker.as_dict(price)
+                logger.info(
+                    "🎯 PARTIAL-TP%s  %s  %.0f%%  @ Rp %s  pnl=Rp %s",
+                    level,
+                    signal.pair,
+                    fraction * 100,
+                    f"{price:,.0f}",
+                    f"{portfolio.get('realized_pnl', 0):,.2f}",
+                )
+                self._notify(
+                    f"🎯 PARTIAL-TP{level} {signal.pair} @ Rp {price:,.0f}\n"
+                    f"Fraction: {fraction:.0%}\n"
+                    f"Amount: {outcome.get('amount', 0):.8f}\n"
+                    f"PnL: Rp {portfolio.get('realized_pnl', 0):,.2f}"
+                )
+            # Mark partial_tp2/3 taken flags that partial_take_profit may not set
+            if level == 2:
+                try:
+                    _tracker2 = self._trader._active_tracker(signal.pair)
+                    _tracker2.partial_tp2_taken = True
+                except Exception:
+                    pass
+            elif level == 3:
+                try:
+                    _tracker3 = self._trader._active_tracker(signal.pair)
+                    _tracker3.partial_tp3_taken = True
+                except Exception:
+                    pass
 
         elif signal.signal_type == "resume_sell":
             outcome = self._trader.resume_pending_sell(snap)

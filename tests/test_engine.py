@@ -1146,3 +1146,423 @@ class TestInitializePairs:
         # must not trigger another API call.
         t.initialize_pairs()
         assert client.get_pairs.call_count == 1
+
+
+# ===========================================================================
+# Dead-coin trade-count filter — missing ticker field must not block all pairs
+# ===========================================================================
+
+class TestRugPullTradeCountFilter:
+    """detect_rug_pull_risk must only apply the trade-count filter when the
+    ticker actually exposes a trade_count / count field.  Indodax tickers do
+    not include this field, so the filter must be silently skipped to prevent
+    every live pair from being flagged as a dead coin."""
+
+    def test_missing_trade_count_field_does_not_flag_dead(self):
+        """When the ticker has no trade_count / count field, min_trades_24h
+        check must be skipped — even if set to a large value."""
+        from bot.analysis import detect_rug_pull_risk
+        ticker = {"ticker": {"high": "100", "last": "95", "vol_idr": "5000000"}}
+        result = detect_rug_pull_risk(ticker, min_trades_24h=1000)
+        assert not result.detected, (
+            f"Expected no detection (field missing), got reason={result.reason!r}"
+        )
+
+    def test_explicit_zero_trade_count_flags_dead(self):
+        """When the ticker explicitly provides trade_count=0, the filter
+        must trigger for min_trades_24h > 0."""
+        from bot.analysis import detect_rug_pull_risk
+        ticker = {"ticker": {"high": "10", "last": "9.5", "vol_idr": "500000",
+                              "trade_count": "0"}}
+        result = detect_rug_pull_risk(ticker, min_trades_24h=10)
+        assert result.detected
+        assert "dead_coin_trades" in result.reason
+
+    def test_sufficient_trade_count_does_not_flag(self):
+        """When trade_count field is present and above threshold, no flag."""
+        from bot.analysis import detect_rug_pull_risk
+        ticker = {"ticker": {"high": "100", "last": "95", "vol_idr": "5000000",
+                              "count": "500"}}
+        result = detect_rug_pull_risk(ticker, min_trades_24h=100)
+        assert not result.detected
+
+    def test_btc_like_ticker_no_trade_count_passes(self):
+        """Ticker without trade_count (like Indodax BTC) must pass all checks
+        when volume and price-drop checks are also satisfied."""
+        from bot.analysis import detect_rug_pull_risk
+        # Typical Indodax btc_idr ticker shape — no trade_count field
+        ticker = {"ticker": {"high": "1600000000", "last": "1550000000",
+                              "vol_idr": "50000000000"}}
+        result = detect_rug_pull_risk(
+            ticker,
+            max_drop_24h_pct=0.50,
+            min_volume_24h_idr=1_000_000,
+            min_trades_24h=100,  # non-zero but field missing → must be skipped
+        )
+        assert not result.detected, (
+            f"btc_idr-like ticker was incorrectly blocked: {result.reason!r}"
+        )
+
+
+# ===========================================================================
+# TradingSignal metadata field
+# ===========================================================================
+
+class TestTradingSignalMetadata:
+    """TradingSignal must carry an optional metadata dict."""
+
+    def test_default_metadata_is_empty(self):
+        snap = _make_snap()
+        sig = TradingSignal(pair="btc_idr", snapshot=snap, signal_type="buy")
+        assert sig.metadata == {}
+
+    def test_metadata_stores_partial_tp_info(self):
+        snap = _make_snap()
+        sig = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="partial_tp",
+            metadata={"fraction": 0.5, "level": 2},
+        )
+        assert sig.metadata["fraction"] == 0.5
+        assert sig.metadata["level"] == 2
+
+    def test_metadata_stores_cancel_reason(self):
+        snap = _make_snap()
+        sig = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="cancel_buy",
+            metadata={"reason": "sell signal (bearish candle)"},
+        )
+        assert "sell signal" in sig.metadata["reason"]
+
+
+# ===========================================================================
+# StrategyEngine — re-analysis gate for resume_buy
+# ===========================================================================
+
+class TestStrategyEngineResumeBuyCancelGate:
+    """StrategyEngine must emit cancel_buy (not resume_buy) when market
+    conditions turn bearish while a pending buy is open."""
+
+    def _make_strategy_engine(self, snap, tracker) -> StrategyEngine:
+        config = _make_config()
+        config.trailing_stop_pct = 0.0
+        config.trailing_tp_pct = 0.0
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        cache = DataCache()
+        signals = SignalQueue()
+        se = StrategyEngine(trader, config, cache, signals)
+        return se
+
+    def test_sell_decision_cancels_pending_buy(self):
+        """Sell signal while buy is pending → cancel_buy signal emitted."""
+        snap = _make_snap(action="sell")
+        tracker = _make_tracker(base_position=0.0, has_pending_buy=True)
+        tracker.base_position = 0.0
+        se = self._make_strategy_engine(snap, tracker)
+        signals = SignalQueue()
+        se._signals = signals
+        se._evaluate("btc_idr", snap)
+        sig = signals.get(timeout=0.1)
+        assert sig is not None
+        assert sig.signal_type == "cancel_buy"
+        assert "sell signal" in sig.metadata.get("reason", "")
+
+    def test_trending_down_regime_cancels_pending_buy_when_no_position(self):
+        """trending_down regime ≥ 0.5 while no position → cancel_buy signal."""
+        snap = _make_snap(action="hold")
+        regime = MagicMock()
+        regime.regime = "trending_down"
+        regime.strength = 0.7
+        snap["regime"] = regime
+        tracker = _make_tracker(base_position=0.0, has_pending_buy=True)
+        se = self._make_strategy_engine(snap, tracker)
+        signals = SignalQueue()
+        se._signals = signals
+        se._evaluate("btc_idr", snap)
+        sig = signals.get(timeout=0.1)
+        assert sig is not None
+        assert sig.signal_type == "cancel_buy"
+        assert "trending_down" in sig.metadata.get("reason", "")
+
+    def test_trending_down_does_not_cancel_when_position_held(self):
+        """When base_position > 0 (partial fill), bearish regime must NOT cancel
+        the pending buy — we already hold coins and must let the buy complete."""
+        snap = _make_snap(action="hold")
+        regime = MagicMock()
+        regime.regime = "trending_down"
+        regime.strength = 0.8
+        snap["regime"] = regime
+        tracker = _make_tracker(base_position=0.001, has_pending_buy=True)
+        se = self._make_strategy_engine(snap, tracker)
+        signals = SignalQueue()
+        se._signals = signals
+        se._evaluate("btc_idr", snap)
+        sig = signals.get(timeout=0.1)
+        assert sig is not None
+        # Must still resume, not cancel
+        assert sig.signal_type == "resume_buy"
+
+    def test_hold_decision_resumes_pending_buy(self):
+        """Neutral market (hold decision) keeps the resume_buy signal path."""
+        snap = _make_snap(action="hold")
+        tracker = _make_tracker(base_position=0.0, has_pending_buy=True)
+        se = self._make_strategy_engine(snap, tracker)
+        signals = SignalQueue()
+        se._signals = signals
+        se._evaluate("btc_idr", snap)
+        sig = signals.get(timeout=0.1)
+        assert sig is not None
+        assert sig.signal_type == "resume_buy"
+
+    def test_trending_down_low_strength_resumes_pending_buy(self):
+        """trending_down with strength < 0.5 must NOT trigger cancel."""
+        snap = _make_snap(action="hold")
+        regime = MagicMock()
+        regime.regime = "trending_down"
+        regime.strength = 0.4  # below threshold
+        snap["regime"] = regime
+        tracker = _make_tracker(base_position=0.0, has_pending_buy=True)
+        se = self._make_strategy_engine(snap, tracker)
+        signals = SignalQueue()
+        se._signals = signals
+        se._evaluate("btc_idr", snap)
+        sig = signals.get(timeout=0.1)
+        assert sig is not None
+        assert sig.signal_type == "resume_buy"
+
+
+# ===========================================================================
+# StrategyEngine — partial take-profit signals
+# ===========================================================================
+
+class TestStrategyEnginePartialTP:
+    """StrategyEngine must emit partial_tp signals when partial TP conditions
+    are met for an open position."""
+
+    def _evaluate(self, snap, tracker, **cfg_overrides):
+        defaults = {
+            "partial_tp_fraction": 0.0,
+            "partial_tp2_fraction": 0.0,
+            "partial_tp2_target_pct": 0.0,
+            "partial_tp3_fraction": 0.0,
+            "partial_tp3_target_pct": 0.0,
+            "trailing_stop_pct": 0.0,
+            "trailing_tp_pct": 0.0,
+        }
+        defaults.update(cfg_overrides)
+        config = _make_config(**defaults)
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        cache = DataCache()
+        signals = SignalQueue()
+        se = StrategyEngine(trader, config, cache, signals)
+        se._evaluate("btc_idr", snap)
+        return signals.get(timeout=0.1)
+
+    def test_partial_tp1_emitted_when_price_at_tp(self):
+        """partial_tp level 1 must be emitted when price >= decision.take_profit."""
+        snap = _make_snap(price=110_000.0, action="hold")
+        snap["decision"].take_profit = 105_000.0
+        tracker = _make_tracker(base_position=0.001)
+        tracker.partial_tp_taken = False
+        tracker.stop_reason = MagicMock(return_value=None)
+        sig = self._evaluate(snap, tracker, partial_tp_fraction=0.5)
+        assert sig is not None
+        assert sig.signal_type == "partial_tp"
+        assert sig.metadata["level"] == 1
+        assert sig.metadata["fraction"] == 0.5
+
+    def test_partial_tp1_not_emitted_when_price_below_tp(self):
+        """partial_tp level 1 must NOT be emitted when price < decision.take_profit."""
+        snap = _make_snap(price=100_000.0, action="hold")
+        snap["decision"].take_profit = 110_000.0
+        tracker = _make_tracker(base_position=0.001)
+        tracker.partial_tp_taken = False
+        tracker.stop_reason = MagicMock(return_value=None)
+        sig = self._evaluate(snap, tracker, partial_tp_fraction=0.5)
+        # Should be None (holding, no signal)
+        assert sig is None
+
+    def test_partial_tp1_not_emitted_when_already_taken(self):
+        """partial_tp level 1 must NOT repeat after the flag is set."""
+        snap = _make_snap(price=115_000.0, action="hold")
+        snap["decision"].take_profit = 105_000.0
+        tracker = _make_tracker(base_position=0.001)
+        tracker.partial_tp_taken = True  # already taken
+        tracker.stop_reason = MagicMock(return_value=None)
+        sig = self._evaluate(snap, tracker, partial_tp_fraction=0.5)
+        assert sig is None
+
+    def test_partial_tp2_emitted_when_price_above_avg_cost_target(self):
+        """partial_tp level 2 must be emitted when price >= avg_cost × (1 + target)."""
+        snap = _make_snap(price=120_000.0, action="hold")
+        snap["decision"].take_profit = None  # no level-1 TP
+        tracker = _make_tracker(base_position=0.001)
+        tracker.partial_tp_taken = True   # level 1 done
+        tracker.partial_tp2_taken = False
+        tracker.avg_cost = 100_000.0
+        tracker.stop_reason = MagicMock(return_value=None)
+        # 120_000 >= 100_000 * (1 + 0.15)
+        sig = self._evaluate(
+            snap, tracker,
+            partial_tp2_fraction=0.3,
+            partial_tp2_target_pct=0.15,
+        )
+        assert sig is not None
+        assert sig.signal_type == "partial_tp"
+        assert sig.metadata["level"] == 2
+        assert sig.metadata["fraction"] == 0.3
+
+    def test_partial_tp3_emitted_correctly(self):
+        """partial_tp level 3 must be emitted when price >= avg_cost × (1 + target)."""
+        snap = _make_snap(price=130_000.0, action="hold")
+        snap["decision"].take_profit = None
+        tracker = _make_tracker(base_position=0.001)
+        tracker.partial_tp_taken = True
+        tracker.partial_tp2_taken = True
+        tracker.partial_tp3_taken = False
+        tracker.avg_cost = 100_000.0
+        tracker.stop_reason = MagicMock(return_value=None)
+        # 130_000 >= 100_000 * (1 + 0.25)
+        sig = self._evaluate(
+            snap, tracker,
+            partial_tp3_fraction=0.2,
+            partial_tp3_target_pct=0.25,
+        )
+        assert sig is not None
+        assert sig.signal_type == "partial_tp"
+        assert sig.metadata["level"] == 3
+        assert sig.metadata["fraction"] == 0.2
+
+
+# ===========================================================================
+# ExecutionEngine — cancel_buy and partial_tp signal handling
+# ===========================================================================
+
+class TestExecutionEngineCancelBuyAndPartialTP:
+    """ExecutionEngine must correctly handle cancel_buy and partial_tp signals."""
+
+    def _make_exec_engine(self, trader):
+        config = _make_config()
+        signals = SignalQueue()
+        risk = RiskEngine(config)
+        return ExecutionEngine(trader, config, signals, risk), signals
+
+    def test_cancel_buy_calls_cancel_methods(self):
+        """cancel_buy signal must cancel orders and clear the pending buy state."""
+        tracker = _make_tracker(base_position=0.0, has_pending_buy=True)
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader._cancel_open_orders = MagicMock()
+        trader._persist_after_trade = MagicMock()
+        trader._resume_buy_retry_counts = {}
+        trader.multi_manager = None
+
+        exec_eng, signals = self._make_exec_engine(trader)
+        snap = _make_snap(price=100_000.0, action="sell")
+        signal = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="cancel_buy",
+            metadata={"reason": "sell signal (bearish)"},
+        )
+        exec_eng._process(signal)
+        trader._cancel_open_orders.assert_called_once_with("btc_idr", ("buy",))
+        tracker.cancel_pending_buy.assert_called_once()
+
+    def test_cancel_buy_returns_cancelled_outcome(self):
+        """cancel_buy must produce an outcome with action=cancel_buy + status=cancelled."""
+        outcomes = []
+        tracker = _make_tracker(base_position=0.0, has_pending_buy=True)
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader._cancel_open_orders = MagicMock()
+        trader._persist_after_trade = MagicMock()
+        trader._resume_buy_retry_counts = {}
+        trader.multi_manager = None
+
+        config = _make_config()
+        signals = SignalQueue()
+        risk = RiskEngine(config)
+        exec_eng = ExecutionEngine(
+            trader, config, signals, risk,
+            on_outcome=lambda sig, out: outcomes.append(out),
+        )
+        snap = _make_snap(price=100_000.0, action="sell")
+        signal = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="cancel_buy",
+            metadata={"reason": "sell signal"},
+        )
+        exec_eng._process(signal)
+        assert len(outcomes) == 1
+        assert outcomes[0]["action"] == "cancel_buy"
+        assert outcomes[0]["status"] == "cancelled"
+
+    def test_partial_tp_calls_partial_take_profit(self):
+        """partial_tp signal must invoke trader.partial_take_profit with correct fraction."""
+        tracker = _make_tracker(base_position=0.001)
+        tracker.as_dict = MagicMock(return_value={"realized_pnl": 1000.0})
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader.partial_take_profit = MagicMock(
+            return_value={"status": "partial_tp", "amount": 0.0005}
+        )
+
+        exec_eng, _ = self._make_exec_engine(trader)
+        snap = _make_snap(price=115_000.0, action="hold")
+        signal = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="partial_tp",
+            metadata={"fraction": 0.5, "level": 1},
+        )
+        exec_eng._process(signal)
+        trader.partial_take_profit.assert_called_once_with(snap, 0.5)
+
+    def test_partial_tp_level2_sets_partial_tp2_taken(self):
+        """After level-2 partial TP, tracker.partial_tp2_taken must be set to True."""
+        tracker = _make_tracker(base_position=0.001)
+        tracker.as_dict = MagicMock(return_value={"realized_pnl": 500.0})
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader.partial_take_profit = MagicMock(
+            return_value={"status": "partial_tp", "amount": 0.0003}
+        )
+
+        exec_eng, _ = self._make_exec_engine(trader)
+        snap = _make_snap(price=120_000.0, action="hold")
+        signal = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="partial_tp",
+            metadata={"fraction": 0.3, "level": 2},
+        )
+        exec_eng._process(signal)
+        assert tracker.partial_tp2_taken is True
+
+    def test_partial_tp_level3_sets_partial_tp3_taken(self):
+        """After level-3 partial TP, tracker.partial_tp3_taken must be set to True."""
+        tracker = _make_tracker(base_position=0.001)
+        tracker.as_dict = MagicMock(return_value={"realized_pnl": 750.0})
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader.partial_take_profit = MagicMock(
+            return_value={"status": "partial_tp", "amount": 0.0002}
+        )
+
+        exec_eng, _ = self._make_exec_engine(trader)
+        snap = _make_snap(price=130_000.0, action="hold")
+        signal = TradingSignal(
+            pair="btc_idr",
+            snapshot=snap,
+            signal_type="partial_tp",
+            metadata={"fraction": 0.2, "level": 3},
+        )
+        exec_eng._process(signal)
+        assert tracker.partial_tp3_taken is True
