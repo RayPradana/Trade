@@ -5,16 +5,18 @@ import datetime
 import logging
 import os
 import signal
+import statistics as _statistics
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Dict, List, Optional
 
 import requests
 
 from bot.config import BotConfig
 from bot.trader import Trader
 from bot.journal import TradeJournal
+from bot.engine import TradingOrchestrator
 from bot.risk_management import (
     check_circuit_breaker as rm_check_circuit_breaker,
     check_max_drawdown,
@@ -95,6 +97,9 @@ _STATUS_ICONS = {
     "force_sold":     "📤",
     "grid_simulated": "🔲",
     "grid_placed":    "🔲",
+    "partial_tp":     "🎯",
+    "cancelled":      "⚠️",
+    "scanning":       "🔍",
 }
 
 # ── Display primitives ───────────────────────────────────────────────────
@@ -417,7 +422,7 @@ def _log_signal(snapshot: dict) -> None:
         spread_str = "N/A"
         imb_str    = "N/A"
         imb_color  = _DIM
-    vol_str = f"{vol.volatility:.4f}" if vol else "N/A"
+    vol_str = f"{vol.volatility * 100:.2f}%" if vol else "N/A"
     logging.info(
         "   %s├─%s market  : spread=%s%s%s  imbalance=%s%s%s  vol=%s%s%s",
         _DIM, _RESET,
@@ -483,8 +488,8 @@ def _log_outcome(outcome: dict) -> None:
     icon   = _STATUS_ICONS.get(status, "❓")
 
     status_color = (
-        _GREEN  if status in ("simulated", "placed")
-        else _RED    if status in ("stopped", "force_sold")
+        _GREEN  if status in ("simulated", "placed", "partial_tp")
+        else _RED    if status in ("stopped", "force_sold", "cancelled")
         else _YELLOW if status in ("skipped",)
         else _DIM
     )
@@ -706,6 +711,281 @@ def _log_holding(
     )
 
 
+def _run_engine_monitor(
+    orchestrator: TradingOrchestrator,
+    trader: "Trader",
+    config: "BotConfig",
+    journal: "TradeJournal",
+    shutdown: threading.Event,
+    tasks: list,
+    autonomous_state: "AutonomousTradingState",
+    start_time: float,
+    crash_history: list,
+    error_log: list,
+    components: list,
+    polling_config: "PollingConfig",
+    now_ms: object,
+) -> None:
+    """Main-thread monitoring loop for engine mode.
+
+    The heavy lifting (market data fetching, strategy evaluation, order
+    execution) is handled by the :class:`~bot.engine.TradingOrchestrator`
+    background threads.  This function runs in the main thread and is
+    responsible for:
+
+    * Periodic health checks and scheduled housekeeping tasks.
+    * Cycle-based performance summaries and state backups.
+    * Logging engine health metrics.
+    * Detecting unhealthy engines and logging warnings.
+    """
+    _now_ms = now_ms  # keep consistent with the old loop alias
+    scan_cycles = 0
+    portfolio: dict = {}
+
+    while not shutdown.is_set():
+        scan_cycles += 1
+        logging.info(_separator(f"Engine cycle #{scan_cycles}"))
+
+        # ── Display all cached pairs + portfolio ──────────────────────────────
+        try:
+            _cached_pairs = orchestrator.cache.pairs()
+            if _cached_pairs:
+                _active = trader.active_positions
+                # Pop execution outcomes buffered by ExecutionEngine since
+                # the previous cycle.  Convert to {pair: outcome} keeping the
+                # most-recent outcome when multiple exist for the same pair.
+                _exec_outcomes: dict = {}
+                for _ep, _eo in orchestrator.pop_recent_outcomes():
+                    _exec_outcomes[_ep] = _eo
+
+                for _disp_pair in _cached_pairs:
+                    _snap = orchestrator.cache.get(_disp_pair)
+                    if not _snap:
+                        continue
+                    _log_signal(_snap)
+                    # ── Outcome: placed / skipped / simulated ─────────────────
+                    if _disp_pair in _exec_outcomes:
+                        # Real outcome from ExecutionEngine (placed, simulated, etc.)
+                        _log_outcome(_exec_outcomes[_disp_pair])
+                    else:
+                        _decision = _snap.get("decision")
+                        if _decision:
+                            if _decision.action == "hold":
+                                # No trade was attempted — show skipped inline
+                                _log_outcome({
+                                    "action": "hold",
+                                    "status": "skipped",
+                                    "reason": _decision.reason,
+                                })
+                            elif _decision.action == "buy" and trader.at_max_positions():
+                                # All slots full — buy skipped
+                                _log_outcome({
+                                    "action": "buy",
+                                    "status": "skipped",
+                                    "reason": "max_positions",
+                                })
+                            elif _decision.action == "sell":
+                                # Bearish signal but no position to exit
+                                _no_pos_tracker = _active.get(_disp_pair)
+                                if _no_pos_tracker is None or _no_pos_tracker.base_position <= 0:
+                                    _log_outcome({
+                                        "action": "sell",
+                                        "status": "skipped",
+                                        "reason": f"no_position ({_decision.reason[:60]})" if _decision.reason else "no_position",
+                                    })
+                            elif _decision.action == "buy":
+                                # Catch-all: a buy signal was emitted by StrategyEngine
+                                # but no execution outcome was captured this cycle.
+                                # Common causes: (1) still queued in SignalQueue at
+                                # display time, (2) outcome callback threw and was
+                                # silently dropped.  Risk rejections are already
+                                # covered by ExecutionEngine pushing a skipped outcome,
+                                # so this branch mostly handles timing races.
+                                # Skip held-position pairs — they are shown by _log_holding.
+                                _held = _active.get(_disp_pair)
+                                if not (_held and _held.base_position > 0):
+                                    _log_outcome({
+                                        "action": "buy",
+                                        "status": "skipped",
+                                        "reason": "pending_execution",
+                                    })
+                        else:
+                            # No analysis decision yet — not enough candle data or
+                            # MarketDataEngine hasn't completed the first cycle.
+                            # Only show for flat pairs (held pairs shown via _log_holding).
+                            _held = _active.get(_disp_pair)
+                            if not (_held and _held.base_position > 0):
+                                _log_outcome({
+                                    "action": "—",
+                                    "status": "scanning",
+                                    "reason": "awaiting_analysis",
+                                })
+                    # Show position status for pairs where we hold a position
+                    _tracker = _active.get(_disp_pair)
+                    if _tracker and _tracker.base_position > 0:
+                        _price = _snap.get("price", 0.0)
+                        _port = _tracker.as_dict(_price)
+                        _log_holding(
+                            _disp_pair,
+                            _price,
+                            _port,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                # Overall portfolio summary — always show (even when flat)
+                _rep_pair = (
+                    next(iter(_active)) if _active
+                    else (_cached_pairs[0] if _cached_pairs else config.pair)
+                )
+                _rep_snap = orchestrator.cache.get(_rep_pair)
+                _rep_price = (_rep_snap or {}).get("price", 0.0)
+                try:
+                    _agg = trader.portfolio_snapshot(_rep_pair, _rep_price)
+                    _log_portfolio(
+                        _agg,
+                        config.initial_capital,
+                        trailing_stop_enabled=config.trailing_stop_pct > 0,
+                        trailing_tp_enabled=config.trailing_tp_pct > 0,
+                    )
+                except Exception:
+                    pass
+            else:
+                logging.info("   ⏳ Waiting for market data (%s) …", config.pair)
+        except Exception as _disp_exc:
+            logging.debug("Engine cycle display error: %s", _disp_exc)
+
+        try:
+            # ── Scheduled housekeeping tasks ─────────────────────────────────
+            _schedule_result = schedule_tasks(tasks, current_time=_now_ms())
+            for _task_name in _schedule_result.tasks_due:
+                _task_idx = next(
+                    (i for i, t in enumerate(tasks) if t.name == _task_name), None,
+                )
+                if _task_idx is None:
+                    continue
+                _task = tasks[_task_idx]
+                _task_success = True
+                try:
+                    if _task_name == "health_check":
+                        _h = orchestrator.health()
+                        logging.debug(
+                            "⚙  Engine health  market_data=%s  strategy=%s  execution=%s"
+                            "  cache=%d pairs  queue=%d",
+                            _h["market_data_engine"],
+                            _h["strategy_engine"],
+                            _h["execution_engine"],
+                            len(_h["cache_pairs"]),
+                            _h["signal_queue_size"],
+                        )
+                        # Warn if any engine thread has died
+                        for engine_name in ("market_data_engine", "strategy_engine", "execution_engine"):
+                            if _h.get(engine_name) == "stopped":
+                                logging.warning(
+                                    "⚠️  %s has stopped unexpectedly!", engine_name
+                                )
+
+                    elif _task_name == "risk_monitoring":
+                        active = trader.active_positions
+                        for _pair, _tracker in active.items():
+                            try:
+                                _portfolio = _tracker.as_dict(
+                                    orchestrator.cache.get(_pair)
+                                    and orchestrator.cache.get(_pair).get("price", 0.0) or 0.0
+                                )
+                                _drawdown_result = check_max_drawdown(
+                                    current_equity=_portfolio.get("equity", config.initial_capital),
+                                    peak_equity=max(
+                                        _portfolio.get("equity", config.initial_capital),
+                                        config.initial_capital,
+                                    ),
+                                    max_drawdown_pct=0.20,
+                                )
+                                if _drawdown_result.is_triggered:
+                                    logging.warning(
+                                        "⚠️  Max drawdown triggered for %s — drawdown=%.1f%%",
+                                        _pair,
+                                        _drawdown_result.drawdown_pct * 100,
+                                    )
+                            except Exception:
+                                pass
+
+                    elif _task_name == "strategy_review":
+                        active = trader.active_positions
+                        if active:
+                            for _pair, _tracker in active.items():
+                                try:
+                                    _snap = orchestrator.cache.get(_pair)
+                                    if _snap:
+                                        _new_strategy = auto_switch_strategy(
+                                            autonomous_state,
+                                            _snap,
+                                        )
+                                        if _new_strategy:
+                                            logging.info(
+                                                "🔄 Auto-switch strategy → %s", _new_strategy
+                                            )
+                                except Exception:
+                                    pass
+
+                except Exception as _task_exc:
+                    _task_success = False
+                    logging.debug("Scheduled task %s failed: %s", _task_name, _task_exc)
+                tasks[_task_idx] = update_task_after_run(
+                    _task, success=_task_success, current_time=_now_ms(),
+                )
+
+            # ── Periodic performance summary ──────────────────────────────────
+            if scan_cycles % config.cycle_summary_interval == 0:
+                active = trader.active_positions
+                if active:
+                    _pair_for_summary = next(iter(active))
+                    _snap = orchestrator.cache.get(_pair_for_summary)
+                    _price_for_summary = (_snap or {}).get("price", 0.0)
+                    try:
+                        portfolio = trader.active_positions[_pair_for_summary].as_dict(
+                            _price_for_summary
+                        )
+                        logging.info(
+                            "📊 %sPeriodic summary%s  cycle #%d : pnl=%s  equity=Rp %s  "
+                            "trades=%d  win=%.0f%%",
+                            _BOLD, _RESET, scan_cycles,
+                            _pnl_str(portfolio.get("realized_pnl", 0.0)),
+                            f"{portfolio.get('equity', 0.0):15,.2f}",
+                            portfolio.get("trade_count", 0),
+                            portfolio.get("win_rate", 0.0) * 100,
+                        )
+                    except Exception:
+                        pass
+                logging.info("📓 %s", journal.summary_str())
+
+            # ── Periodic state backup ─────────────────────────────────────────
+            if (
+                config.state_path is not None
+                and config.state_backup_interval > 0
+                and scan_cycles % config.state_backup_interval == 0
+            ):
+                try:
+                    _backup_path = config.state_path.with_name(
+                        config.state_path.stem + "_backup" + config.state_path.suffix
+                    )
+                    trader.persistence.backup(_backup_path)
+                except Exception as _bk_exc:
+                    logging.debug("State backup failed: %s", _bk_exc)
+
+        except Exception as _exc:
+            logging.warning("Engine monitor error: %s", _exc)
+
+        logging.info(_separator())
+
+        # Sleep based on strategy engine interval so we're not spinning.
+        _sleep = max(1.0, config.strategy_engine_interval)
+        shutdown.wait(timeout=_sleep)
+
+        if config.run_once:
+            break
+
+
 def main() -> None:
     configure_logging()  # early bootstrap logging before config is available
     config = BotConfig.from_env()
@@ -807,6 +1087,53 @@ def main() -> None:
             trader.tracker.base_position,
         )
 
+    # ── Engine mode: hand off to multi-threaded engine architecture ─────────
+    if config.engine_mode:
+        logging.info(
+            "%s⚙  ENGINE MODE%s  — launching low-latency engine architecture …",
+            _BOLD, _RESET,
+        )
+        logging.info(
+            "   Market Data Engine  →  Data Cache  →  Strategy Engine\n"
+            "                                               ↓\n"
+            "   Risk Engine  ←  Execution Engine  ←  Signal Queue",
+        )
+        orchestrator = TradingOrchestrator(
+            trader,
+            config,
+            notify_fn=lambda text: _notify(config, text),
+            on_outcome=None,  # outcomes are buffered by orchestrator and shown in cycle
+        )
+        # Eagerly load the full pair list so MarketDataEngine scans ALL pairs
+        # from its very first iteration (not just config.pair).
+        try:
+            trader.initialize_pairs()
+        except Exception as _ip_exc:
+            logging.warning(
+                "initialize_pairs failed, MarketDataEngine will fall back to config.pair: %s",
+                _ip_exc,
+            )
+        orchestrator.start()
+        try:
+            _run_engine_monitor(
+                orchestrator,
+                trader,
+                config,
+                journal,
+                _shutdown,
+                _tasks,
+                _autonomous_state,
+                _start_time,
+                _crash_history,
+                _error_log,
+                _components,
+                _polling_config,
+                _now_ms,
+            )
+        finally:
+            orchestrator.stop()
+        return
+
     while not _shutdown.is_set():
         cycle += 1
         logging.info(_separator(f"Cycle #{cycle}"))
@@ -865,6 +1192,146 @@ def main() -> None:
                                 "🔄 Health check: needs restart (errors=%d)",
                                 _health["error_count"],
                             )
+                    elif _task_name == "pair_rotation":
+                        # ── Pair rotation using scanning + autonomous modules ───
+                        try:
+                            # Score all tracked pairs with multi-market scanning
+                            _scan_scores = trader.get_pair_scan_scores()
+
+                            # Build price lists for direct scan calls
+                            _ph: Dict[str, List[float]] = {
+                                _p: [_px for _, _px in _buf]
+                                for _p, _buf in trader._price_history.items()
+                                if len(_buf) >= 20
+                            }
+
+                            # Momentum scan — identify pairs with strong ROC
+                            _mom = scan_momentum(_ph)
+                            _bull = [r.market for r in _mom if r.signal == "bullish"]
+
+                            # Trend scan — identify pairs in confirmed uptrend
+                            _trnd = scan_trends(_ph)
+                            _up = [r.market for r in _trnd if r.trend == "uptrend"]
+
+                            if _bull or _up:
+                                logging.info(
+                                    "📊 Pair scan — bullish momentum: %s | uptrend: %s",
+                                    _bull[:3], _up[:3],
+                                )
+
+                            # Build pair_data for rotate_pairs
+                            _pair_data: Dict[str, Dict] = {}
+                            for _p, _score in _scan_scores.items():
+                                _pbuf = trader._price_history.get(_p, [])
+                                _pprices = [_px for _, _px in _pbuf]
+                                _pvol = trader._pair_volume(_p)
+                                _pvolatility = 0.0
+                                if len(_pprices) >= 5:
+                                    _prets = [
+                                        (_pprices[i] - _pprices[i - 1]) / _pprices[i - 1]
+                                        for i in range(1, len(_pprices))
+                                        if _pprices[i - 1] > 0
+                                    ]
+                                    if len(_prets) >= 2:
+                                        _pvolatility = _statistics.pstdev(_prets)
+                                _pair_data[_p] = {
+                                    "volume": _pvol,
+                                    "volatility": _pvolatility,
+                                    "spread": 0.0,
+                                    "momentum": _score,
+                                }
+                            if _pair_data:
+                                _rotation = rotate_pairs(
+                                    pair_data=_pair_data,
+                                    current_pair=config.pair,
+                                    max_pairs=getattr(config, "multi_position_max", 3),
+                                    min_volume=getattr(config, "min_volume_idr", 0.0),
+                                )
+                                if _rotation.rotated:
+                                    logging.info(
+                                        "🔄 Pair rotation: %s → %s (%s)",
+                                        _rotation.previous_pair,
+                                        _rotation.new_pair,
+                                        _rotation.reason,
+                                    )
+                                elif _rotation.selected_pairs:
+                                    logging.debug(
+                                        "📊 Top pairs: %s (current=%s is optimal)",
+                                        _rotation.selected_pairs[:3],
+                                        _rotation.previous_pair,
+                                    )
+                            for _comp in _components:
+                                if _comp.name == "scanner":
+                                    _comp.is_healthy = True
+                                    _comp.consecutive_failures = 0
+                        except Exception as _pr_exc:
+                            logging.debug("Pair rotation failed: %s", _pr_exc)
+                    elif _task_name == "strategy_review":
+                        # ── Strategy optimization + auto-switch ──────────────────
+                        try:
+                            if snapshot and snapshot.get("candles"):
+                                _sr_candles = snapshot["candles"]
+                                if len(_sr_candles) >= 20:
+                                    _opt = optimize_strategy(_sr_candles)
+                                    if _opt.fitness_score > 0.1:
+                                        logging.info(
+                                            "🤖 Strategy optimization: best=%s"
+                                            " (fitness=%.4f, params=%s)",
+                                            _opt.recommended_strategy,
+                                            _opt.fitness_score,
+                                            _opt.recommended_params,
+                                        )
+
+                            # Gather per-strategy stats from all active trackers
+                            _strategy_stats: Dict[str, Dict] = {}
+                            for _t in trader.active_positions.values():
+                                for _sn, _ss in getattr(_t, "_strategy_stats", {}).items():
+                                    if _sn not in _strategy_stats:
+                                        _strategy_stats[_sn] = dict(_ss)
+                                    else:
+                                        for _k, _v in _ss.items():
+                                            try:
+                                                _strategy_stats[_sn][_k] = (
+                                                    (_strategy_stats[_sn].get(_k, 0) + float(_v)) / 2
+                                                )
+                                            except (TypeError, ValueError):
+                                                pass
+                            # Fall back to the primary tracker
+                            if not _strategy_stats and hasattr(trader, "tracker"):
+                                _strategy_stats = dict(trader.tracker._strategy_stats)
+
+                            if _strategy_stats:
+                                _ph_prices = [
+                                    _px for _, _px in
+                                    trader._price_history.get(config.pair, [])[-20:]
+                                ]
+                                _switch = auto_switch_strategy(
+                                    strategy_stats=_strategy_stats,
+                                    current_strategy=getattr(config, "strategy", ""),
+                                    prices=_ph_prices,
+                                )
+                                if _switch.switched:
+                                    logging.info(
+                                        "🔄 Strategy switch recommended: %s → %s"
+                                        " (%s) | regime=%s",
+                                        _switch.previous_strategy,
+                                        _switch.new_strategy,
+                                        _switch.reason,
+                                        _switch.regime,
+                                    )
+                                elif _switch.regime not in ("unknown", ""):
+                                    logging.debug(
+                                        "📊 Strategy review: regime=%s,"
+                                        " current=%s still optimal",
+                                        _switch.regime,
+                                        _switch.previous_strategy,
+                                    )
+                            for _comp in _components:
+                                if _comp.name == "strategy_engine":
+                                    _comp.is_healthy = True
+                                    _comp.consecutive_failures = 0
+                        except Exception as _sr_exc:
+                            logging.debug("Strategy review failed: %s", _sr_exc)
                     elif _task_name == "risk_monitoring":
                         # ── Risk management monitoring via risk_management module ──
                         try:
@@ -887,6 +1354,88 @@ def main() -> None:
                                         _comp.consecutive_failures = 0
                         except Exception as _rm_exc:
                             logging.debug("Risk monitoring check failed: %s", _rm_exc)
+                        # ── Max drawdown check (portfolio-wide) ──────────────────
+                        try:
+                            _main_tracker = getattr(trader, "tracker", None)
+                            if _main_tracker is not None:
+                                _eq_hist = getattr(_main_tracker, "equity_history", [])
+                                if _eq_hist and len(_eq_hist) >= 2:
+                                    _dd = check_max_drawdown(
+                                        equity_history=_eq_hist,
+                                        max_drawdown_pct=config.max_loss_pct * 100,
+                                        warning_pct=config.max_loss_pct * 100 * 0.75,
+                                    )
+                                    if _dd.should_stop:
+                                        logging.warning(
+                                            "🛑 Portfolio max drawdown reached:"
+                                            " %.2f%% ≥ %.2f%%",
+                                            _dd.current_drawdown_pct,
+                                            _dd.max_drawdown_pct,
+                                        )
+                                    elif _dd.should_reduce:
+                                        logging.warning(
+                                            "⚠️ Drawdown warning: %.2f%%"
+                                            " — consider reducing exposure",
+                                            _dd.current_drawdown_pct,
+                                        )
+                        except Exception as _dd_exc:
+                            logging.debug("Max drawdown monitoring failed: %s", _dd_exc)
+                        # ── Dynamic risk adjustment advisory ─────────────────────
+                        try:
+                            _main_tracker = getattr(trader, "tracker", None)
+                            if _main_tracker is not None:
+                                _rpnl = list(
+                                    _main_tracker._all_sell_pnls[-10:]
+                                ) if _main_tracker._all_sell_pnls else []
+                                if _rpnl:
+                                    _eq_hist = getattr(_main_tracker, "equity_history", [])
+                                    _cur_dd = 0.0
+                                    if _eq_hist and len(_eq_hist) >= 2:
+                                        _pk = max(_eq_hist)
+                                        _cur = _eq_hist[-1]
+                                        _cur_dd = ((_pk - _cur) / _pk * 100) if _pk > 0 else 0.0
+                                    _dyn = adjust_risk_dynamically(
+                                        base_risk_pct=config.risk_per_trade * 100,
+                                        recent_pnl=_rpnl,
+                                        current_drawdown_pct=_cur_dd,
+                                        volatility=0.0,
+                                        win_rate=_main_tracker.win_rate,
+                                    )
+                                    if _dyn.scale_factor < 0.8:
+                                        logging.warning(
+                                            "📉 Risk monitoring: risk scaled down"
+                                            " to %.2f%% (factor=%.2f×, %s)",
+                                            _dyn.adjusted_risk_pct,
+                                            _dyn.scale_factor,
+                                            _dyn.reason,
+                                        )
+                                    elif _dyn.scale_factor > 1.1:
+                                        logging.info(
+                                            "📈 Risk monitoring: risk scaled up"
+                                            " to %.2f%% (factor=%.2f×, %s)",
+                                            _dyn.adjusted_risk_pct,
+                                            _dyn.scale_factor,
+                                            _dyn.reason,
+                                        )
+                        except Exception as _dr_exc:
+                            logging.debug(
+                                "Dynamic risk adjustment monitoring failed: %s", _dr_exc,
+                            )
+                        # ── Anomaly detection (ML-based) ─────────────────────────
+                        try:
+                            if snapshot and snapshot.get("candles"):
+                                _anom_candles = snapshot["candles"]
+                                if len(_anom_candles) >= 10:
+                                    _anom = ml_detect_anomalies(_anom_candles)
+                                    if _anom.is_anomaly:
+                                        logging.warning(
+                                            "🚨 ML anomaly detected (score=%.2f,"
+                                            " type=%s) — monitor closely",
+                                            _anom.anomaly_score,
+                                            _anom.anomaly_type,
+                                        )
+                        except Exception as _anom_exc:
+                            logging.debug("ML anomaly detection failed: %s", _anom_exc)
                     elif _task_name == "portfolio_analysis":
                         # ── Portfolio management analysis ─────────────────────────
                         try:
@@ -903,10 +1452,40 @@ def main() -> None:
                                     "📊 Diversification: score=%.2f, effective_assets=%.1f",
                                     _div.score, _div.effective_assets,
                                 )
-                                for _comp in _components:
-                                    if _comp.name == "portfolio_engine":
-                                        _comp.is_healthy = True
-                                        _comp.consecutive_failures = 0
+                            if _pa.get("rebalance"):
+                                _rb = _pa["rebalance"]
+                                if _rb.needs_rebalance:
+                                    logging.info(
+                                        "⚖️ Rebalance needed: %d trades,"
+                                        " turnover=%.0f, max_drift=%.2f%% (%s)",
+                                        len(_rb.actions),
+                                        _rb.total_turnover,
+                                        _rb.max_drift,
+                                        _rb.reason,
+                                    )
+                            if _pa.get("correlation"):
+                                _corr = _pa["correlation"]
+                                if _corr.risk_level in ("high", "critical"):
+                                    logging.warning(
+                                        "⚠️ High correlation risk: %s"
+                                        " (avg=%.2f, max=%.2f, pairs=%s)",
+                                        _corr.risk_level,
+                                        _corr.avg_correlation,
+                                        _corr.max_correlation,
+                                        _corr.high_pairs[:3],
+                                    )
+                                elif _corr.high_pairs:
+                                    logging.info(
+                                        "📊 Correlation: risk=%s, avg=%.2f,"
+                                        " high_pairs=%d",
+                                        _corr.risk_level,
+                                        _corr.avg_correlation,
+                                        len(_corr.high_pairs),
+                                    )
+                            for _comp in _components:
+                                if _comp.name == "portfolio_engine":
+                                    _comp.is_healthy = True
+                                    _comp.consecutive_failures = 0
                         except Exception as _pa_exc:
                             logging.debug("Portfolio analysis failed: %s", _pa_exc)
                     elif _task_name == "ml_regime_check":
@@ -997,7 +1576,12 @@ def main() -> None:
                             _BOLD, held_pair, _RESET,
                             _cancel_reason,
                         )
+                        # Cancel any live exchange orders before clearing the
+                        # in-memory tracker state — otherwise the orders remain
+                        # open on the exchange and may fill unexpectedly.
+                        trader._cancel_open_orders(held_pair, ("buy",))
                         held_tracker.cancel_pending_buy()
+                        trader._resume_buy_retry_counts.pop(held_pair, None)
                         if hasattr(trader, 'multi_manager') and trader.multi_manager is not None:
                             trader.multi_manager.return_position_cash(held_pair)
                         trader._persist_after_trade(held_pair)
@@ -1276,15 +1860,21 @@ def main() -> None:
                         f"PnL: Rp {portfolio['realized_pnl']:,.2f}",
                     )
 
-                    # ── Re-entry analysis after trail/stop sell ──────────────
-                    # When the exit was triggered by a trailing stop or stop
-                    # loss, analyse whether the coin still has upside potential.
-                    # If so, mark a pending buy at a lower target price so the
-                    # bot can re-enter instead of staying flat.
-                    if stop_reason in (
+                    # ── Re-entry analysis after any exit ─────────────────────
+                    # After any exit (trailing stop, stop loss, TP reached, sell
+                    # signal, dump) re-analyse whether the pair still has upside
+                    # potential for a fresh position.  This prevents the bot from
+                    # leaving a profitable coin too early and allows it to
+                    # compound gains by re-entering on a dip after TP.
+                    # analyze_reentry_opportunity checks market regime, trend, OB
+                    # pressure, and support levels — it returns None when
+                    # conditions are unfavourable so safe to call on every exit.
+                    _run_reentry = stop_reason in (
                         "trailing_stop", "stop_loss", "trailing_tp_triggered",
                         "momentum_exit", "post_entry_dump",
-                    ):
+                        "target_profit_reached",
+                    ) or (stop_reason is None and held_decision.action == "sell")
+                    if _run_reentry:
                         try:
                             _reentry = trader.analyze_reentry_opportunity(held_snapshot)
                             if _reentry and _reentry.get("reentry"):

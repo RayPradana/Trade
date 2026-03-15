@@ -1387,15 +1387,21 @@ def detect_rug_pull_risk(
         )
 
     # ── Trade count check ────────────────────────────────────────────────────
+    # Only apply when the ticker actually exposes a trade-count field.  Many
+    # exchanges (including Indodax) do NOT include ``trade_count`` / ``count``
+    # in their ticker response; treating a missing field as "0 trades" would
+    # incorrectly flag every pair on those exchanges as a dead coin.
     if min_trades_24h > 0:
-        trade_count = int(_f("trade_count", "count") or 0)
-        if trade_count < min_trades_24h:
-            return RugPullRisk(
-                detected=True,
-                reason=f"dead_coin_trades={trade_count}",
-                drop_24h_pct=round(drop_24h, 4),
-                volume_24h_idr=volume_idr,
-            )
+        _has_trade_count = any(inner.get(k) is not None for k in ("trade_count", "count"))
+        if _has_trade_count:
+            trade_count = int(_f("trade_count", "count") or 0)
+            if trade_count < min_trades_24h:
+                return RugPullRisk(
+                    detected=True,
+                    reason=f"dead_coin_trades={trade_count}",
+                    drop_24h_pct=round(drop_24h, 4),
+                    volume_24h_idr=volume_idr,
+                )
 
     return no_risk
 

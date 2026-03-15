@@ -86,6 +86,7 @@ from .portfolio_management import (
     evaluate_multi_asset_portfolio,
     plan_rebalance,
     assess_diversification,
+    compute_correlation_matrix,
 )
 from .ml_models import (
     detect_regime,
@@ -220,6 +221,12 @@ class Trader:
         # saturate the REST rate limit.  Entries are reused until
         # config.scan_candle_cache_seconds have elapsed.
         self._candle_cache: Dict[str, Tuple[float, List[Any]]] = {}
+        # ── Resume-buy retry counters ─────────────────────────────────────────
+        # Tracks how many resume cycles have elapsed for each pair while a
+        # pending buy is outstanding.  Used by resume_pending_buy() to rotate
+        # through the 3-tier price strategy (above → same → below best_ask).
+        # Reset to 0 when the order fills or the pending state is cancelled.
+        self._resume_buy_retry_counts: Dict[str, int] = {}
 
         # ── Market Data Feed ──────────────────────────────────────────────────
         self.market_data_feed: Optional[MarketDataFeed] = None
@@ -914,7 +921,12 @@ class Trader:
         still compute indicators for pairs that are not yet receiving WS trade
         data (e.g. on first startup before the feed is fully seeded).
         """
-        min_candles = max(2, self.config.slow_window // 2)
+        # Require at least slow_window candles so that MA(slow_window) is always
+        # computable.  Using slow_window // 2 as the threshold (the previous
+        # value) meant that WS/trades candles with only 24–47 entries were
+        # accepted even though MA(48) would be NaN for all of them, causing
+        # analyze_trend() to return "flat" → action "hold" on every cycle.
+        min_candles = self.config.slow_window
 
         # ── 1. Try real-time WS trade buffer from MultiPairFeed ─────────────
         if self._multi_feed is not None:
@@ -1086,16 +1098,38 @@ class Trader:
         if decision.action != "buy":
             return None
 
+        # ── Maximum drawdown protection ───────────────────────────────────────
+        equity_history = tracker.equity_history if hasattr(tracker, "equity_history") else []
+        drawdown_pct = 0.0
+        if equity_history and len(equity_history) >= 2:
+            try:
+                _dd = check_max_drawdown(
+                    equity_history=equity_history,
+                    max_drawdown_pct=self.config.max_loss_pct * 100,
+                    warning_pct=self.config.max_loss_pct * 100 * 0.75,
+                )
+                drawdown_pct = _dd.current_drawdown_pct
+                if _dd.should_stop:
+                    logger.warning(
+                        "🛑 Max drawdown reached: %.2f%% ≥ %.2f%% — blocking buy",
+                        _dd.current_drawdown_pct, _dd.max_drawdown_pct,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": f"max_drawdown {_dd.current_drawdown_pct:.2f}%",
+                        "portfolio": tracker.as_dict(price),
+                    }
+                if _dd.should_reduce:
+                    logger.warning(
+                        "⚠️ Drawdown warning: %.2f%% approaching hard limit of %.2f%%",
+                        _dd.current_drawdown_pct, _dd.max_drawdown_pct,
+                    )
+            except Exception as exc:
+                logger.debug("Max drawdown check failed: %s", exc)
+
         # ── Circuit breaker (risk_management module) ─────────────────────────
         try:
             daily_loss = tracker.daily_loss_pct(price) * 100
-            equity_history = tracker.equity_history if hasattr(tracker, "equity_history") else []
-            drawdown_pct = 0.0
-            if equity_history and len(equity_history) >= 2:
-                peak = max(equity_history)
-                current = equity_history[-1]
-                drawdown_pct = ((peak - current) / peak * 100) if peak > 0 else 0.0
-
             cb = rm_check_circuit_breaker(
                 daily_loss_pct=daily_loss,
                 drawdown_pct=drawdown_pct,
@@ -1114,6 +1148,59 @@ class Trader:
                 }
         except Exception as exc:
             logger.debug("Risk management circuit breaker check failed: %s", exc)
+
+        # ── Daily loss limit (risk_management module) ─────────────────────────
+        if self.config.max_daily_loss_pct > 0:
+            try:
+                _daily_loss_frac = tracker.daily_loss_pct(price)
+                _day_equity_open = tracker._day_open_equity
+                # daily_pnl is negative when we have a loss
+                _daily_pnl_idr = -_daily_loss_frac * _day_equity_open
+                _dl_limit = self.config.max_daily_loss_pct * _day_equity_open
+                _dl = check_daily_loss_limit(
+                    daily_pnl=_daily_pnl_idr,
+                    daily_loss_limit=_dl_limit,
+                )
+                if not _dl.can_trade:
+                    logger.warning(
+                        "🛑 Daily loss limit reached: pnl=Rp%.0f, limit=Rp%.0f (utilization=%.1f%%)",
+                        _dl.daily_pnl, _dl.daily_loss_limit, _dl.utilization_pct,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            f"daily_loss_limit pnl={_dl.daily_pnl:.0f}"
+                            f" limit={_dl.daily_loss_limit:.0f}"
+                        ),
+                        "portfolio": tracker.as_dict(price),
+                    }
+                if _dl.utilization_pct > 75:
+                    logger.info(
+                        "⚠️ Daily loss at %.1f%% of limit — remaining budget: Rp%.0f",
+                        _dl.utilization_pct, _dl.remaining_budget,
+                    )
+            except Exception as exc:
+                logger.debug("Daily loss limit check failed: %s", exc)
+
+        # ── Dynamic risk adjustment (advisory) ────────────────────────────────
+        try:
+            _recent_pnl = list(tracker._all_sell_pnls[-10:]) if tracker._all_sell_pnls else []
+            _vol_obj = snapshot.get("volatility")
+            _vol_val = getattr(_vol_obj, "volatility", 0.0) if _vol_obj else 0.0
+            _dyn_risk = adjust_risk_dynamically(
+                base_risk_pct=self.config.risk_per_trade * 100,
+                recent_pnl=_recent_pnl,
+                current_drawdown_pct=drawdown_pct,
+                volatility=_vol_val,
+                win_rate=tracker.win_rate,
+            )
+            if _dyn_risk.scale_factor < 0.8 or _dyn_risk.scale_factor > 1.1:
+                logger.info(
+                    "📉 Dynamic risk adjustment: scale=%.2f× adjusted=%.2f%% (%s)",
+                    _dyn_risk.scale_factor, _dyn_risk.adjusted_risk_pct, _dyn_risk.reason,
+                )
+        except Exception as exc:
+            logger.debug("Dynamic risk adjustment advisory failed: %s", exc)
 
         # ── Anomaly detection ────────────────────────────────────────────────
         candles = snapshot.get("candles", [])
@@ -1332,6 +1419,66 @@ class Trader:
         except Exception:
             pass
 
+        # ── Portfolio rebalancing plan (advisory) ─────────────────────────────
+        # Computes the drift between current and equal-weight target allocations.
+        # The plan is surfaced in main.py's portfolio_analysis log and is NOT
+        # automatically executed — it informs manual or future automated actions.
+        try:
+            if len(positions) >= 2:
+                # Compute IDR value per pair using latest buffered price
+                prices_map: Dict[str, float] = {}
+                for pair in positions:
+                    buf = self._price_history.get(pair, [])
+                    if buf:
+                        prices_map[pair] = buf[-1][1]
+                    else:
+                        prices_map[pair] = positions[pair].avg_cost or 1.0
+                total_value = sum(
+                    positions[p].base_position * prices_map.get(p, 1.0)
+                    for p in positions
+                )
+                if total_value > 0:
+                    current_weights = {
+                        p: (positions[p].base_position * prices_map.get(p, 1.0)) / total_value
+                        for p in positions
+                    }
+                    n = len(positions)
+                    target_weights = {p: 1.0 / n for p in positions}
+                    rebalance = plan_rebalance(
+                        current_weights=current_weights,
+                        target_weights=target_weights,
+                        portfolio_value=total_value,
+                    )
+                    result["rebalance"] = rebalance
+        except Exception:
+            pass
+
+        # ── Correlation matrix ─────────────────────────────────────────────────
+        try:
+            if len(positions) >= 2:
+                assets = list(positions.keys())
+                returns_map: Dict[str, List[float]] = {}
+                for pair in assets:
+                    buf = self._price_history.get(pair, [])
+                    prices = [p for _, p in buf[-30:]]
+                    if len(prices) >= 3:
+                        rets = [
+                            (prices[i] - prices[i - 1]) / prices[i - 1]
+                            for i in range(1, len(prices))
+                            if prices[i - 1] > 0
+                        ]
+                        if rets:
+                            returns_map[pair] = rets
+                usable = [a for a in assets if a in returns_map]
+                if len(usable) >= 2:
+                    corr = compute_correlation_matrix(
+                        assets=usable,
+                        returns_map=returns_map,
+                    )
+                    result["correlation"] = corr
+        except Exception:
+            pass
+
         return result
 
     def _pair_volume(self, pair: str) -> float:
@@ -1358,6 +1505,87 @@ class Trader:
                 except (ValueError, TypeError):
                     pass
         return 0.0
+
+    def get_pair_scan_scores(self) -> Dict[str, float]:
+        """Score all tracked pairs using multi-market scanning functions.
+
+        Builds price-history and volume data from the internal buffer, then
+        applies :func:`~bot.scanning.scan_multiple_markets`,
+        :func:`~bot.scanning.scan_momentum`,
+        :func:`~bot.scanning.scan_trends`,
+        :func:`~bot.scanning.filter_by_volume`, and
+        :func:`~bot.scanning.filter_by_volatility` to produce a composite
+        score per pair.  Higher scores indicate stronger buy opportunities;
+        negative scores indicate weak or bearish conditions.
+
+        Returns an empty dict when no price history is available.
+        """
+        if not self._price_history:
+            return {}
+
+        # Extract price lists from the internal buffer
+        price_hist: Dict[str, List[float]] = {}
+        vol_hist: Dict[str, List[float]] = {}
+        for pair, buf in self._price_history.items():
+            if len(buf) >= 2:
+                price_hist[pair] = [p for _, p in buf]
+                vol_hist[pair] = [self._pair_volume(pair)]
+
+        if not price_hist:
+            return {}
+
+        scores: Dict[str, float] = {}
+
+        # Multi-market composite signal (trend + momentum − volatility)
+        try:
+            for r in scan_multiple_markets(price_hist, min_score=0.0):
+                scores[r.market] = scores.get(r.market, 0.0) + r.score * 0.40
+        except Exception:
+            pass
+
+        # Momentum signal — rate-of-change over recent candles
+        try:
+            for r in scan_momentum(price_hist):
+                if r.signal == "bullish":
+                    scores[r.market] = scores.get(r.market, 0.0) + r.strength * 0.30
+                elif r.signal == "bearish":
+                    scores[r.market] = scores.get(r.market, 0.0) - r.strength * 0.30
+        except Exception:
+            pass
+
+        # Trend signal — fast/slow MA crossover
+        try:
+            for r in scan_trends(price_hist):
+                if r.trend == "uptrend":
+                    scores[r.market] = scores.get(r.market, 0.0) + r.strength * 0.30
+                elif r.trend == "downtrend":
+                    scores[r.market] = scores.get(r.market, 0.0) - r.strength * 0.30
+        except Exception:
+            pass
+
+        # Volume filter — penalise pairs below the configured minimum trading volume.
+        # We have a single-point volume snapshot per pair, so we use the
+        # min_avg_volume threshold rather than a ratio check (ratio with a
+        # single point is always 1.0, making > 1.5 comparisons meaningless).
+        try:
+            for r in filter_by_volume(
+                vol_hist,
+                min_avg_volume=getattr(self.config, "min_volume_idr", 0.0),
+            ):
+                if not r.passed:
+                    scores[r.market] = scores.get(r.market, 0.0) - 0.20
+        except Exception:
+            pass
+
+        # Volatility filter — penalise pairs outside the tradeable range
+        try:
+            for r in filter_by_volatility(price_hist, min_vol=0.0001, max_vol=0.05):
+                if not r.passed:
+                    scores[r.market] = scores.get(r.market, 0.0) - 0.20
+        except Exception:
+            pass
+
+        return scores
 
     def _record_price(self, pair: str, price: float) -> None:
         """Append *(now, price)* to the per-pair pump-detection history buffer.
@@ -2528,21 +2756,6 @@ class Trader:
                     )
                     return result
 
-        # ── Daily loss cap ────────────────────────────────────────────────────
-        if self.config.max_daily_loss_pct > 0 and decision.action == "buy":
-            daily_loss_pct = _tracker.daily_loss_pct(price)
-            if daily_loss_pct >= self.config.max_daily_loss_pct:
-                logger.warning(
-                    "Daily loss cap reached: %.2f%% ≥ %.2f%% — skipping buy",
-                    daily_loss_pct * 100,
-                    self.config.max_daily_loss_pct * 100,
-                )
-                return {
-                    "status": "skipped",
-                    "reason": f"daily_loss_cap {daily_loss_pct:.2%} ≥ {self.config.max_daily_loss_pct:.2%}",
-                    "portfolio": _tracker.as_dict(price),
-                }
-
         # ── Per-coin exposure cap ─────────────────────────────────────────────
         if self.config.max_exposure_per_coin_pct > 0 and decision.action == "buy":
             current_equity = _tracker.snapshot(price).equity
@@ -2956,8 +3169,10 @@ class Trader:
         # Apply basic orderbook quality checks to ALL coins, not just cheap ones.
         # Uses the full-depth orderbook (200 levels from analyze_market) rather
         # than the shallow execution-time depth (5 levels) for accuracy.
-        # Coins with only 1-2 bid levels AND extremely thin bid depth are
-        # unreliable for execution and exits can be impossible.
+        # Thin books are unreliable for execution and exits can be impossible.
+        # Two-level check:
+        #   Level 1 — very thin book (< 5 bids): reject if depth below threshold
+        #   Level 2 — sparse book (5–9 bids, i.e. < 10): reject if total depth is too small
         # Gated by small_coin_min_depth_idr to remain configurable.
         _raw_depth = snapshot.get("raw_depth")
         if (
@@ -2968,23 +3183,39 @@ class Trader:
         ):
             _raw_bids = _raw_depth.get("buy") or []
             _bid_count = len(_raw_bids)
-            if _bid_count < 3:
-                _bid_depth_idr = sum(
-                    float(b[0]) * float(b[1]) for b in _raw_bids
-                ) if _raw_bids else 0.0
-                # Very thin book: fewer than 3 bids AND low depth
-                if _bid_depth_idr < self.config.small_coin_min_depth_idr:
-                    logger.info(
-                        "Koin sepi %s: only %d bid level(s), depth Rp%.0f — skipping buy",
-                        snapshot["pair"], _bid_count, _bid_depth_idr,
-                    )
-                    return {
-                        "status": "skipped",
-                        "reason": (
-                            f"koin_sepi {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
-                        ),
-                        "portfolio": _tracker.as_dict(price),
-                    }
+            _bid_depth_idr = (
+                sum(float(b[0]) * float(b[1]) for b in _raw_bids)
+                if _raw_bids else 0.0
+            )
+            # Level 1: very thin book (< 5 bid levels)
+            if _bid_count < 5 and _bid_depth_idr < self.config.small_coin_min_depth_idr:
+                logger.info(
+                    "Koin sepi %s: only %d bid level(s), depth Rp%.0f — skipping buy",
+                    snapshot["pair"], _bid_count, _bid_depth_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"koin_sepi {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
+            # Level 2: sparse book (5–9 bid levels) with insufficient total depth
+            if (
+                _bid_count < 10
+                and _bid_depth_idr < self.config.small_coin_min_depth_idr * 3
+            ):
+                logger.info(
+                    "Koin sepi %s: sparse book %d bids, depth Rp%.0f — skipping buy",
+                    snapshot["pair"], _bid_count, _bid_depth_idr,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        f"koin_sepi_sparse {_bid_count} bids depth_idr={_bid_depth_idr:.0f}"
+                    ),
+                    "portfolio": _tracker.as_dict(price),
+                }
 
         # Spread anomaly detection
         if self.config.spread_anomaly_multiplier > 0 and top_bid > 0 and top_ask > 0:
@@ -3170,17 +3401,21 @@ class Trader:
         if self.config.min_liquidity_depth_idr > 0 and decision.action == "buy":
             total_depth = self._liquidity_depth_idr(depth, price)
             if total_depth is None:
-                # Depth data unavailable (API error / unexpected format).
-                # Treat as thin market — safer to skip than enter blindly.
+                # Execution-depth REST call returned an unexpected format
+                # (e.g. the API returned an error dict).  Fall back to the
+                # pre-validated snapshot depth before concluding the data is
+                # truly unavailable.
+                _snap_raw = snapshot.get("raw_depth") or {}
+                total_depth = self._liquidity_depth_idr(_snap_raw, price)
+            if total_depth is None:
+                # Both depth sources are unavailable.  Per the
+                # _liquidity_depth_idr docstring the caller must skip the
+                # liquidity check (allow the trade) rather than blocking a
+                # valid signal due to a transient API failure.
                 logger.warning(
-                    "Depth data unavailable for %s — skipping buy (no liquidity data)",
+                    "Depth data unavailable for %s — skipping liquidity check (allowing trade)",
                     snapshot["pair"],
                 )
-                return {
-                    "status": "skipped",
-                    "reason": "depth_data_unavailable",
-                    "portfolio": _tracker.as_dict(price),
-                }
             elif total_depth < self.config.min_liquidity_depth_idr:
                 logger.info(
                     "Thin market on %s: depth Rp%.0f < min Rp%.0f — skipping buy",
@@ -3220,6 +3455,28 @@ class Trader:
                 )
             else:
                 available_cash = _tracker.cash
+                # ── Cash sync with exchange ──────────────────────────────────
+                # When the tracker shows no cash (all capital deployed) but the
+                # exchange might have IDR available (e.g. after a bot restart
+                # without a full position restore), re-query the real balance and
+                # use it for sizing — prevents false "insufficient balance" skips.
+                if (
+                    available_cash <= 0
+                    and self.config.api_key is not None
+                    and getattr(self.config, "balance_check_enabled", False)
+                ):
+                    try:
+                        _acct = self.client.get_account_info()
+                        _bal = (_acct.get("return") or {}).get("balance") or {}
+                        _real_idr = float(_bal.get("idr") or "0")
+                        if _real_idr > available_cash:
+                            logger.info(
+                                "Cash sync for buy on %s: tracker=%.2f → exchange=%.2f",
+                                _pair, available_cash, _real_idr,
+                            )
+                            available_cash = _real_idr
+                    except Exception as _cash_exc:
+                        logger.debug("Cash sync failed for %s: %s", _pair, _cash_exc)
             max_affordable = max(0.0, available_cash / (reference_price * self._FEE_BUFFER))
             effective_amount = min(decision.amount, max_affordable)
 
@@ -3266,6 +3523,30 @@ class Trader:
                 )
         elif decision.action == "sell":
             max_sellable = max(0.0, _tracker.base_position)
+            # ── Position sync with exchange ──────────────────────────────────
+            # When the tracker shows no position but the exchange holds a real
+            # balance (e.g. after a restart / manual trade outside the bot),
+            # re-query the real balance and update the tracker so the sell is
+            # not silently skipped.
+            if (
+                max_sellable <= 0
+                and self.config.api_key is not None
+                and getattr(self.config, "balance_check_enabled", False)
+            ):
+                try:
+                    _acct = self.client.get_account_info()
+                    _bal = (_acct.get("return") or {}).get("balance") or {}
+                    _base_coin = _pair.split("_")[0].lower()
+                    _real_pos = float(_bal.get(_base_coin) or "0")
+                    if _real_pos > 0:
+                        logger.info(
+                            "Position sync for sell on %s: tracker=%.8f → exchange=%.8f — using exchange balance",
+                            _pair, _tracker.base_position, _real_pos,
+                        )
+                        _tracker.base_position = _real_pos
+                        max_sellable = _real_pos
+                except Exception as _pos_exc:
+                    logger.debug("Position sync failed for %s: %s", _pair, _pos_exc)
             effective_amount = min(decision.amount, max_sellable)
             # When selling, if the amount is below the exchange minimum but we
             # hold the full position, sell everything rather than being stuck
@@ -3287,6 +3568,49 @@ class Trader:
             )
             # Re-enforce the max_affordable ceiling after the adjustment
             effective_amount = min(effective_amount, max_affordable)
+
+        # ── Risk-management position-sizing advisory ──────────────────────────
+        # Cross-check using calculate_position_size (fixed-pct method) and
+        # size_by_volatility (ATR-based).  These are informational only — they
+        # do not override the computed size, but log a debug note when the
+        # risk-module recommendation differs substantially.
+        if decision.action == "buy" and effective_amount > 0:
+            try:
+                _equity_cap = _tracker.effective_capital()
+                _vol_obj = snapshot.get("volatility")
+                _vol_val = getattr(_vol_obj, "volatility", 0.0) if _vol_obj else 0.0
+                _sl_price = (
+                    reference_price * (1.0 - self.config.stop_loss_pct)
+                    if getattr(self.config, "stop_loss_pct", 0.0) > 0
+                    else 0.0
+                )
+                _ps = calculate_position_size(
+                    account_balance=_equity_cap,
+                    risk_per_trade_pct=self.config.risk_per_trade * 100,
+                    entry_price=reference_price,
+                    stop_loss_price=_sl_price,
+                    method="fixed_pct",
+                    volatility=_vol_val,
+                )
+                if _ps.quantity > 0:
+                    logger.debug(
+                        "Position size advisory (fixed-pct): %.8f — %s",
+                        _ps.quantity, _ps.reason,
+                    )
+                candles_snap = snapshot.get("candles", [])
+                if candles_snap and len(candles_snap) >= 2:
+                    _svol = size_by_volatility(
+                        account_balance=_equity_cap,
+                        candles=candles_snap,
+                        risk_pct=self.config.risk_per_trade * 100,
+                    )
+                    if _svol.quantity > 0:
+                        logger.debug(
+                            "Position size advisory (ATR-vol): %.8f (atr=%.8f) — %s",
+                            _svol.quantity, _svol.atr_value, _svol.reason,
+                        )
+            except Exception:
+                pass
 
         if effective_amount <= 0:
             _diag_cash = available_cash if decision.action == "buy" else _tracker.base_position
@@ -4580,18 +4904,97 @@ class Trader:
         try:
             depth = self.client.get_depth(pair, count=5)
             asks = depth.get("sell") or []
+            bids = depth.get("buy") or []
             best_ask = float(asks[0][0]) if asks else price
+            best_bid = float(bids[0][0]) if bids else price
         except Exception:
             best_ask = price
+            best_bid = price
 
         entry_aggr = max(
             self.config.entry_retry_aggressiveness_pct,
             0.001,
         )
-        retry_price = best_ask * (1 + entry_aggr)
+
+        # ── Pump detection: bypass limit order, switch to market immediately ──
+        # When pump detection is configured (pump_protection_pct > 0), a genuine
+        # price pump is active, and it is NOT a fake pump (spike-then-reversal),
+        # there is a live upward move happening.  A pending limit order priced
+        # below the rising market will never fill; switch to a market-crossing
+        # price so the bot does not miss the move.
+        if (
+            self.config.pump_protection_pct > 0
+            and self._is_pumped(pair, price)
+            and not self._is_fake_pump(pair, price)
+        ):
+            _pump_market_price = best_ask * (1 + entry_aggr * 2)
+            _fmt_price = getattr(self.client, "format_price", None)
+            if callable(_fmt_price):
+                _pump_market_price, _ = _fmt_price(pair, _pump_market_price)
+            logger.info(
+                "resume_pending_buy: PUMP DETECTED — market order Rp%.2f (pair=%s)",
+                _pump_market_price, pair,
+            )
+            try:
+                _pump_resp = self.client.create_order(pair, "buy", _pump_market_price, amount)
+                getattr(self.client, "invalidate_account_info_cache", lambda: None)()
+                _pump_recv = 0.0
+                try:
+                    _pump_recv = float(
+                        (_pump_resp.get("return") or {}).get(receive_key) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    _pump_recv = 0.0
+                if _pump_recv > 0:
+                    _tracker.record_trade("buy", _pump_market_price, _pump_recv)
+                    self._resume_buy_retry_counts.pop(pair, None)
+                    self._ensure_position_feed(pair)
+                    self._persist_after_trade(pair)
+                    return {
+                        "status": "resumed",
+                        "action": "buy",
+                        "pair": pair,
+                        "price": _pump_market_price,
+                        "amount": _pump_recv,
+                        "portfolio": _tracker.as_dict(_pump_market_price),
+                    }
+            except Exception as _pump_exc:
+                logger.warning(
+                    "resume_pending_buy: pump market order failed — falling back to tier (pair=%s): %s",
+                    pair, _pump_exc,
+                )
+            # Fall through to tier-based limit order if market order fails.
+
+        # ── 3-tier price strategy ─────────────────────────────────────────────
+        # Rotate through three price levels on consecutive unfilled retries:
+        #   Tier 0 (above)  — best_ask + aggr%  : aggressive, fills immediately
+        #   Tier 1 (same)   — best_ask           : neutral, at market ask
+        #   Tier 2 (below)  — best_bid           : passive, catches a dip
+        # When the price is falling, placing above market often won't fill.
+        # Cycling through tiers maximises the chance of getting the order
+        # filled while still capturing a favourable entry on dips.
+        _retry_count = self._resume_buy_retry_counts.get(pair, 0)
+        _price_tier = _retry_count % 3
+        if _price_tier == 0:
+            retry_price = best_ask * (1 + entry_aggr)  # above
+            _tier_label = "above"
+        elif _price_tier == 1:
+            retry_price = best_ask  # same / at-market
+            _tier_label = "same"
+        else:
+            retry_price = best_bid  # below / passive
+            _tier_label = "below"
+        # Advance the retry counter for next cycle.
+        self._resume_buy_retry_counts[pair] = _retry_count + 1
+
         _fmt_price = getattr(self.client, "format_price", None)
         if callable(_fmt_price):
             retry_price, _ = _fmt_price(pair, retry_price)
+
+        logger.info(
+            "resume_pending_buy: price tier %d (%s) — Rp%.2f (pair=%s)",
+            _price_tier, _tier_label, retry_price, pair,
+        )
 
         # Per-pair effective minimum.
         _get_min = getattr(self.client, "get_pair_min_order", None)
@@ -4604,6 +5007,7 @@ class Trader:
                 amount * retry_price, _eff_min_idr, pair,
             )
             _tracker.pending_orders.clear()
+            self._resume_buy_retry_counts.pop(pair, None)
             if self.multi_manager is not None:
                 self.multi_manager.return_position_cash(pair)
             return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
@@ -4630,6 +5034,7 @@ class Trader:
                     idr_balance, needed_idr, pair,
                 )
                 _tracker.pending_orders.clear()
+                self._resume_buy_retry_counts.pop(pair, None)
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
@@ -4645,6 +5050,7 @@ class Trader:
                 pair,
             )
             _tracker.pending_orders.clear()
+            self._resume_buy_retry_counts.pop(pair, None)
             if self.multi_manager is not None:
                 self.multi_manager.return_position_cash(pair)
             return {"status": "cancelled_zero", "pair": pair, "price": retry_price}
@@ -4664,6 +5070,7 @@ class Trader:
                     "Resume pending buy hit exchange minimum — cancelling (pair=%s)", pair,
                 )
                 _tracker.pending_orders.clear()
+                self._resume_buy_retry_counts.pop(pair, None)
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_below_min", "pair": pair, "price": retry_price}
@@ -4672,6 +5079,7 @@ class Trader:
                     "Resume pending buy: insufficient balance — cancelling (pair=%s)", pair,
                 )
                 _tracker.pending_orders.clear()
+                self._resume_buy_retry_counts.pop(pair, None)
                 if self.multi_manager is not None:
                     self.multi_manager.return_position_cash(pair)
                 return {"status": "cancelled_insufficient", "pair": pair, "price": retry_price}
@@ -4698,6 +5106,8 @@ class Trader:
 
         if received > 0:
             _tracker.record_trade("buy", retry_price, received)
+            # Reset the price-tier retry counter now that the order is filled.
+            self._resume_buy_retry_counts.pop(pair, None)
             remaining_buy = amount - received
             # Partial fill: record filled portion and re-mark the remaining
             # amount as pending_buy so it is retried on the next cycle.
@@ -4762,6 +5172,7 @@ class Trader:
                         pass
                     if _mkt_received > 0:
                         _tracker.record_trade("buy", market_price, _mkt_received)
+                        self._resume_buy_retry_counts.pop(pair, None)
                         self._ensure_position_feed(pair)
                         self._persist_after_trade(pair)
                         return {
@@ -4873,6 +5284,31 @@ class Trader:
         _fmt_price = getattr(self.client, "format_price", None)
         if callable(_fmt_price):
             retry_price, _ = _fmt_price(pair, retry_price)
+
+        # ── Flash-dump detection: switch to market-crossing price immediately ─
+        # When a rapid price drop is detected via the rolling price history,
+        # a resting limit order will miss the exit window as bids collapse.
+        # Place a deeply-discounted limit order (below best_bid) so that it
+        # fills immediately against the aggressive bid side — effectively a
+        # market sell without requiring a true market-order API call.
+        if self.config.flash_dump_pct > 0:
+            _pair_hist = self._price_history.get(pair, [])
+            _dump_signal = detect_flash_dump(
+                _pair_hist,
+                self.config.flash_dump_lookback_seconds,
+                self.config.flash_dump_pct,
+            )
+            if _dump_signal.detected:
+                _dump_market_price = best_bid * (1 - entry_aggr * 3)
+                _fmt2 = getattr(self.client, "format_price", None)
+                if callable(_fmt2):
+                    _dump_market_price, _ = _fmt2(pair, _dump_market_price)
+                logger.info(
+                    "resume_pending_sell: DUMP DETECTED (drop=%.2f%%) — "
+                    "market-crossing sell Rp%.2f (pair=%s)",
+                    _dump_signal.drop_pct * 100, _dump_market_price, pair,
+                )
+                retry_price = _dump_market_price
 
         # Per-pair effective minimum.
         _get_min = getattr(self.client, "get_pair_min_order", None)
@@ -5628,32 +6064,42 @@ class Trader:
                     raise
         raise last_exc
 
+    def initialize_pairs(self) -> None:
+        """Load the full list of tradeable pairs from the exchange.
+
+        Idempotent — does nothing when ``_all_pairs`` is already populated.
+        Call this once before starting the engine so that
+        :class:`~bot.engine.MarketDataEngine` sees all pairs from the very
+        first iteration rather than falling back to ``config.pair`` only.
+        """
+        if self._all_pairs is not None:
+            return
+        try:
+            pairs_data = self.client.get_pairs()
+            names = []
+            for p in pairs_data:
+                if "name" in p:
+                    names.append(p["name"])
+                elif "ticker_id" in p:
+                    names.append(p["ticker_id"])
+            self._all_pairs = [n.lower() for n in names if n]
+            # Populate the per-pair min-order cache from the already-fetched
+            # pairs data so we avoid a second /api/pairs request.  This
+            # prevents the duplicate REST call that previously triggered 429
+            # errors on the first cycle (one from _ensure_pair_min_order_cache
+            # and one here).
+            if self.config.pair_min_order_cache_enabled and hasattr(self.client, "load_pair_min_orders"):
+                try:
+                    self.client.load_pair_min_orders(pairs_data)
+                    self._pair_min_order_cache_cycles = 0
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Failed to populate min order cache from pairs data: %s", exc)
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            logger.warning("Failed to load pairs; fallback to default %s", exc)
+            self._all_pairs = [self.config.pair]
+
     def scan_and_choose(self) -> Tuple[str, Dict[str, Any]]:
-        if self._all_pairs is None:
-            try:
-                pairs_data = self.client.get_pairs()
-                names = []
-                for p in pairs_data:
-                    if "name" in p:
-                        names.append(p["name"])
-                    elif "ticker_id" in p:
-                        names.append(p["ticker_id"])
-                self._all_pairs = [n.lower() for n in names if n]
-                # Populate the per-pair min-order cache from the already-fetched
-                # pairs data so we avoid a second /api/pairs request.  This
-                # prevents the duplicate REST call that previously triggered 429
-                # errors on the first cycle (one from _ensure_pair_min_order_cache
-                # and one here).
-                if self.config.pair_min_order_cache_enabled and hasattr(self.client, "load_pair_min_orders"):
-                    try:
-                        self.client.load_pair_min_orders(pairs_data)
-                        self._pair_min_order_cache_cycles = 0
-                    except Exception as exc:  # pragma: no cover
-                        logger.debug("Failed to populate min order cache from pairs data: %s", exc)
-            # pragma: no cover - guard for pair listing/parsing failures
-            except (requests.RequestException, RuntimeError, ValueError) as exc:
-                logger.warning("Failed to load pairs; fallback to default %s", exc)
-                self._all_pairs = [self.config.pair]
+        self.initialize_pairs()
 
         # ── Per-pair minimum order cache ─────────────────────────────────────
         # On the first cycle this is a no-op when the cache was populated above

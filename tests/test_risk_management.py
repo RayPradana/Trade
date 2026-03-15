@@ -184,6 +184,16 @@ class TestDailyLossLimit(unittest.TestCase):
         self.assertTrue(r.can_trade)
         self.assertGreater(r.remaining_budget, 0)
 
+    def test_zero_limit_disabled_allows_trading(self):
+        # limit=0 means the feature is disabled → must always allow trading
+        r = check_daily_loss_limit(0.0, 0.0)
+        self.assertTrue(r.can_trade)
+
+    def test_zero_limit_with_loss_still_allows_trading(self):
+        # even with a negative PnL, limit=0 means no cap
+        r = check_daily_loss_limit(-500_000.0, 0.0)
+        self.assertTrue(r.can_trade)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Maximum Drawdown Protection

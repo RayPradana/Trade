@@ -93,7 +93,7 @@ class BotConfig:
     websocket_subscribe_message: Optional[str] = None  # raw JSON string sent to the server on connect
     websocket_batch_size: int = 100  # max pairs per WebSocket connection for multi-pair feed
     pairs_per_cycle: int = 20  # 0 = scan all pairs every cycle; >0 = rotate N pairs per cycle
-    min_confidence: float = 0.52
+    min_confidence: float = 0.45
     # ── Confidence-based position sizing ──────────────────────────────────────
     # When enabled, position size is a direct percentage of available capital
     # determined by confidence tier rather than the risk/stop-distance formula.
@@ -406,9 +406,9 @@ class BotConfig:
     # the exchange so the error is caught gracefully as a "skipped" outcome
     # rather than raising a runtime exception.
     #
-    # Default is 30,000 IDR — a conservative buffer above the 10,000 IDR
-    # exchange minimum to avoid tiny trades and fee waste.  Must be > 0.
-    min_order_idr: float = 30_000.0
+    # Default is 100,000 IDR — a practical floor that keeps profit targets
+    # achievable and fees as a small fraction of the trade value.  Must be > 0.
+    min_order_idr: float = 100_000.0
     # Consecutive loss protection
     max_consecutive_losses: int = 0  # 0=disabled; stop trading after N losing sells in a row
     # Volatility cooldown
@@ -681,6 +681,19 @@ class BotConfig:
     market_data_anomaly_spread_mult: float = 3.0
     market_data_anomaly_crash_pct: float = 0.10
 
+    # ── Professional Engine Architecture ──────────────────────────────────────
+    # When engine_mode=True the bot uses the low-latency multi-threaded engine
+    # architecture (MarketDataEngine → DataCache → StrategyEngine → SignalQueue
+    # → ExecutionEngine ↔ RiskEngine) instead of the monolithic single-thread loop.
+    #
+    # market_data_engine_interval: seconds between full market-data refresh
+    #   passes in MarketDataEngine (default 2 s).
+    # strategy_engine_interval: seconds between strategy-evaluation passes
+    #   in StrategyEngine (default 3 s).
+    engine_mode: bool = True
+    market_data_engine_interval: float = 2.0
+    strategy_engine_interval: float = 3.0
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         existing_keys = set(os.environ.keys())
@@ -717,7 +730,7 @@ class BotConfig:
             websocket_subscribe_message=os.getenv("WEBSOCKET_SUBSCRIBE_MESSAGE"),
             websocket_batch_size=_env_int("WEBSOCKET_BATCH_SIZE", "100"),
             pairs_per_cycle=_env_int("PAIRS_PER_CYCLE", "20"),
-            min_confidence=_env_float("MIN_CONFIDENCE", "0.52"),
+            min_confidence=_env_float("MIN_CONFIDENCE", "0.45"),
             interval_seconds=interval_seconds,
             fast_window=_env_int("FAST_WINDOW", "12"),
             slow_window=_env_int("SLOW_WINDOW", "48"),
@@ -728,7 +741,7 @@ class BotConfig:
             order_timeout_to_market=os.getenv("ORDER_TIMEOUT_TO_MARKET", "true").lower() in {"1", "true", "yes"},
             resume_buy_wait_seconds=_env_int("RESUME_BUY_WAIT_SECONDS", "20"),
             smart_entry_buffer_enabled=os.getenv("SMART_ENTRY_BUFFER_ENABLED", "true").lower() in {"1", "true", "yes"},
-            entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.35"),
+            entry_quality_min_score=_env_float("ENTRY_QUALITY_MIN_SCORE", "0.25"),
             adaptive_order_enabled=os.getenv("ADAPTIVE_ORDER_ENABLED", "true").lower() in {"1", "true", "yes"},
             min_orderbook_volume_idr=_env_float("MIN_ORDERBOOK_VOLUME_IDR", "0"),
             initial_capital=_env_float("INITIAL_CAPITAL", "1000000"),
@@ -800,7 +813,7 @@ class BotConfig:
             ai_scoring_enabled=os.getenv("AI_SCORING_ENABLED", "false").lower() in {"1", "true", "yes"},
             ai_scoring_weight=_env_float("AI_SCORING_WEIGHT", "0.25"),
             fake_pump_reversal_pct=_env_float("FAKE_PUMP_REVERSAL_PCT", "0"),
-            min_order_idr=_env_float("MIN_ORDER_IDR", "30000"),
+            min_order_idr=_env_float("MIN_ORDER_IDR", "100000"),
             max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", "0"),
             volatility_cooldown_pct=_env_float("VOLATILITY_COOLDOWN_PCT", "0"),
             volatility_cooldown_seconds=_env_float("VOLATILITY_COOLDOWN_SECONDS", "0"),
@@ -893,6 +906,10 @@ class BotConfig:
             market_data_anomaly_volume_mult=_env_float("MARKET_DATA_ANOMALY_VOLUME_MULT", "5"),
             market_data_anomaly_spread_mult=_env_float("MARKET_DATA_ANOMALY_SPREAD_MULT", "3"),
             market_data_anomaly_crash_pct=_env_float("MARKET_DATA_ANOMALY_CRASH_PCT", "0.10"),
+            # Professional Engine Architecture
+            engine_mode=os.getenv("ENGINE_MODE", "true").lower() in {"1", "true", "yes"},
+            market_data_engine_interval=_env_float("MARKET_DATA_ENGINE_INTERVAL", "2.0"),
+            strategy_engine_interval=_env_float("STRATEGY_ENGINE_INTERVAL", "3.0"),
         )
         cfg._validate()
         return cfg

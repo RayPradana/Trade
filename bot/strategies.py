@@ -35,8 +35,12 @@ VOLATILITY_PENALTY_CAP = 0.8
 MIN_STOP_DISTANCE = 1e-6
 LEVEL_PROXIMITY = 0.02  # 2% proximity to support/resistance levels
 # AI-style entry scoring weights/scales (heuristic, tuned for 0..1 range)
-AI_TREND_SCALE = 12.0
-AI_VOL_SCALE = 50.0
+# Indodax 5-min candles: typical MA-gap strength is 0.001-0.01 (0.1%-1%), so
+# a scale of 100 maps a 1% gap → trend_score=1.0 (reasonable upper bound).
+# Volatility of 0.01-0.02 (1-2%) is normal crypto — scale of 10 keeps vol_score
+# near 0.8-0.9 for those values rather than collapsing it to near zero.
+AI_TREND_SCALE = 100.0
+AI_VOL_SCALE = 10.0
 AI_TREND_WEIGHT = 0.4
 AI_OB_WEIGHT = 0.35
 AI_VOL_WEIGHT = 0.25
@@ -243,7 +247,8 @@ def select_strategy(
 
 
 def _confidence(trend: TrendResult, orderbook: OrderbookInsight, vol: VolatilityStats) -> float:
-    trend_score = min(trend.strength * 10, 1.0)
+    # Scale aligned with AI_TREND_SCALE: a 1% MA gap (strength=0.01) → trend_score=1.0
+    trend_score = min(trend.strength * 100, 1.0)
     spread_bonus = max(0, ORDERBOOK_SPREAD_BONUS - orderbook.spread_pct) * ORDERBOOK_IMBALANCE_WEIGHT
     orderbook_score = min(abs(orderbook.imbalance) + spread_bonus, 1.0)
     vol_score = 1 - min(vol.volatility * 10, VOLATILITY_PENALTY_CAP)
@@ -803,8 +808,8 @@ def make_trade_decision(
     _all_notes = " ".join(n for n in (_notes, adaptive_note) if n)
 
     reason = (
-        f"{mode} | trend={trend.direction} strength={trend.strength:.4f} "
-        f"vol={vol.volatility:.4f} ob_imbalance={orderbook.imbalance:.2f} "
+        f"{mode} | trend={trend.direction} strength={trend.strength * 100:.2f}% "
+        f"vol={vol.volatility * 100:.2f}% ob_imbalance={orderbook.imbalance:.2f} "
         f"rsi={indicators.rsi if indicators else float('nan'):.2f}"
         + (f" {_all_notes}" if _all_notes else "")
     )
