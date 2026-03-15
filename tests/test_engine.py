@@ -938,12 +938,83 @@ class TestEngineMonitorCycleDisplay:
                     self._run_once(orch, active_positions=active_positions)
         mock_portfolio.assert_called_once()
 
-    def test_log_portfolio_not_called_when_no_positions(self):
-        """_log_portfolio must NOT be called when there are no active positions."""
+    def test_log_portfolio_called_even_when_no_positions(self):
+        """_log_portfolio must always be called when the cache is non-empty,
+        even when there are no active positions (flat / startup state)."""
         import main
         snap = self._make_minimal_snap("btc_idr", 100_000.0)
         orch = self._make_orchestrator(snaps={"btc_idr": snap})
         with patch.object(main, "_log_signal"):
             with patch.object(main, "_log_portfolio") as mock_portfolio:
                 self._run_once(orch, active_positions={})
+        mock_portfolio.assert_called_once()
+
+    def test_log_portfolio_not_called_when_cache_empty(self):
+        """_log_portfolio must NOT be called when the cache is empty."""
+        import main
+        orch = self._make_orchestrator(snaps={})
+        with patch.object(main, "_log_portfolio") as mock_portfolio:
+            self._run_once(orch, active_positions={})
         mock_portfolio.assert_not_called()
+
+
+class TestInitializePairs:
+    """Trader.initialize_pairs() loads the pair list from the exchange exactly
+    once and is idempotent on subsequent calls."""
+
+    def _make_trader(self, pairs_response):
+        """Build a minimal Trader mock backed by a fake client."""
+        from unittest.mock import MagicMock, patch
+        from bot.config import BotConfig
+        config = BotConfig(api_key=None, pair="btc_idr")
+        client = MagicMock()
+        client.get_pairs = MagicMock(return_value=pairs_response)
+        client.configure_caches = MagicMock()
+        with patch("bot.trader.Trader.__init__", return_value=None):
+            from bot.trader import Trader
+            t = object.__new__(Trader)
+            t.config = config
+            t.client = client
+            t._all_pairs = None
+            t._pair_min_order_cache_cycles = 0
+        return t, client
+
+    def test_initialize_pairs_loads_all_pairs(self):
+        """initialize_pairs populates _all_pairs from the exchange."""
+        from bot.trader import Trader
+        t, client = self._make_trader([
+            {"name": "btc_idr"}, {"name": "eth_idr"}, {"name": "sol_idr"},
+        ])
+        t.initialize_pairs()
+        assert t._all_pairs == ["btc_idr", "eth_idr", "sol_idr"]
+        client.get_pairs.assert_called_once()
+
+    def test_initialize_pairs_is_idempotent(self):
+        """initialize_pairs must not call the API again when already populated."""
+        from bot.trader import Trader
+        t, client = self._make_trader([{"name": "btc_idr"}])
+        t._all_pairs = ["btc_idr", "eth_idr"]  # already loaded
+        t.initialize_pairs()
+        client.get_pairs.assert_not_called()
+        assert t._all_pairs == ["btc_idr", "eth_idr"]
+
+    def test_initialize_pairs_fallback_on_error(self):
+        """initialize_pairs falls back to config.pair when the API fails."""
+        import requests
+        from bot.trader import Trader
+        t, client = self._make_trader([])
+        client.get_pairs.side_effect = requests.RequestException("timeout")
+        t.initialize_pairs()
+        assert t._all_pairs == ["btc_idr"]
+
+    def test_scan_and_choose_uses_initialize_pairs(self):
+        """scan_and_choose must not call get_pairs a second time when
+        initialize_pairs was already called before it."""
+        from bot.trader import Trader
+        t, client = self._make_trader([{"name": "btc_idr"}, {"name": "eth_idr"}])
+        t.initialize_pairs()
+        assert client.get_pairs.call_count == 1
+        # Subsequent calls to initialize_pairs (as done inside scan_and_choose)
+        # must not trigger another API call.
+        t.initialize_pairs()
+        assert client.get_pairs.call_count == 1

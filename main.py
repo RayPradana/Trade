@@ -766,21 +766,23 @@ def _run_engine_monitor(
                             trailing_stop_enabled=config.trailing_stop_pct > 0,
                             trailing_tp_enabled=config.trailing_tp_pct > 0,
                         )
-                # Overall portfolio summary when any position is held
-                if _active:
-                    _rep_pair = next(iter(_active))
-                    _rep_snap = orchestrator.cache.get(_rep_pair)
-                    _rep_price = (_rep_snap or {}).get("price", 0.0)
-                    try:
-                        _agg = trader.portfolio_snapshot(_rep_pair, _rep_price)
-                        _log_portfolio(
-                            _agg,
-                            config.initial_capital,
-                            trailing_stop_enabled=config.trailing_stop_pct > 0,
-                            trailing_tp_enabled=config.trailing_tp_pct > 0,
-                        )
-                    except Exception:
-                        pass
+                # Overall portfolio summary — always show (even when flat)
+                _rep_pair = (
+                    next(iter(_active)) if _active
+                    else (_cached_pairs[0] if _cached_pairs else config.pair)
+                )
+                _rep_snap = orchestrator.cache.get(_rep_pair)
+                _rep_price = (_rep_snap or {}).get("price", 0.0)
+                try:
+                    _agg = trader.portfolio_snapshot(_rep_pair, _rep_price)
+                    _log_portfolio(
+                        _agg,
+                        config.initial_capital,
+                        trailing_stop_enabled=config.trailing_stop_pct > 0,
+                        trailing_tp_enabled=config.trailing_tp_pct > 0,
+                    )
+                except Exception:
+                    pass
             else:
                 logging.info("   ⏳ Waiting for market data (%s) …", config.pair)
         except Exception as _disp_exc:
@@ -1035,6 +1037,15 @@ def main() -> None:
             notify_fn=lambda text: _notify(config, text),
             on_outcome=lambda sig, out: _log_outcome(out),
         )
+        # Eagerly load the full pair list so MarketDataEngine scans ALL pairs
+        # from its very first iteration (not just config.pair).
+        try:
+            trader.initialize_pairs()
+        except Exception as _ip_exc:
+            logging.warning(
+                "initialize_pairs failed, MarketDataEngine will fall back to config.pair: %s",
+                _ip_exc,
+            )
         orchestrator.start()
         try:
             _run_engine_monitor(
