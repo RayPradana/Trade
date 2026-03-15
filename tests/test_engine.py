@@ -697,3 +697,142 @@ class TestEngineConfigFields:
         from bot.config import BotConfig
         cfg = BotConfig.from_env()
         assert cfg.strategy_engine_interval == 7.5
+
+
+# ===========================================================================
+# _run_engine_monitor cycle display tests
+# ===========================================================================
+
+class TestEngineMonitorCycleDisplay:
+    """Engine monitor loop must display pair snapshot when available,
+    and show a 'waiting' message when the cache is empty."""
+
+    def _make_minimal_snap(self, pair: str = "btc_idr", price: float = 100_000.0, action: str = "hold"):
+        decision = MagicMock()
+        decision.action = action
+        decision.confidence = 0.5
+        decision.reason = "test"
+        decision.mode = "day_trading"
+        return {
+            "pair": pair,
+            "price": price,
+            "decision": decision,
+            "orderbook": None,
+            "volatility": None,
+            "levels": None,
+            "indicators": None,
+        }
+
+    def _make_orchestrator(self, snap=None):
+        orch = MagicMock()
+        orch.cache = MagicMock()
+        orch.cache.get = MagicMock(return_value=snap)
+        orch.health = MagicMock(return_value={
+            "market_data_engine": "running",
+            "strategy_engine": "running",
+            "execution_engine": "running",
+            "cache_pairs": [],
+            "signal_queue_size": 0,
+        })
+        return orch
+
+    def _run_once(self, orchestrator, pair="btc_idr"):
+        import main
+        import threading
+        config = MagicMock()
+        config.pair = pair
+        config.run_once = True
+        config.strategy_engine_interval = 0.0
+        config.cycle_summary_interval = 9999
+        config.state_path = None
+        config.state_backup_interval = 0
+        trader = MagicMock()
+        trader.active_positions = {}
+        journal = MagicMock()
+        journal.summary_str = MagicMock(return_value="0 sells | PnL=+0.00")
+        shutdown = threading.Event()
+        tasks = []
+        autonomous_state = MagicMock()
+        polling_config = MagicMock()
+        main._run_engine_monitor(
+            orchestrator=orchestrator,
+            trader=trader,
+            config=config,
+            journal=journal,
+            shutdown=shutdown,
+            tasks=tasks,
+            autonomous_state=autonomous_state,
+            start_time=0.0,
+            crash_history=[],
+            error_log=[],
+            components=[],
+            polling_config=polling_config,
+            now_ms=lambda: 0,
+        )
+
+    def test_log_signal_called_when_cache_has_snapshot(self):
+        """When cache has a snapshot, _log_signal should be called with it."""
+        import main
+        snap = self._make_minimal_snap()
+        orch = self._make_orchestrator(snap=snap)
+        with patch.object(main, "_log_signal") as mock_log_signal:
+            self._run_once(orch)
+        mock_log_signal.assert_called_once_with(snap)
+
+    def test_waiting_message_logged_when_cache_empty(self):
+        """When cache returns None, a 'Waiting for market data' message is logged."""
+        import logging
+        import main
+        orch = self._make_orchestrator(snap=None)
+        with patch.object(main, "_log_signal") as mock_log_signal:
+            with self.assertLogs_compat(level="INFO") as cm:
+                self._run_once(orch)
+        mock_log_signal.assert_not_called()
+        assert any("Waiting" in msg or "waiting" in msg for msg in cm.output)
+
+    def assertLogs_compat(self, level="INFO"):
+        """Helper to use assertLogs in pytest context."""
+        import logging
+        import contextlib
+
+        class _CM:
+            def __enter__(self_):
+                self_.handler = _LogCapture()
+                logging.getLogger().addHandler(self_.handler)
+                self_.handler.setLevel(level)
+                self_.old_level = logging.getLogger().level
+                logging.getLogger().setLevel(level)
+                self_.output = self_.handler.records
+                return self_
+
+            def __exit__(self_, *args):
+                logging.getLogger().removeHandler(self_.handler)
+                logging.getLogger().setLevel(self_.old_level)
+
+        class _LogCapture(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(self.format(record))
+
+        return _CM()
+
+    def test_cache_get_called_with_config_pair(self):
+        """orchestrator.cache.get must be called with config.pair."""
+        import main
+        snap = self._make_minimal_snap()
+        orch = self._make_orchestrator(snap=snap)
+        with patch.object(main, "_log_signal"):
+            self._run_once(orch, pair="btc_idr")
+        orch.cache.get.assert_any_call("btc_idr")
+
+    def test_display_error_does_not_crash_monitor(self):
+        """If _log_signal raises, the engine monitor must not crash."""
+        import main
+        snap = self._make_minimal_snap()
+        orch = self._make_orchestrator(snap=snap)
+        with patch.object(main, "_log_signal", side_effect=RuntimeError("display boom")):
+            # Should not raise
+            self._run_once(orch)

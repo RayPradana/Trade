@@ -744,6 +744,16 @@ def _run_engine_monitor(
         scan_cycles += 1
         logging.info(_separator(f"Engine cycle #{scan_cycles}"))
 
+        # ── Display current pair snapshot ────────────────────────────────────
+        try:
+            _snap = orchestrator.cache.get(pair)
+            if _snap:
+                _log_signal(_snap)
+            else:
+                logging.info("   ⏳ Waiting for market data (%s) …", pair)
+        except Exception as _disp_exc:
+            logging.debug("Engine cycle display error: %s", _disp_exc)
+
         try:
             # ── Scheduled housekeeping tasks ─────────────────────────────────
             _schedule_result = schedule_tasks(tasks, current_time=_now_ms())
