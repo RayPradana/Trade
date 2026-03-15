@@ -704,8 +704,8 @@ class TestEngineConfigFields:
 # ===========================================================================
 
 class TestEngineMonitorCycleDisplay:
-    """Engine monitor loop must display pair snapshot when available,
-    and show a 'waiting' message when the cache is empty."""
+    """Engine monitor loop displays all cached pairs + portfolio when available,
+    and shows a 'waiting' message when the cache is empty."""
 
     def _make_minimal_snap(self, pair: str = "btc_idr", price: float = 100_000.0, action: str = "hold"):
         decision = MagicMock()
@@ -723,20 +723,26 @@ class TestEngineMonitorCycleDisplay:
             "indicators": None,
         }
 
-    def _make_orchestrator(self, snap=None):
+    def _make_orchestrator(self, snaps: dict | None = None):
+        """Build a mock orchestrator whose cache contains ``snaps`` (pair→snap dict).
+
+        If snaps is None the cache is empty.
+        """
+        snaps = snaps or {}
         orch = MagicMock()
         orch.cache = MagicMock()
-        orch.cache.get = MagicMock(return_value=snap)
+        orch.cache.pairs = MagicMock(return_value=list(snaps.keys()))
+        orch.cache.get = MagicMock(side_effect=lambda p: snaps.get(p))
         orch.health = MagicMock(return_value={
             "market_data_engine": "running",
             "strategy_engine": "running",
             "execution_engine": "running",
-            "cache_pairs": [],
+            "cache_pairs": list(snaps.keys()),
             "signal_queue_size": 0,
         })
         return orch
 
-    def _run_once(self, orchestrator, pair="btc_idr"):
+    def _run_once(self, orchestrator, pair="btc_idr", active_positions=None, trader=None):
         import main
         import threading
         config = MagicMock()
@@ -746,8 +752,17 @@ class TestEngineMonitorCycleDisplay:
         config.cycle_summary_interval = 9999
         config.state_path = None
         config.state_backup_interval = 0
-        trader = MagicMock()
-        trader.active_positions = {}
+        config.trailing_stop_pct = 0.0
+        config.trailing_tp_pct = 0.0
+        config.initial_capital = 1_000_000.0
+        if trader is None:
+            trader = MagicMock()
+            trader.active_positions = active_positions or {}
+            trader.portfolio_snapshot = MagicMock(return_value={
+                "equity": 1_000_000.0, "cash": 1_000_000.0,
+                "base_position": 0.0, "realized_pnl": 0.0,
+                "trade_count": 0, "win_rate": 0.0,
+            })
         journal = MagicMock()
         journal.summary_str = MagicMock(return_value="0 sells | PnL=+0.00")
         shutdown = threading.Event()
@@ -770,20 +785,22 @@ class TestEngineMonitorCycleDisplay:
             now_ms=lambda: 0,
         )
 
+    # ── basic display ─────────────────────────────────────────────────────
+
     def test_log_signal_called_when_cache_has_snapshot(self):
         """When cache has a snapshot, _log_signal should be called with it."""
         import main
         snap = self._make_minimal_snap()
-        orch = self._make_orchestrator(snap=snap)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
         with patch.object(main, "_log_signal") as mock_log_signal:
             self._run_once(orch)
         mock_log_signal.assert_called_once_with(snap)
 
     def test_waiting_message_logged_when_cache_empty(self):
-        """When cache returns None, a 'Waiting for market data' message is logged."""
+        """When cache is empty, a 'Waiting for market data' message is logged."""
         import logging
         import main
-        orch = self._make_orchestrator(snap=None)
+        orch = self._make_orchestrator(snaps={})
         with patch.object(main, "_log_signal") as mock_log_signal:
             with self.assertLogs_compat(level="INFO") as cm:
                 self._run_once(orch)
@@ -793,7 +810,6 @@ class TestEngineMonitorCycleDisplay:
     def assertLogs_compat(self, level="INFO"):
         """Helper to use assertLogs in pytest context."""
         import logging
-        import contextlib
 
         class _CM:
             def __enter__(self_):
@@ -819,11 +835,11 @@ class TestEngineMonitorCycleDisplay:
 
         return _CM()
 
-    def test_cache_get_called_with_config_pair(self):
-        """orchestrator.cache.get must be called with config.pair."""
+    def test_cache_get_called_for_cached_pair(self):
+        """orchestrator.cache.get must be called for each pair returned by cache.pairs()."""
         import main
         snap = self._make_minimal_snap()
-        orch = self._make_orchestrator(snap=snap)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
         with patch.object(main, "_log_signal"):
             self._run_once(orch, pair="btc_idr")
         orch.cache.get.assert_any_call("btc_idr")
@@ -832,7 +848,102 @@ class TestEngineMonitorCycleDisplay:
         """If _log_signal raises, the engine monitor must not crash."""
         import main
         snap = self._make_minimal_snap()
-        orch = self._make_orchestrator(snap=snap)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
         with patch.object(main, "_log_signal", side_effect=RuntimeError("display boom")):
             # Should not raise
             self._run_once(orch)
+
+    # ── multi-pair display ────────────────────────────────────────────────
+
+    def test_all_cached_pairs_are_displayed(self):
+        """Every pair in the cache must have _log_signal called for it."""
+        import main
+        snap_btc = self._make_minimal_snap("btc_idr", 100_000.0)
+        snap_eth = self._make_minimal_snap("eth_idr", 5_000.0)
+        snap_sol = self._make_minimal_snap("sol_idr", 3_000.0)
+        orch = self._make_orchestrator(snaps={
+            "btc_idr": snap_btc,
+            "eth_idr": snap_eth,
+            "sol_idr": snap_sol,
+        })
+        calls = []
+        with patch.object(main, "_log_signal", side_effect=lambda s: calls.append(s["pair"])):
+            self._run_once(orch)
+        assert set(calls) == {"btc_idr", "eth_idr", "sol_idr"}
+
+    def test_only_pairs_in_cache_are_displayed(self):
+        """config.pair should NOT be added artificially if it isn't in the cache."""
+        import main
+        snap_eth = self._make_minimal_snap("eth_idr", 5_000.0)
+        # config.pair = "btc_idr" but cache only has "eth_idr"
+        orch = self._make_orchestrator(snaps={"eth_idr": snap_eth})
+        calls = []
+        with patch.object(main, "_log_signal", side_effect=lambda s: calls.append(s["pair"])):
+            self._run_once(orch, pair="btc_idr")
+        assert calls == ["eth_idr"]
+
+    # ── portfolio / holding display ───────────────────────────────────────
+
+    def test_log_holding_called_for_active_position(self):
+        """_log_holding must be called for a pair where the trader holds a position."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        # Build a tracker with an open position
+        tracker = MagicMock()
+        tracker.base_position = 0.001
+        tracker.as_dict = MagicMock(return_value={
+            "equity": 1_100_000.0, "cash": 1_000_000.0,
+            "base_position": 0.001, "realized_pnl": 0.0,
+            "avg_cost": 100_000.0, "trade_count": 1, "win_rate": 1.0,
+        })
+        active_positions = {"btc_idr": tracker}
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_holding") as mock_holding:
+                with patch.object(main, "_log_portfolio"):
+                    self._run_once(orch, active_positions=active_positions)
+        mock_holding.assert_called_once()
+        call_args = mock_holding.call_args
+        assert call_args[0][0] == "btc_idr"  # pair argument
+
+    def test_log_holding_not_called_when_no_position(self):
+        """_log_holding must NOT be called when base_position == 0."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        tracker = MagicMock()
+        tracker.base_position = 0.0
+        active_positions = {"btc_idr": tracker}
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_holding") as mock_holding:
+                self._run_once(orch, active_positions=active_positions)
+        mock_holding.assert_not_called()
+
+    def test_log_portfolio_called_when_positions_held(self):
+        """_log_portfolio must be called once when trader has active positions."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        tracker = MagicMock()
+        tracker.base_position = 0.001
+        tracker.as_dict = MagicMock(return_value={
+            "equity": 1_100_000.0, "cash": 1_000_000.0,
+            "base_position": 0.001, "realized_pnl": 0.0,
+            "avg_cost": 100_000.0, "trade_count": 1, "win_rate": 1.0,
+        })
+        active_positions = {"btc_idr": tracker}
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_holding"):
+                with patch.object(main, "_log_portfolio") as mock_portfolio:
+                    self._run_once(orch, active_positions=active_positions)
+        mock_portfolio.assert_called_once()
+
+    def test_log_portfolio_not_called_when_no_positions(self):
+        """_log_portfolio must NOT be called when there are no active positions."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0)
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_portfolio") as mock_portfolio:
+                self._run_once(orch, active_positions={})
+        mock_portfolio.assert_not_called()

@@ -738,19 +738,51 @@ def _run_engine_monitor(
     _now_ms = now_ms  # keep consistent with the old loop alias
     scan_cycles = 0
     portfolio: dict = {}
-    pair = config.pair
 
     while not shutdown.is_set():
         scan_cycles += 1
         logging.info(_separator(f"Engine cycle #{scan_cycles}"))
 
-        # ── Display current pair snapshot ────────────────────────────────────
+        # ── Display all cached pairs + portfolio ──────────────────────────────
         try:
-            _snap = orchestrator.cache.get(pair)
-            if _snap:
-                _log_signal(_snap)
+            _cached_pairs = orchestrator.cache.pairs()
+            if _cached_pairs:
+                _active = trader.active_positions
+                for _disp_pair in _cached_pairs:
+                    _snap = orchestrator.cache.get(_disp_pair)
+                    if not _snap:
+                        continue
+                    _log_signal(_snap)
+                    # Show position status for pairs where we hold a position
+                    _tracker = _active.get(_disp_pair)
+                    if _tracker and _tracker.base_position > 0:
+                        _price = _snap.get("price", 0.0)
+                        _port = _tracker.as_dict(_price)
+                        _log_holding(
+                            _disp_pair,
+                            _price,
+                            _port,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                # Overall portfolio summary when any position is held
+                if _active:
+                    _rep_pair = next(iter(_active))
+                    _rep_snap = orchestrator.cache.get(_rep_pair)
+                    _rep_price = (_rep_snap or {}).get("price", 0.0)
+                    try:
+                        _agg = trader.portfolio_snapshot(_rep_pair, _rep_price)
+                        _log_portfolio(
+                            _agg,
+                            config.initial_capital,
+                            trailing_stop_enabled=config.trailing_stop_pct > 0,
+                            trailing_tp_enabled=config.trailing_tp_pct > 0,
+                        )
+                    except Exception:
+                        pass
             else:
-                logging.info("   ⏳ Waiting for market data (%s) …", pair)
+                logging.info("   ⏳ Waiting for market data (%s) …", config.pair)
         except Exception as _disp_exc:
             logging.debug("Engine cycle display error: %s", _disp_exc)
 
