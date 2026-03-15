@@ -848,6 +848,35 @@ class ExecutionEngine:
                     f"Amount: {outcome.get('amount', 0):.8f}\n"
                     f"PnL: Rp {portfolio.get('realized_pnl', 0):,.2f}"
                 )
+                # ── Re-entry analysis after exit ─────────────────────────────
+                # Mirror the non-engine monitoring loop: after any successful
+                # exit, check whether the pair still has upside potential for a
+                # fresh position.  Prevents leaving a profitable coin too early
+                # and allows compounding gains by re-entering on a dip after TP.
+                try:
+                    _reentry = self._trader.analyze_reentry_opportunity(snap)
+                    if _reentry and _reentry.get("reentry"):
+                        _tgt = _reentry["target_price"]
+                        logger.info(
+                            "🔄 RE-ENTRY OPPORTUNITY  %s  ·  target Rp %s  "
+                            "regime=%s  imbalance=%.2f",
+                            signal.pair,
+                            f"{_tgt:,.2f}",
+                            _reentry.get("regime", "?"),
+                            _reentry.get("imbalance", 0),
+                        )
+                        self._notify(
+                            f"🔄 RE-ENTRY OPPORTUNITY {signal.pair}\n"
+                            f"Target: Rp {_tgt:,.2f}\n"
+                            f"Regime: {_reentry.get('regime', '?')}"
+                        )
+                    else:
+                        logger.info(
+                            "📊 No re-entry opportunity for %s — staying flat",
+                            signal.pair,
+                        )
+                except Exception:
+                    pass
             else:
                 logger.info(
                     "🔄 PENDING SELL  %s  — sell not filled, will retry",

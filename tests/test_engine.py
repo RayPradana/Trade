@@ -1043,6 +1043,32 @@ class TestEngineMonitorCycleDisplay:
         assert call_kwargs["status"] == "skipped"
         assert call_kwargs["reason"] == "max_positions"
 
+    def test_log_outcome_skipped_no_position_for_sell_decision(self):
+        """When decision is 'sell' and the trader holds no position for that pair,
+        _log_outcome must show status='skipped' with reason containing 'no_position'."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0, action="sell")
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        orch.pop_recent_outcomes = MagicMock(return_value=[])
+        trader = MagicMock()
+        # No active positions
+        trader.active_positions = {}
+        trader.at_max_positions = MagicMock(return_value=False)
+        trader.portfolio_snapshot = MagicMock(return_value={
+            "equity": 1_000_000.0, "cash": 1_000_000.0,
+            "base_position": 0.0, "realized_pnl": 0.0,
+            "trade_count": 0, "win_rate": 0.0,
+        })
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_outcome") as mock_outcome:
+                with patch.object(main, "_log_portfolio"):
+                    self._run_once(orch, trader=trader)
+        mock_outcome.assert_called_once()
+        call_kwargs = mock_outcome.call_args[0][0]
+        assert call_kwargs["action"] == "sell"
+        assert call_kwargs["status"] == "skipped"
+        assert "no_position" in call_kwargs.get("reason", "")
+
     def test_pop_recent_outcomes_integration(self):
         """TradingOrchestrator.pop_recent_outcomes must start empty and
         accumulate outcomes pushed by the internal callback."""
@@ -1566,3 +1592,81 @@ class TestExecutionEngineCancelBuyAndPartialTP:
         )
         exec_eng._process(signal)
         assert tracker.partial_tp3_taken is True
+
+
+class TestExecutionEngineReentryAnalysis:
+    """ExecutionEngine must call analyze_reentry_opportunity after a successful exit."""
+
+    def _make_exec_engine(self, trader):
+        config = _make_config()
+        signals = SignalQueue()
+        risk = RiskEngine(config)
+        return ExecutionEngine(trader, config, signals, risk), signals
+
+    def test_reentry_analysis_called_after_exit(self):
+        """After a successful 'exit' signal (status != pending_sell),
+        ExecutionEngine must call trader.analyze_reentry_opportunity with the snapshot."""
+        tracker = _make_tracker(base_position=0.001)
+        tracker.as_dict = MagicMock(return_value={"realized_pnl": 5000.0})
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader.force_sell = MagicMock(return_value={"status": "simulated", "amount": 0.001})
+        trader.analyze_reentry_opportunity = MagicMock(return_value={"reentry": False})
+
+        exec_eng, _ = self._make_exec_engine(trader)
+        snap = _make_snap(price=120_000.0, action="sell")
+        signal = TradingSignal(pair="btc_idr", snapshot=snap, signal_type="exit")
+        exec_eng._process(signal)
+
+        trader.analyze_reentry_opportunity.assert_called_once_with(snap)
+
+    def test_reentry_analysis_not_called_when_pending_sell(self):
+        """When force_sell returns 'pending_sell', the exit was not completed —
+        analyze_reentry_opportunity must NOT be called."""
+        tracker = _make_tracker(base_position=0.001)
+        tracker.as_dict = MagicMock(return_value={"realized_pnl": 0.0})
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader.force_sell = MagicMock(return_value={"status": "pending_sell"})
+        trader.analyze_reentry_opportunity = MagicMock(return_value={"reentry": False})
+
+        exec_eng, _ = self._make_exec_engine(trader)
+        snap = _make_snap(price=120_000.0, action="sell")
+        signal = TradingSignal(pair="btc_idr", snapshot=snap, signal_type="exit")
+        exec_eng._process(signal)
+
+        trader.analyze_reentry_opportunity.assert_not_called()
+
+    def test_reentry_opportunity_notifies_when_detected(self):
+        """When analyze_reentry_opportunity returns reentry=True,
+        the notify function must be called with a RE-ENTRY message."""
+        tracker = _make_tracker(base_position=0.001)
+        tracker.as_dict = MagicMock(return_value={"realized_pnl": 2000.0})
+        trader = _make_trader()
+        trader._active_tracker = MagicMock(return_value=tracker)
+        trader.force_sell = MagicMock(return_value={"status": "simulated", "amount": 0.001})
+        trader.analyze_reentry_opportunity = MagicMock(return_value={
+            "reentry": True,
+            "target_price": 115_000.0,
+            "regime": "trending_up",
+            "imbalance": 0.65,
+        })
+        notifications: list = []
+
+        config = _make_config()
+        signals = SignalQueue()
+        risk = RiskEngine(config)
+        exec_eng = ExecutionEngine(
+            trader, config, signals, risk,
+            notify_fn=lambda text: notifications.append(text),
+        )
+        snap = _make_snap(price=120_000.0, action="sell")
+        signal = TradingSignal(pair="btc_idr", snapshot=snap, signal_type="exit")
+        exec_eng._process(signal)
+
+        assert len(notifications) >= 2  # EXIT + RE-ENTRY
+        re_entry_msg = next(
+            (n for n in notifications if "RE-ENTRY" in n), None
+        )
+        assert re_entry_msg is not None
+        assert "115,000" in re_entry_msg or "115000" in re_entry_msg.replace(",", "")

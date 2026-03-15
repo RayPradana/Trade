@@ -783,6 +783,15 @@ def _run_engine_monitor(
                                     "status": "skipped",
                                     "reason": "max_positions",
                                 })
+                            elif _decision.action == "sell":
+                                # Bearish signal but no position to exit
+                                _no_pos_tracker = _active.get(_disp_pair)
+                                if _no_pos_tracker is None or _no_pos_tracker.base_position <= 0:
+                                    _log_outcome({
+                                        "action": "sell",
+                                        "status": "skipped",
+                                        "reason": f"no_position ({_decision.reason[:60]})" if _decision.reason else "no_position",
+                                    })
                     # Show position status for pairs where we hold a position
                     _tracker = _active.get(_disp_pair)
                     if _tracker and _tracker.base_position > 0:

@@ -921,7 +921,12 @@ class Trader:
         still compute indicators for pairs that are not yet receiving WS trade
         data (e.g. on first startup before the feed is fully seeded).
         """
-        min_candles = max(2, self.config.slow_window // 2)
+        # Require at least slow_window candles so that MA(slow_window) is always
+        # computable.  Using slow_window // 2 as the threshold (the previous
+        # value) meant that WS/trades candles with only 24–47 entries were
+        # accepted even though MA(48) would be NaN for all of them, causing
+        # analyze_trend() to return "flat" → action "hold" on every cycle.
+        min_candles = self.config.slow_window
 
         # ── 1. Try real-time WS trade buffer from MultiPairFeed ─────────────
         if self._multi_feed is not None:

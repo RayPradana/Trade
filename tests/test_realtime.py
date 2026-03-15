@@ -1045,6 +1045,29 @@ class WsDepthAndTradesInScanTests(unittest.TestCase):
         # Must have called REST OHLC as the fallback
         self.assertEqual(client.ohlc_calls, 1)
 
+    def test_insufficient_ws_candles_fall_through_to_ohlc(self):
+        """_fetch_candles must fall back to REST OHLC when WS trades produce
+        fewer candles than slow_window — otherwise MA(slow_window) would be NaN
+        for every candle, causing analyze_trend() to return "flat" (→ "hold").
+        """
+        trader, client, feed = self._make_trader_with_feed("btc_idr")
+        # slow_window=48, interval_seconds=300 (5-min candles).
+        # Inject trades spanning only ~20 minutes so build_candles produces
+        # at most 4 candles — well below the slow_window threshold of 48.
+        trades_data = [
+            ["btcidr", 1700000000 + i * 60, i, "buy", "10000", "100000", "0.01"]
+            for i in range(20)
+        ]
+        feed._apply_trade_activity_for_pair("btc_idr", {"data": trades_data})
+
+        trader._fetch_candles("btc_idr", [], use_cache=False)
+
+        # WS candles were too few for MA(slow_window) — REST OHLC must be called
+        self.assertEqual(
+            client.ohlc_calls, 1,
+            "REST OHLC must be called when WS candles < slow_window",
+        )
+
     def test_ws_depth_empty_falls_back_to_empty_depth(self):
         """When WS depth is not yet available, skip_depth=True still returns empty depth (no REST)."""
         trader, client, feed = self._make_trader_with_feed("btc_idr")
