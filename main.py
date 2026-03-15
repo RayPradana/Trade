@@ -16,6 +16,7 @@ import requests
 from bot.config import BotConfig
 from bot.trader import Trader
 from bot.journal import TradeJournal
+from bot.engine import TradingOrchestrator
 from bot.risk_management import (
     check_circuit_breaker as rm_check_circuit_breaker,
     check_max_drawdown,
@@ -707,6 +708,163 @@ def _log_holding(
     )
 
 
+def _run_engine_monitor(
+    orchestrator: TradingOrchestrator,
+    trader: "Trader",
+    config: "BotConfig",
+    journal: "TradeJournal",
+    shutdown: threading.Event,
+    tasks: list,
+    autonomous_state: "AutonomousTradingState",
+    start_time: float,
+    crash_history: list,
+    error_log: list,
+    components: list,
+    polling_config: "PollingConfig",
+    now_ms: object,
+) -> None:
+    """Main-thread monitoring loop for engine mode.
+
+    The heavy lifting (market data fetching, strategy evaluation, order
+    execution) is handled by the :class:`~bot.engine.TradingOrchestrator`
+    background threads.  This function runs in the main thread and is
+    responsible for:
+
+    * Periodic health checks and scheduled housekeeping tasks.
+    * Cycle-based performance summaries and state backups.
+    * Logging engine health metrics.
+    * Detecting unhealthy engines and logging warnings.
+    """
+    _now_ms = now_ms  # keep consistent with the old loop alias
+    scan_cycles = 0
+    portfolio: dict = {}
+    pair = config.pair
+
+    while not shutdown.is_set():
+        scan_cycles += 1
+        logging.info(_separator(f"Engine cycle #{scan_cycles}"))
+
+        try:
+            # ── Scheduled housekeeping tasks ─────────────────────────────────
+            due_tasks = schedule_tasks(tasks, current_time_ms=_now_ms())
+            for task in due_tasks:
+                try:
+                    if task.name == "health_check":
+                        _h = orchestrator.health()
+                        logging.debug(
+                            "⚙  Engine health  market_data=%s  strategy=%s  execution=%s"
+                            "  cache=%d pairs  queue=%d",
+                            _h["market_data_engine"],
+                            _h["strategy_engine"],
+                            _h["execution_engine"],
+                            len(_h["cache_pairs"]),
+                            _h["signal_queue_size"],
+                        )
+                        # Warn if any engine thread has died
+                        for engine_name in ("market_data_engine", "strategy_engine", "execution_engine"):
+                            if _h.get(engine_name) == "stopped":
+                                logging.warning(
+                                    "⚠️  %s has stopped unexpectedly!", engine_name
+                                )
+
+                    elif task.name == "risk_monitoring":
+                        active = trader.active_positions
+                        for _pair, _tracker in active.items():
+                            try:
+                                _portfolio = _tracker.as_dict(
+                                    orchestrator.cache.get(_pair)
+                                    and orchestrator.cache.get(_pair).get("price", 0.0) or 0.0
+                                )
+                                _drawdown_result = check_max_drawdown(
+                                    current_equity=_portfolio.get("equity", config.initial_capital),
+                                    peak_equity=max(
+                                        _portfolio.get("equity", config.initial_capital),
+                                        config.initial_capital,
+                                    ),
+                                    max_drawdown_pct=0.20,
+                                )
+                                if _drawdown_result.is_triggered:
+                                    logging.warning(
+                                        "⚠️  Max drawdown triggered for %s — drawdown=%.1f%%",
+                                        _pair,
+                                        _drawdown_result.drawdown_pct * 100,
+                                    )
+                            except Exception:
+                                pass
+
+                    elif task.name == "strategy_review":
+                        active = trader.active_positions
+                        if active:
+                            for _pair, _tracker in active.items():
+                                try:
+                                    _snap = orchestrator.cache.get(_pair)
+                                    if _snap:
+                                        _new_strategy = auto_switch_strategy(
+                                            autonomous_state,
+                                            _snap,
+                                        )
+                                        if _new_strategy:
+                                            logging.info(
+                                                "🔄 Auto-switch strategy → %s", _new_strategy
+                                            )
+                                except Exception:
+                                    pass
+
+                    update_task_after_run(task, current_time_ms=_now_ms())
+                except Exception as _task_exc:
+                    logging.debug("Scheduled task %s failed: %s", task.name, _task_exc)
+
+            # ── Periodic performance summary ──────────────────────────────────
+            if scan_cycles % config.cycle_summary_interval == 0:
+                active = trader.active_positions
+                if active:
+                    _pair_for_summary = next(iter(active))
+                    _snap = orchestrator.cache.get(_pair_for_summary)
+                    _price_for_summary = (_snap or {}).get("price", 0.0)
+                    try:
+                        portfolio = trader.active_positions[_pair_for_summary].as_dict(
+                            _price_for_summary
+                        )
+                        logging.info(
+                            "📊 %sPeriodic summary%s  cycle #%d : pnl=%s  equity=Rp %s  "
+                            "trades=%d  win=%.0f%%",
+                            _BOLD, _RESET, scan_cycles,
+                            _pnl_str(portfolio.get("realized_pnl", 0.0)),
+                            f"{portfolio.get('equity', 0.0):15,.2f}",
+                            portfolio.get("trade_count", 0),
+                            portfolio.get("win_rate", 0.0) * 100,
+                        )
+                    except Exception:
+                        pass
+                logging.info("📓 %s", journal.summary_str())
+
+            # ── Periodic state backup ─────────────────────────────────────────
+            if (
+                config.state_path is not None
+                and config.state_backup_interval > 0
+                and scan_cycles % config.state_backup_interval == 0
+            ):
+                try:
+                    _backup_path = config.state_path.with_name(
+                        config.state_path.stem + "_backup" + config.state_path.suffix
+                    )
+                    trader.persistence.backup(_backup_path)
+                except Exception as _bk_exc:
+                    logging.debug("State backup failed: %s", _bk_exc)
+
+        except Exception as _exc:
+            logging.warning("Engine monitor error: %s", _exc)
+
+        logging.info(_separator())
+
+        # Sleep based on strategy engine interval so we're not spinning.
+        _sleep = max(1.0, config.strategy_engine_interval)
+        shutdown.wait(timeout=_sleep)
+
+        if config.run_once:
+            break
+
+
 def main() -> None:
     configure_logging()  # early bootstrap logging before config is available
     config = BotConfig.from_env()
@@ -807,6 +965,44 @@ def main() -> None:
             _BOLD, pair, _RESET,
             trader.tracker.base_position,
         )
+
+    # ── Engine mode: hand off to multi-threaded engine architecture ─────────
+    if config.engine_mode:
+        logging.info(
+            "%s⚙  ENGINE MODE%s  — launching low-latency engine architecture …",
+            _BOLD, _RESET,
+        )
+        logging.info(
+            "   Market Data Engine  →  Data Cache  →  Strategy Engine\n"
+            "                                               ↓\n"
+            "   Risk Engine  ←  Execution Engine  ←  Signal Queue",
+        )
+        orchestrator = TradingOrchestrator(
+            trader,
+            config,
+            notify_fn=lambda text: _notify(config, text),
+            on_outcome=lambda sig, out: _log_outcome(out),
+        )
+        orchestrator.start()
+        try:
+            _run_engine_monitor(
+                orchestrator,
+                trader,
+                config,
+                journal,
+                _shutdown,
+                _tasks,
+                _autonomous_state,
+                _start_time,
+                _crash_history,
+                _error_log,
+                _components,
+                _polling_config,
+                _now_ms,
+            )
+        finally:
+            orchestrator.stop()
+        return
 
     while not _shutdown.is_set():
         cycle += 1

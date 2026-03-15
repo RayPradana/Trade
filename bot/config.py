@@ -681,6 +681,19 @@ class BotConfig:
     market_data_anomaly_spread_mult: float = 3.0
     market_data_anomaly_crash_pct: float = 0.10
 
+    # ── Professional Engine Architecture ──────────────────────────────────────
+    # When engine_mode=True the bot uses the low-latency multi-threaded engine
+    # architecture (MarketDataEngine → DataCache → StrategyEngine → SignalQueue
+    # → ExecutionEngine ↔ RiskEngine) instead of the monolithic single-thread loop.
+    #
+    # market_data_engine_interval: seconds between full market-data refresh
+    #   passes in MarketDataEngine (default 2 s).
+    # strategy_engine_interval: seconds between strategy-evaluation passes
+    #   in StrategyEngine (default 3 s).
+    engine_mode: bool = True
+    market_data_engine_interval: float = 2.0
+    strategy_engine_interval: float = 3.0
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         existing_keys = set(os.environ.keys())
@@ -893,6 +906,10 @@ class BotConfig:
             market_data_anomaly_volume_mult=_env_float("MARKET_DATA_ANOMALY_VOLUME_MULT", "5"),
             market_data_anomaly_spread_mult=_env_float("MARKET_DATA_ANOMALY_SPREAD_MULT", "3"),
             market_data_anomaly_crash_pct=_env_float("MARKET_DATA_ANOMALY_CRASH_PCT", "0.10"),
+            # Professional Engine Architecture
+            engine_mode=os.getenv("ENGINE_MODE", "true").lower() in {"1", "true", "yes"},
+            market_data_engine_interval=_env_float("MARKET_DATA_ENGINE_INTERVAL", "2.0"),
+            strategy_engine_interval=_env_float("STRATEGY_ENGINE_INTERVAL", "3.0"),
         )
         cfg._validate()
         return cfg
