@@ -746,10 +746,17 @@ def _run_engine_monitor(
 
         try:
             # ── Scheduled housekeeping tasks ─────────────────────────────────
-            due_tasks = schedule_tasks(tasks, current_time_ms=_now_ms())
-            for task in due_tasks:
+            _schedule_result = schedule_tasks(tasks, current_time=_now_ms())
+            for _task_name in _schedule_result.tasks_due:
+                _task_idx = next(
+                    (i for i, t in enumerate(tasks) if t.name == _task_name), None,
+                )
+                if _task_idx is None:
+                    continue
+                _task = tasks[_task_idx]
+                _task_success = True
                 try:
-                    if task.name == "health_check":
+                    if _task_name == "health_check":
                         _h = orchestrator.health()
                         logging.debug(
                             "⚙  Engine health  market_data=%s  strategy=%s  execution=%s"
@@ -767,7 +774,7 @@ def _run_engine_monitor(
                                     "⚠️  %s has stopped unexpectedly!", engine_name
                                 )
 
-                    elif task.name == "risk_monitoring":
+                    elif _task_name == "risk_monitoring":
                         active = trader.active_positions
                         for _pair, _tracker in active.items():
                             try:
@@ -792,7 +799,7 @@ def _run_engine_monitor(
                             except Exception:
                                 pass
 
-                    elif task.name == "strategy_review":
+                    elif _task_name == "strategy_review":
                         active = trader.active_positions
                         if active:
                             for _pair, _tracker in active.items():
@@ -810,9 +817,12 @@ def _run_engine_monitor(
                                 except Exception:
                                     pass
 
-                    update_task_after_run(task, current_time_ms=_now_ms())
                 except Exception as _task_exc:
-                    logging.debug("Scheduled task %s failed: %s", task.name, _task_exc)
+                    _task_success = False
+                    logging.debug("Scheduled task %s failed: %s", _task_name, _task_exc)
+                tasks[_task_idx] = update_task_after_run(
+                    _task, success=_task_success, current_time=_now_ms(),
+                )
 
             # ── Periodic performance summary ──────────────────────────────────
             if scan_cycles % config.cycle_summary_interval == 0:
