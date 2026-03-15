@@ -739,6 +739,25 @@ class TradingOrchestrator:
         self.signal_queue = SignalQueue(maxsize=200)
         self.risk_engine = RiskEngine(config)
 
+        # -- Recent outcome buffer (thread-safe) ------------------------------
+        # ExecutionEngine pushes here on every signal outcome so that the
+        # monitor loop can display placed / skipped results within the cycle.
+        self._outcome_lock: threading.Lock = threading.Lock()
+        self._recent_outcomes: List[Tuple[str, Dict[str, Any]]] = []
+
+        _ext_on_outcome = on_outcome
+
+        def _chained_on_outcome(
+            signal: TradingSignal, outcome: Dict[str, Any]
+        ) -> None:
+            with self._outcome_lock:
+                self._recent_outcomes.append((signal.pair, outcome))
+            if _ext_on_outcome is not None:
+                try:
+                    _ext_on_outcome(signal, outcome)
+                except Exception:
+                    pass
+
         # -- Engines ----------------------------------------------------------
         self.market_data_engine = MarketDataEngine(
             trader, config, self.cache
@@ -752,7 +771,7 @@ class TradingOrchestrator:
             self.signal_queue,
             self.risk_engine,
             notify_fn=notify_fn,
-            on_outcome=on_outcome,
+            on_outcome=_chained_on_outcome,
         )
 
     # -- lifecycle ------------------------------------------------------------
@@ -795,6 +814,25 @@ class TradingOrchestrator:
             shutdown.wait(timeout=poll_interval)
             if not shutdown.is_set():
                 self._log_health()
+
+    # -- outcome buffer -------------------------------------------------------
+
+    def pop_recent_outcomes(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return and clear all execution outcomes buffered since the last call.
+
+        Thread-safe: the :class:`ExecutionEngine` pushes outcomes from its
+        background thread; the monitor loop pops them once per cycle so they
+        can be displayed within the structured cycle block rather than as
+        free-floating log lines.
+
+        Returns a list of ``(pair, outcome_dict)`` tuples in insertion order.
+        When multiple outcomes exist for the same pair the caller should use
+        the last one (most recent).
+        """
+        with self._outcome_lock:
+            result = list(self._recent_outcomes)
+            self._recent_outcomes.clear()
+            return result
 
     # -- helpers --------------------------------------------------------------
 

@@ -740,6 +740,8 @@ class TestEngineMonitorCycleDisplay:
             "cache_pairs": list(snaps.keys()),
             "signal_queue_size": 0,
         })
+        # Default: no recent execution outcomes buffered
+        orch.pop_recent_outcomes = MagicMock(return_value=[])
         return orch
 
     def _run_once(self, orchestrator, pair="btc_idr", active_positions=None, trader=None):
@@ -758,6 +760,7 @@ class TestEngineMonitorCycleDisplay:
         if trader is None:
             trader = MagicMock()
             trader.active_positions = active_positions or {}
+            trader.at_max_positions = MagicMock(return_value=False)
             trader.portfolio_snapshot = MagicMock(return_value={
                 "equity": 1_000_000.0, "cash": 1_000_000.0,
                 "base_position": 0.0, "realized_pnl": 0.0,
@@ -956,6 +959,131 @@ class TestEngineMonitorCycleDisplay:
         with patch.object(main, "_log_portfolio") as mock_portfolio:
             self._run_once(orch, active_positions={})
         mock_portfolio.assert_not_called()
+
+    # ── outcome display (skipped / placed) ────────────────────────────────
+
+    def test_log_outcome_called_for_hold_decision(self):
+        """_log_outcome must be called with status='skipped' for HOLD decisions."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0, action="hold")
+        snap["decision"].reason = "rug_pull_risk:dead_coin_trades=0"
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        # No recent execution outcomes buffered
+        orch.pop_recent_outcomes = MagicMock(return_value=[])
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_outcome") as mock_outcome:
+                with patch.object(main, "_log_portfolio"):
+                    self._run_once(orch)
+        mock_outcome.assert_called_once()
+        call_kwargs = mock_outcome.call_args[0][0]
+        assert call_kwargs["status"] == "skipped"
+        assert call_kwargs["action"] == "hold"
+        assert "rug_pull_risk" in call_kwargs.get("reason", "")
+
+    def test_log_outcome_called_for_each_hold_pair(self):
+        """_log_outcome must be called once per HOLD pair."""
+        import main
+        snap_btc = self._make_minimal_snap("btc_idr", 100_000.0, action="hold")
+        snap_eth = self._make_minimal_snap("eth_idr", 5_000.0, action="hold")
+        orch = self._make_orchestrator(snaps={
+            "btc_idr": snap_btc,
+            "eth_idr": snap_eth,
+        })
+        orch.pop_recent_outcomes = MagicMock(return_value=[])
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_outcome") as mock_outcome:
+                with patch.object(main, "_log_portfolio"):
+                    self._run_once(orch)
+        assert mock_outcome.call_count == 2
+
+    def test_log_outcome_shows_exec_outcome_over_synthetic_skip(self):
+        """When an execution outcome is buffered for a pair, that takes
+        priority over the synthetic 'skipped' outcome for a HOLD decision."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0, action="buy")
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        placed_outcome = {
+            "action": "buy",
+            "status": "placed",
+            "amount": 0.001,
+            "price": 100_000.0,
+        }
+        orch.pop_recent_outcomes = MagicMock(
+            return_value=[("btc_idr", placed_outcome)]
+        )
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_outcome") as mock_outcome:
+                with patch.object(main, "_log_portfolio"):
+                    self._run_once(orch)
+        mock_outcome.assert_called_once()
+        call_kwargs = mock_outcome.call_args[0][0]
+        assert call_kwargs["status"] == "placed"
+
+    def test_log_outcome_skipped_max_positions_for_buy_decision(self):
+        """When decision is 'buy' but trader is at max positions, _log_outcome
+        must show status='skipped' with reason='max_positions'."""
+        import main
+        snap = self._make_minimal_snap("btc_idr", 100_000.0, action="buy")
+        orch = self._make_orchestrator(snaps={"btc_idr": snap})
+        orch.pop_recent_outcomes = MagicMock(return_value=[])
+        trader = MagicMock()
+        trader.active_positions = {}
+        trader.at_max_positions = MagicMock(return_value=True)
+        trader.portfolio_snapshot = MagicMock(return_value={
+            "equity": 1_000_000.0, "cash": 1_000_000.0,
+            "base_position": 0.0, "realized_pnl": 0.0,
+            "trade_count": 0, "win_rate": 0.0,
+        })
+        with patch.object(main, "_log_signal"):
+            with patch.object(main, "_log_outcome") as mock_outcome:
+                with patch.object(main, "_log_portfolio"):
+                    self._run_once(orch, trader=trader)
+        mock_outcome.assert_called_once()
+        call_kwargs = mock_outcome.call_args[0][0]
+        assert call_kwargs["status"] == "skipped"
+        assert call_kwargs["reason"] == "max_positions"
+
+    def test_pop_recent_outcomes_integration(self):
+        """TradingOrchestrator.pop_recent_outcomes must start empty and
+        accumulate outcomes pushed by the internal callback."""
+        config = _make_config()
+        trader = _make_trader()
+        orch = TradingOrchestrator(trader, config)
+        # Should start empty
+        assert orch.pop_recent_outcomes() == []
+        # Simulate the internal chained callback by pushing directly
+        with orch._outcome_lock:
+            orch._recent_outcomes.append(("btc_idr", {"status": "placed"}))
+        result = orch.pop_recent_outcomes()
+        assert result == [("btc_idr", {"status": "placed"})]
+        # After pop, buffer is cleared
+        assert orch.pop_recent_outcomes() == []
+
+    def test_on_outcome_callback_still_invoked_via_chained(self):
+        """External on_outcome callback passed to TradingOrchestrator must
+        still be invoked (chained through) even though outcomes are also
+        buffered internally."""
+        config = _make_config()
+        trader = _make_trader()
+        trader.maybe_execute = MagicMock(
+            return_value={"action": "buy", "status": "simulated", "amount": 0.001}
+        )
+        ext_calls: list = []
+        orch = TradingOrchestrator(
+            trader, config,
+            on_outcome=lambda sig, out: ext_calls.append((sig.pair, out)),
+        )
+        orch.start()
+        orch.signal_queue.put(
+            TradingSignal(pair="btc_idr", snapshot=_make_snap(price=100.0), signal_type="buy")
+        )
+        import time as _time
+        _time.sleep(0.4)
+        orch.stop()
+        # External callback must have been invoked
+        assert len(ext_calls) >= 1
+        # Outcomes must also have been buffered (or already popped by nothing)
+        # — just verify no exception occurred
 
 
 class TestInitializePairs:

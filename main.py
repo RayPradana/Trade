@@ -748,11 +748,39 @@ def _run_engine_monitor(
             _cached_pairs = orchestrator.cache.pairs()
             if _cached_pairs:
                 _active = trader.active_positions
+                # Pop execution outcomes buffered by ExecutionEngine since
+                # the previous cycle.  Convert to {pair: outcome} keeping the
+                # most-recent outcome when multiple exist for the same pair.
+                _exec_outcomes: dict = {}
+                for _ep, _eo in orchestrator.pop_recent_outcomes():
+                    _exec_outcomes[_ep] = _eo
+
                 for _disp_pair in _cached_pairs:
                     _snap = orchestrator.cache.get(_disp_pair)
                     if not _snap:
                         continue
                     _log_signal(_snap)
+                    # ── Outcome: placed / skipped / simulated ─────────────────
+                    if _disp_pair in _exec_outcomes:
+                        # Real outcome from ExecutionEngine (placed, simulated, etc.)
+                        _log_outcome(_exec_outcomes[_disp_pair])
+                    else:
+                        _decision = _snap.get("decision")
+                        if _decision:
+                            if _decision.action == "hold":
+                                # No trade was attempted — show skipped inline
+                                _log_outcome({
+                                    "action": "hold",
+                                    "status": "skipped",
+                                    "reason": _decision.reason,
+                                })
+                            elif _decision.action == "buy" and trader.at_max_positions():
+                                # All slots full — buy skipped
+                                _log_outcome({
+                                    "action": "buy",
+                                    "status": "skipped",
+                                    "reason": "max_positions",
+                                })
                     # Show position status for pairs where we hold a position
                     _tracker = _active.get(_disp_pair)
                     if _tracker and _tracker.base_position > 0:
@@ -1035,7 +1063,7 @@ def main() -> None:
             trader,
             config,
             notify_fn=lambda text: _notify(config, text),
-            on_outcome=lambda sig, out: _log_outcome(out),
+            on_outcome=None,  # outcomes are buffered by orchestrator and shown in cycle
         )
         # Eagerly load the full pair list so MarketDataEngine scans ALL pairs
         # from its very first iteration (not just config.pair).
