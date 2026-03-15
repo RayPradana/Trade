@@ -349,7 +349,8 @@ def check_daily_loss_limit(
     loss = -daily_pnl if daily_pnl < 0 else 0.0
     total_risk = loss + abs(pending_risk)
     remaining = max(0, limit - total_risk)
-    can_trade = total_risk < limit
+    # When limit == 0 the feature is disabled → always allow trading.
+    can_trade = limit <= 0 or total_risk < limit
     utilization = (total_risk / limit * 100) if limit > 0 else 0.0
 
     return DailyLossCheck(

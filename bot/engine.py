@@ -610,9 +610,12 @@ class RiskEngine:
         if daily_loss_pct > 0.0:
             try:
                 tracker = trader._active_tracker(signal.pair)
-                daily_pnl: float = getattr(tracker, "_daily_pnl", 0.0)
-                limit = -(abs(self._config.initial_capital) * daily_loss_pct)
-                if daily_pnl <= limit:
+                daily_loss_idr: float = tracker.daily_loss(price)
+                limit_idr: float = (
+                    abs(getattr(self._config, "initial_capital", 0.0))
+                    * daily_loss_pct
+                )
+                if limit_idr > 0 and daily_loss_idr >= limit_idr:
                     return False, "daily_loss_cap_reached"
             except Exception:
                 pass

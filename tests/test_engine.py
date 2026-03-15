@@ -285,7 +285,7 @@ class TestRiskEngine:
         risk = RiskEngine(config)
         trader = _make_trader()
         tracker = _make_tracker()
-        tracker._daily_pnl = -60_000.0  # exceeds 5% of 1M
+        tracker.daily_loss = MagicMock(return_value=60_000.0)  # exceeds 5% of 1M
         trader._active_tracker = MagicMock(return_value=tracker)
         sig = TradingSignal(pair="btc_idr", snapshot=_make_snap(price=100.0), signal_type="buy")
         ok, reason = risk.approve(sig, trader)
@@ -297,11 +297,24 @@ class TestRiskEngine:
         risk = RiskEngine(config)
         trader = _make_trader()
         tracker = _make_tracker()
-        tracker._daily_pnl = -10_000.0  # only 1% loss, under 5% cap
+        tracker.daily_loss = MagicMock(return_value=10_000.0)  # only 1% loss, under 5% cap
         trader._active_tracker = MagicMock(return_value=tracker)
         sig = TradingSignal(pair="btc_idr", snapshot=_make_snap(price=100.0), signal_type="buy")
         ok, _ = risk.approve(sig, trader)
         assert ok is True
+
+    def test_daily_loss_cap_disabled(self):
+        # max_daily_loss_pct=0 → daily loss check is skipped entirely
+        config = _make_config(max_daily_loss_pct=0.0, initial_capital=1_000_000.0)
+        risk = RiskEngine(config)
+        trader = _make_trader()
+        tracker = _make_tracker()
+        tracker.daily_loss = MagicMock(return_value=999_999.0)
+        trader._active_tracker = MagicMock(return_value=tracker)
+        sig = TradingSignal(pair="btc_idr", snapshot=_make_snap(price=100.0), signal_type="buy")
+        ok, reason = risk.approve(sig, trader)
+        assert ok is True
+        assert reason == "approved"
 
 
 # ===========================================================================
